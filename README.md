@@ -25,7 +25,7 @@ API 성공과 퀴즈 품질을 분리합니다. JSON 파싱, 문제·보기 수,
 - [`configs/pilot.yaml`](configs/pilot.yaml): Pilot의 방식·모델·문제 수·반복 횟수 설정. 실행기는 아직 없습니다.
 - [`data/videos.schema.json`](data/videos.schema.json): 영상 메타데이터와 사용 조건 기록 계약.
 - [`data/ground_truth.schema.json`](data/ground_truth.schema.json): 사람이 확인한 사실·근거·구간의 기록 계약.
-- [`data/videos.jsonl`](data/videos.jsonl): 공식 링크와 자막을 확인한 Pilot 영상 후보 3개.
+- [`data/videos.jsonl`](data/videos.jsonl): 공식 링크와 자막을 확인한 Pilot 영상 후보 4개(영어 3, 한국어 1).
 - [`data/ground_truth_candidates.jsonl`](data/ground_truth_candidates.jsonl): 공식 자막에서 추린 사실 후보. 모두 사람 검수 전이며 최종 ground truth가 아님.
 - [`docs/pilot-data-review.md`](docs/pilot-data-review.md): 권리·언어·영상 확인의 남은 조건.
 - [`docs/results-format.md`](docs/results-format.md): 실행별 JSONL과 집계 CSV 계약.
