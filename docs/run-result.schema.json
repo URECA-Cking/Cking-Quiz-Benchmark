@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pilot benchmark run result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["benchmarkType", "runId", "videoId", "method", "model", "promptVersion", "repetition", "startedAt", "apiStatus"],
+  "properties": {
+    "benchmarkType": {"enum": ["video_grounding", "quiz_generation", "end_to_end"]},
+    "runId": {"type": "string", "minLength": 1},
+    "videoId": {"type": "string", "minLength": 1},
+    "method": {"type": "string", "minLength": 1},
+    "model": {"type": ["string", "null"]},
+    "promptVersion": {"type": ["string", "null"]},
+    "repetition": {"type": "integer", "minimum": 1},
+    "startedAt": {"type": "string", "format": "date-time"},
+    "apiStatus": {"enum": ["success", "error", "not_run"]},
+    "errorCategory": {"type": ["string", "null"]},
+    "latencyMs": {"type": ["number", "null"], "minimum": 0},
+    "inputTokens": {"type": ["integer", "null"], "minimum": 0},
+    "outputTokens": {"type": ["integer", "null"], "minimum": 0},
+    "thinkingTokens": {"type": ["integer", "null"], "minimum": 0},
+    "estimatedCostUsd": {"type": ["number", "null"], "minimum": 0},
+    "pricingReference": {"type": ["string", "null"]},
+    "groundingFacts": {"type": "array", "items": {"$ref": "#/$defs/groundingFact"}},
+    "omission": {"$ref": "#/$defs/nullableReview"},
+    "hallucination": {"$ref": "#/$defs/nullableReview"},
+    "contentTextSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "sourceGroundingRunId": {"type": ["string", "null"]},
+    "parseStatus": {"enum": ["pass", "fail", "not_run"]},
+    "validatorStatus": {"enum": ["pass", "fail", "not_run"]},
+    "beCompatibility": {"enum": ["pass", "fail", "not_applicable", "not_run"]},
+    "questionCount": {"type": ["integer", "null"], "minimum": 0},
+    "evidenceTextContained": {"type": ["boolean", "null"]},
+    "questionReviews": {"type": "array", "items": {"$ref": "#/$defs/questionReview"}},
+    "groundingRunId": {"type": ["string", "null"]},
+    "quizRunId": {"type": ["string", "null"]},
+    "totalLatencyMs": {"type": ["number", "null"], "minimum": 0},
+    "totalEstimatedCostUsd": {"type": ["number", "null"], "minimum": 0},
+    "videoGrounding": {"$ref": "#/$defs/nullableReview"}
+  },
+  "oneOf": [
+    {
+      "properties": {"benchmarkType": {"const": "video_grounding"}, "method": {"enum": ["gemini_video", "authorized_transcript"]}},
+      "required": ["groundingFacts"]
+    },
+    {
+      "properties": {"benchmarkType": {"const": "quiz_generation"}, "method": {"const": "fixed_content_text"}, "model": {"enum": ["gemini-3.8-flash", "deepseek-flash"]}},
+      "required": ["contentTextSha256", "parseStatus", "validatorStatus", "beCompatibility", "questionReviews"]
+    },
+    {
+      "properties": {"benchmarkType": {"const": "end_to_end"}, "method": {"enum": ["gemini_grounding_gemini_quiz", "gemini_grounding_deepseek_quiz", "gemini_direct_quiz", "transcript_gemini_quiz", "transcript_deepseek_quiz"]}},
+      "required": ["groundingRunId", "quizRunId", "beCompatibility", "questionReviews"],
+      "allOf": [
+        {
+          "if": {"properties": {"method": {"const": "gemini_direct_quiz"}}, "required": ["method"]},
+          "then": {"properties": {"groundingRunId": {"type": "null"}, "quizRunId": {"type": "null"}, "beCompatibility": {"const": "not_applicable"}}}
+        }
+      ]
+    }
+  ],
+  "$defs": {
+    "nullableReview": {"enum": ["pass", "fail", "uncertain", null]},
+    "groundingFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fact", "evidenceType", "evidence", "timestampStartSeconds", "timestampEndSeconds"],
+      "properties": {
+        "fact": {"type": "string", "minLength": 1},
+        "evidenceType": {"enum": ["speech", "visual", "unknown"]},
+        "evidence": {"type": "string", "minLength": 1},
+        "timestampStartSeconds": {"type": ["number", "null"], "minimum": 0},
+        "timestampEndSeconds": {"type": ["number", "null"], "minimum": 0},
+        "factExists": {"$ref": "#/$defs/nullableReview"},
+        "evidenceTypeCorrect": {"$ref": "#/$defs/nullableReview"},
+        "timestampAccurate": {"$ref": "#/$defs/nullableReview"},
+        "reviewNote": {"type": ["string", "null"]}
+      }
+    },
+    "questionReview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["questionIndex"],
+      "properties": {
+        "questionIndex": {"type": "integer", "minimum": 0},
+        "answerAccuracy": {"$ref": "#/$defs/nullableReview"},
+        "uniqueAnswer": {"$ref": "#/$defs/nullableReview"},
+        "evidenceSupportsAnswer": {"$ref": "#/$defs/nullableReview"},
+        "videoGrounding": {"$ref": "#/$defs/nullableReview"},
+        "koreanQuality": {"$ref": "#/$defs/nullableReview"},
+        "hallucination": {"$ref": "#/$defs/nullableReview"},
+        "reviewNote": {"type": ["string", "null"]}
+      }
+    }
+  }
+}
