@@ -1,0 +1,11 @@
+pilot:
+  model: gemini-3.8-flash # 실행 전 공식 모델 ID와 제공 상태 재확인
+  methods: [A, B, C]
+  video_count_min: 3
+  video_count_max: 5
+  repetitions_per_condition: 2
+  questions_per_video: 3
+  options_per_question: 4
+  prompt_version: pilot-v1
+  api_key_environment_variable: GEMINI_API_KEY
+  # 호출 및 비용 상한은 실행 전에 별도로 결정한다.

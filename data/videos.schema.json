@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pilot video metadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["videoId", "youtubeUrl", "title", "durationSeconds", "rightsNote", "accessCheckedAt"],
+  "properties": {
+    "videoId": {"type": "string", "minLength": 1},
+    "youtubeUrl": {"type": "string", "format": "uri"},
+    "title": {"type": "string", "minLength": 1},
+    "durationSeconds": {"type": "integer", "minimum": 1},
+    "rightsNote": {"type": "string", "minLength": 1, "description": "공개 접근 및 평가·메타데이터 공유 가능 여부를 확인한 근거"},
+    "accessCheckedAt": {"type": "string", "format": "date-time"},
+    "transcriptAvailability": {"enum": ["available", "unavailable", "unknown"]},
+    "transcriptAccessNote": {"type": "string"}
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Human-reviewed video fact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["videoId", "factId", "fact", "evidenceType", "evidence", "reviewer", "reviewedAt"],
+  "properties": {
+    "videoId": {"type": "string", "minLength": 1},
+    "factId": {"type": "string", "minLength": 1},
+    "fact": {"type": "string", "minLength": 1},
+    "evidenceType": {"enum": ["video_observation", "authorized_transcript"]},
+    "evidence": {"type": "string", "minLength": 1},
+    "timestampStartSeconds": {"type": "number", "minimum": 0},
+    "timestampEndSeconds": {"type": "number", "minimum": 0},
+    "reviewer": {"type": "string", "minLength": 1},
+    "reviewedAt": {"type": "string", "format": "date-time"}
+  }
+}
