@@ -12,7 +12,7 @@ AI 퀴즈의 생성 방식과 모델을 비교하기 위한 실험 저장소입�
   - C: 사용 가능한 transcript/caption → `contentText` → 퀴즈 생성
 - 영상당 객관식 3문제, 문제당 보기 4개
 
-이 단계는 실행 골격과 평가 계약만 정의합니다. 아직 Gemini 호출 코드, 영상 데이터, transcript 및 성능 결과가 없습니다. Pilot 검증 이후에만 영상 12~18개와 추가 모델로 확대합니다.
+현재는 평가 계약과 영상 후보만 있습니다. 아직 Gemini 호출 코드, 원본 영상 파일, transcript 전문 및 성능 결과가 없습니다. Pilot 검증 이후에만 영상 12~18개와 추가 모델로 확대합니다.
 
 ## 평가 원칙
 
@@ -25,12 +25,15 @@ API 성공과 퀴즈 품질을 분리합니다. JSON 파싱, 문제·보기 수,
 - [`configs/pilot.yaml`](configs/pilot.yaml): Pilot의 방식·모델·문제 수·반복 횟수 설정. 실행기는 아직 없습니다.
 - [`data/videos.schema.json`](data/videos.schema.json): 영상 메타데이터와 사용 조건 기록 계약.
 - [`data/ground_truth.schema.json`](data/ground_truth.schema.json): 사람이 확인한 사실·근거·구간의 기록 계약.
+- [`data/videos.jsonl`](data/videos.jsonl): 공식 링크와 자막을 확인한 Pilot 영상 후보 3개.
+- [`data/ground_truth_candidates.jsonl`](data/ground_truth_candidates.jsonl): 공식 자막에서 추린 사실 후보. 모두 사람 검수 전이며 최종 ground truth가 아님.
+- [`docs/pilot-data-review.md`](docs/pilot-data-review.md): 권리·언어·영상 확인의 남은 조건.
 - [`docs/results-format.md`](docs/results-format.md): 실행별 JSONL과 집계 CSV 계약.
 - [`docs/selection.md`](docs/selection.md): 실험 뒤 선택 근거를 기록할 자리.
 - [`src/README.md`](src/README.md): 후속 실행 코드의 책임 경계.
 
-실제 API 키는 `GEMINI_API_KEY` 환경변수로만 전달합니다. 키를 코드, 설정 파일, `.env`, 로그, Git에 저장하지 않습니다. 공개 저장소에는 이용 허락을 확인한 메타데이터와 공유 가능한 평가 정보만 올립니다. 제한된 transcript와 원시 API 응답 및 로컬 결과는 `.gitignore` 대상입니다.
+실제 API 키는 `GEMINI_API_KEY` 환경변수로만 전달합니다. 키를 코드, 설정 파일, `.env`, 로그, Git에 저장하지 않습니다. 공개 저장소에는 공식 출처를 확인한 메타데이터와 자막을 바탕으로 재서술한 사실 후보만 올립니다. 영상·자막 전문은 포함하지 않습니다. 제한된 transcript와 원시 API 응답 및 로컬 결과는 `.gitignore` 대상입니다.
 
 ## 다음 단계
 
-영상 3~5개의 이용 조건과 수동 ground truth를 확정한 뒤 실행기를 구현하고, 비용 상한을 정한 후 Pilot을 실행합니다. 현재는 아직 Benchmark를 실행할 수 없습니다.
+후보 영상의 실제 재생 내용과 사실을 사람이 확인하고, 한국어 영상 후보 및 이용 조건을 확정한 뒤 실행기를 구현합니다. 비용 상한을 정한 후 Pilot을 실행합니다. 현재는 아직 Benchmark를 실행할 수 없습니다.
