@@ -12,7 +12,7 @@ AI 퀴즈의 영상 근거 확보 방식과 생성 모델을 **별도로** 비�
 
 기존 A/B/C와의 관계: **A**는 Gemini Grounding 후 Quiz 생성의 두 조합, **B**는 Gemini 직접 Quiz, **C**는 권한 있는 transcript 기반 두 조합입니다. 새로운 Quiz Generation Benchmark는 A/C의 한 실행을 그대로 비교하지 않고 **동일한 고정 입력**으로 생성 모델의 차이만 측정합니다.
 
-현재는 평가 계약과 영상 후보만 있습니다. Gemini·DeepSeek 호출 코드, 원본 영상 파일, transcript 전문 및 성능 결과는 없습니다. Pilot을 검증한 뒤에만 영상 12~18개와 추가 모델로 확대합니다.
+현재는 평가 계약과 영상 후보, 사람 검수를 마친 ground truth가 있습니다. Gemini·DeepSeek 호출 코드, 원본 영상 파일, transcript 전문 및 성능 결과는 없습니다. Pilot을 검증한 뒤에만 영상 12~18개와 추가 모델로 확대합니다.
 
 ## 평가 원칙
 
@@ -20,7 +20,7 @@ Grounding 결과와 Quiz 결과는 별도로 저장하고 실행 ID로 연결합
 
 `Cking-BE`의 현재 입력 계약은 `QuizGenerationInput(contentText)`이며 `sourceEvidence`가 해당 `contentText`에 포함되어야 합니다. `contentText`가 있는 A/C와 고정 입력 Quiz Benchmark에는 BE 호환 여부를 기록합니다. B는 원문 `contentText`가 없으므로 `beCompatibility`를 항상 `not_applicable`로 기록합니다. 문자열 포함 검사는 해당 문장이 **실제 영상에 존재하거나 정답을 뒷받침함**을 증명하지 않습니다.
 
-현재 [ground truth 후보](data/ground_truth_candidates.jsonl) 12개는 영상별 3개이며 모두 `pending_human`입니다. 실제 영상을 직접 확인하고 검수자·시각을 기록하기 전에는 확정 ground truth로 사용하지 않습니다. 영상 4개와 후보 12개의 내용·상태는 이번 설계 변경에서 수정하지 않습니다.
+현재 [ground truth 후보](data/ground_truth_candidates.jsonl) 12개는 영상별 3개이며 모두 `approved`입니다. 사용자가 YouTube 영상의 자막·내용을 확인해 후보 사실과 일치한다고 판정했습니다. 이는 timestamp의 프레임 단위 정확성이나 원본 transcript 전문을 검증했다는 뜻은 아닙니다. 새 후보는 `pending_human`으로 등록하고 사람이 검수한 뒤에만 승인합니다.
 
 ## 데이터와 설정
 
@@ -28,7 +28,7 @@ Grounding 결과와 Quiz 결과는 별도로 저장하고 실행 ID로 연결합
 - [`data/videos.schema.json`](data/videos.schema.json): 영상 메타데이터와 사용 조건 기록 계약.
 - [`data/ground_truth.schema.json`](data/ground_truth.schema.json): 사람이 확인한 사실·근거·구간의 기록 계약.
 - [`data/videos.jsonl`](data/videos.jsonl): 공식 링크와 자막을 확인한 Pilot 영상 후보 4개(영어 3, 한국어 1).
-- [`data/ground_truth_candidates.jsonl`](data/ground_truth_candidates.jsonl): 공식 자막에서 추린 사실 후보. 모두 사람 검수 전이며 최종 ground truth가 아님.
+- [`data/ground_truth_candidates.jsonl`](data/ground_truth_candidates.jsonl): 공식 자료에서 추린 사실 후보 12개. YouTube 자막·내용에 대한 사람 검수 후 모두 `approved`.
 - [`docs/pilot-data-review.md`](docs/pilot-data-review.md): 권리·언어·영상 확인의 남은 조건.
 - [`docs/results-format.md`](docs/results-format.md), [`docs/run-result.schema.json`](docs/run-result.schema.json): 계층별 실행 JSONL과 집계 CSV 계약.
 - [`docs/selection.md`](docs/selection.md): 실험 뒤 선택 근거를 기록할 자리.
@@ -38,4 +38,4 @@ Grounding 결과와 Quiz 결과는 별도로 저장하고 실행 ID로 연결합
 
 ## 다음 단계
 
-후보 영상의 실제 재생 내용과 사실을 사람이 확인하고, transcript 사용 권한 및 비용 상한을 확정한 뒤 실행기를 구현합니다. 현재는 아직 Benchmark를 실행할 수 없습니다.
+승인된 후보를 바탕으로 transcript 사용 권한 및 비용 상한을 확정한 뒤 실행기를 구현합니다. 현재는 아직 Benchmark를 실행할 수 없습니다.
