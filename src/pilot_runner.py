@@ -1,9 +1,11 @@
-"""One-condition Pilot runner. The CLI accepts fixtures only; no network client exists here."""
+"""One-condition Pilot runner. Live HTTP requires explicit safety options."""
 
 import argparse
 import hashlib
 import json
 import math
+import os
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -82,9 +84,9 @@ class PilotRunner:
             "estimatedCostUsd": None, "pricingReference": None,
         }
 
-    def _save(self, row, raw=None):
+    def _save(self, row, raw=None, evaluation=None):
         self._safe_results_path(self.results)
-        self._check_raw_secrets(raw)
+        self._validate_raw_metadata(raw)
         for key in ("latencyMs", "estimatedCostUsd", "totalLatencyMs", "totalEstimatedCostUsd"):
             value = row.get(key)
             if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value < 0):
@@ -104,6 +106,16 @@ class PilotRunner:
                 raise ValueError("Raw result file must not be a link")
             raw_file.write_text(
                 json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        if evaluation is not None:
+            evaluation_dir = self.results / "evaluation"
+            if evaluation_dir.resolve() != evaluation_dir:
+                raise ValueError("Evaluation results directory must not be a link")
+            evaluation_dir.mkdir(exist_ok=True)
+            evaluation_file = evaluation_dir / (row["runId"] + ".json")
+            if evaluation_file.resolve() != evaluation_file:
+                raise ValueError("Evaluation result file must not be a link")
+            evaluation_file.write_text(
+                json.dumps(evaluation, ensure_ascii=False, indent=2), encoding="utf-8")
         result_file = self.results / self.FILES[row["benchmarkType"]]
         if result_file.resolve() != result_file:
             raise ValueError("Result file must not be a link")
@@ -112,18 +124,16 @@ class PilotRunner:
         return row
 
     @staticmethod
-    def _check_raw_secrets(value):
-        # Provider adapters must pass response bodies only, never requests, headers or credentials.
-        forbidden = {"authorization", "headers", "apikey", "xgoogapikey", "secret",
-                     "accesstoken", "refreshtoken", "password", "credential", "request"}
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if not isinstance(key, str) or "".join(char for char in key.lower() if char.isalnum()) in forbidden:
-                    raise ValueError("Raw response contains a secret or request metadata field")
-                PilotRunner._check_raw_secrets(child)
-        elif isinstance(value, list):
-            for child in value:
-                PilotRunner._check_raw_secrets(child)
+    def _validate_raw_metadata(value):
+        if value is None or value == {"source": "fixture"}:
+            return
+        if (not isinstance(value, dict) or set(value) != {"status", "provider", "usage"}
+                or value["status"] != "completed" or value["provider"] not in ("gemini", "openai")
+                or not isinstance(value["usage"], dict)
+                or set(value["usage"]) != {"inputTokens", "outputTokens", "thinkingTokens", "toolUseTokens"}
+                or any(token is not None and (type(token) is not int or token < 0)
+                       for token in value["usage"].values())):
+            raise ValueError("Raw results may contain allowlisted provider metadata only")
 
     @staticmethod
     def _metrics(row, response, elapsed_ms):
@@ -174,12 +184,23 @@ class PilotRunner:
         if manifest.resolve() != manifest:
             raise ValueError("Fixed content manifest must not be a link")
         record = {"videoId": video_id, "promptVersion": prompt_version, "contentTextSha256": content_hash}
+        temp_path = None
         try:
-            with manifest.open("x", encoding="utf-8") as stream:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=root,
+                                             prefix=".fixed-", suffix=".tmp", delete=False) as stream:
+                temp_path = Path(stream.name)
                 json.dump(record, stream)
-        except FileExistsError:
-            if json.loads(manifest.read_text(encoding="utf-8")) != record:
-                raise ValueError("A different fixed contentText is registered for this video and promptVersion")
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Same-directory hard-link creation is atomic and never replaces the first writer.
+            try:
+                os.link(temp_path, manifest)
+            except FileExistsError:
+                if json.loads(manifest.read_text(encoding="utf-8")) != record:
+                    raise ValueError("A different fixed contentText is registered for this video and promptVersion")
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     @staticmethod
     def _call(provider, kind, **kwargs):
@@ -207,6 +228,7 @@ class PilotRunner:
             return self._save(row), None
         started = time.monotonic()
         raw = None
+        normalized = None
         try:
             if method == "authorized_transcript":
                 # The caller must supply text whose use rights have been checked. No AI call.
@@ -215,11 +237,12 @@ class PilotRunner:
             else:
                 response, elapsed = self._call(
                     provider, "grounding", video=self.videos[video_id], model=row["model"])
-                raw = response.get("raw")
-                if not isinstance(raw, dict) or not isinstance(raw.get("contentText"), str) or not raw["contentText"].strip():
+                normalized = response.get("normalized") if self._actual(provider) else response.get("raw")
+                raw = response.get("responseBody") if self._actual(provider) else {"source": "fixture"}
+                if not isinstance(normalized, dict) or not isinstance(normalized.get("contentText"), str) or not normalized["contentText"].strip():
                     raise ProviderFailure("invalid_grounding_response")
-                content = raw["contentText"]
-                facts = raw.get("facts", [])
+                content = normalized["contentText"]
+                facts = normalized.get("facts", [])
                 if not isinstance(facts, list):
                     raise ProviderFailure("invalid_grounding_response")
                 for fact in facts:
@@ -240,10 +263,10 @@ class PilotRunner:
                         "timestampAccurate": None, "reviewNote": None,
                     })
                 self._success(row, provider, response, elapsed)
-            return self._save(row, raw), content
+            return self._save(row, raw, normalized), content
         except ProviderFailure as exc:
             self._failure(row, provider, exc, started)
-            return self._save(row, raw), None
+            return self._save(row, raw, normalized), None
 
     def run_grounding(self, video_id, method, repetition, provider, authorized_transcript=None):
         return self._run_grounding(video_id, method, repetition, provider, authorized_transcript)[0]
@@ -280,7 +303,7 @@ class PilotRunner:
         row["questionCount"] = len(questions)
         row["questionReviews"] = self._question_reviews(len(questions))
         try:
-            if "promptVersion" in parsed and parsed["promptVersion"] is not None and not parsed["promptVersion"].strip():
+            if "promptVersion" not in parsed or parsed["promptVersion"] != row["promptVersion"]:
                 raise ValueError()
             if len(questions) != self.config["questions_per_video"]:
                 raise ValueError()
@@ -332,11 +355,12 @@ class PilotRunner:
                                            model=model, promptVersion=row["promptVersion"],
                                            questionCount=self.config["questions_per_video"],
                                            optionCount=self.config["options_per_question"])
-            raw = response.get("raw")
+            normalized = response.get("normalized") if self._actual(provider) else response.get("raw")
+            raw = response.get("responseBody") if self._actual(provider) else {"source": "fixture"}
             self._success(row, provider, response, elapsed)
-            self._evaluate_quiz(row, raw, content_text)
+            self._evaluate_quiz(row, normalized, content_text)
             row["beCompatibility"] = "pass" if row["validatorStatus"] == "pass" else "fail"
-            return self._save(row, raw)
+            return self._save(row, raw, normalized)
         except ProviderFailure as exc:
             self._failure(row, provider, exc, started)
             return self._save(row)
@@ -361,12 +385,15 @@ class PilotRunner:
                                                model=row["model"], promptVersion=row["promptVersion"],
                                                questionCount=self.config["questions_per_video"],
                                                optionCount=self.config["options_per_question"])
-                raw = response.get("raw")
+                normalized = response.get("normalized") if self._actual(provider) else response.get("raw")
+                raw = response.get("responseBody") if self._actual(provider) else {"source": "fixture"}
                 self._success(row, provider, response, elapsed)
-                self._evaluate_quiz(row, raw, None)
+                self._evaluate_quiz(row, normalized, None)
+                # A video-only direct Quiz cannot run the BE contentText validator.
+                row["validatorStatus"] = "not_run"
                 row["totalLatencyMs"] = row["latencyMs"]
                 row["totalEstimatedCostUsd"] = row["estimatedCostUsd"]
-                return self._save(row, raw)
+                return self._save(row, raw, normalized)
             except ProviderFailure as exc:
                 self._failure(row, provider, exc, started)
                 return self._save(row)
@@ -393,18 +420,46 @@ class PilotRunner:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run exactly one offline Pilot condition from a fixture")
+    parser = argparse.ArgumentParser(description="Run exactly one Pilot condition")
     parser.add_argument("mode", choices=("grounding", "quiz", "end-to-end"))
     parser.add_argument("--video-id", required=True)
     parser.add_argument("--method")
     parser.add_argument("--model")
     parser.add_argument("--repetition", type=int, required=True)
-    parser.add_argument("--fixture", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--fixture", type=Path)
+    source.add_argument("--live", action="store_true")
+    parser.add_argument("--call-limit", type=int)
+    parser.add_argument("--per-call-cost-limit", type=float)
+    parser.add_argument("--total-cost-limit", type=float,
+                        help="Estimated cost guard for this CLI run/ProviderRouter only; not a persistent billing cap")
+    parser.add_argument("--timeout-seconds", type=float)
+    parser.add_argument("--retry-attempts", type=int)
+    parser.add_argument("--reasoning-effort")
+    parser.add_argument("--video-processing")
+    parser.add_argument("--max-output-tokens", type=int)
+    parser.add_argument("--estimated-input-tokens", type=int)
+    parser.add_argument("--input-price-per-million", type=float)
+    parser.add_argument("--output-price-per-million", type=float)
     parser.add_argument("--content-file", type=Path)
     parser.add_argument("--authorized-transcript-file", type=Path)
     parser.add_argument("--results-dir", type=Path, default=Path("results"))
     args = parser.parse_args()
-    provider = FixtureProvider(json.loads(args.fixture.read_text(encoding="utf-8")))
+    if args.live:
+        from src.provider_adapters import LivePolicy, ProviderRouter
+        policy = LivePolicy(enabled=True, call_limit=args.call_limit,
+                            per_call_cost_limit=args.per_call_cost_limit,
+                            total_cost_limit=args.total_cost_limit,
+                            timeout_seconds=args.timeout_seconds, retry_attempts=args.retry_attempts,
+                            reasoning_effort=args.reasoning_effort, video_processing=args.video_processing,
+                            max_output_tokens=args.max_output_tokens,
+                            estimated_input_tokens=args.estimated_input_tokens,
+                            input_price_per_million=args.input_price_per_million,
+                            output_price_per_million=args.output_price_per_million)
+        policy.authorize("direct" if args.mode == "end-to-end" else args.mode, 0, 0)
+        provider = ProviderRouter(policy)
+    else:
+        provider = FixtureProvider(json.loads(args.fixture.read_text(encoding="utf-8")))
     runner = PilotRunner(Path(__file__).resolve().parents[1], args.results_dir)
     transcript = args.authorized_transcript_file.read_text(encoding="utf-8") if args.authorized_transcript_file else None
     if args.mode == "grounding":

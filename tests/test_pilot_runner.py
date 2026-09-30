@@ -1,8 +1,12 @@
 import json
+import os
 import shutil
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
+from unittest import mock
 
 from src.pilot_runner import FixtureProvider, PilotRunner
 
@@ -11,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VIDEO = "nasa-water-cycle-2019"
 CONTENT = "NASA measures global rain and snow every 30 minutes."
 QUIZ = {
-    "promptVersion": "quiz-mcq-v1",
+    "promptVersion": "pilot-v1",
     "questions": [
         {"question": f"Question {i}?", "options": ["A", "B", "C", "D"],
          "correctOptionIndex": 0, "explanation": "Because NASA observes it.",
@@ -60,9 +64,9 @@ class PilotRunnerTest(unittest.TestCase):
     def test_two_models_use_exact_same_fixed_content_and_hash(self):
         provider = FixtureProvider({"quiz": {"raw": QUIZ}})
         gemini = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
-        deepseek = self.runner.run_quiz(VIDEO, "deepseek-flash", 1, CONTENT, provider)
+        openai = self.runner.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, provider)
         self.assertEqual(provider.calls[0]["contentText"], provider.calls[1]["contentText"])
-        self.assertEqual(gemini["contentTextSha256"], deepseek["contentTextSha256"])
+        self.assertEqual(gemini["contentTextSha256"], openai["contentTextSha256"])
         self.assertEqual(gemini["beCompatibility"], "pass")
         self.assertIsNone(gemini["questionReviews"][0]["answerAccuracy"])
 
@@ -70,7 +74,7 @@ class PilotRunnerTest(unittest.TestCase):
         provider = FixtureProvider({"quiz": {"raw": QUIZ}})
         self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
         with self.assertRaisesRegex(ValueError, "fixed contentText"):
-            self.runner.run_quiz(VIDEO, "deepseek-flash", 1, CONTENT + " changed", provider)
+            self.runner.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT + " changed", provider)
         self.assertEqual(len(provider.calls), 1)
 
     def test_canonical_input_survives_different_result_directories(self):
@@ -79,18 +83,18 @@ class PilotRunnerTest(unittest.TestCase):
         first.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, FixtureProvider({"quiz": {"raw": QUIZ}}))
         provider = FixtureProvider({"quiz": {"raw": QUIZ}})
         with self.assertRaisesRegex(ValueError, "fixed contentText"):
-            second.run_quiz(VIDEO, "deepseek-flash", 1, CONTENT + " changed", provider)
+            second.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT + " changed", provider)
         self.assertFalse(provider.calls)
 
     def test_canonical_input_is_scoped_to_video_and_prompt_version(self):
         provider = FixtureProvider({"quiz": {"raw": QUIZ}})
         self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
         other_video = "nasa-methane-2020"
-        self.runner.run_quiz(other_video, "deepseek-flash", 1, CONTENT + " other", provider)
+        self.runner.run_quiz(other_video, "gpt-5.4-mini", 1, CONTENT + " other", provider)
         config = self.repository / "configs" / "pilot.yaml"
         config.write_text(config.read_text(encoding="utf-8").replace("pilot-v1", "pilot-v2"), encoding="utf-8")
         next_version = PilotRunner(self.repository, self.repository / "results" / "next")
-        next_version.run_quiz(VIDEO, "deepseek-flash", 1, CONTENT + " changed", provider)
+        next_version.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT + " changed", provider)
         self.assertEqual(len(provider.calls), 3)
 
     def test_unsafe_result_paths_are_rejected(self):
@@ -133,10 +137,58 @@ class PilotRunnerTest(unittest.TestCase):
                 self.assertIsNone(row["estimatedCostUsd"])
 
     def test_raw_response_with_authorization_header_is_not_saved(self):
-        with self.assertRaisesRegex(ValueError, "secret"):
-            self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
-                                 FixtureProvider({"quiz": {"raw": dict(QUIZ, Authorization="Bearer example")}}))
-        self.assertFalse((self.results / "quiz-generation.jsonl").exists())
+        row = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
+                                   FixtureProvider({"quiz": {"raw": dict(QUIZ, Authorization="Bearer example")}}))
+        self.assertNotIn("Bearer example", (self.results / "raw" / (row["runId"] + ".json")).read_text(encoding="utf-8"))
+
+    def test_raw_metadata_rejects_freeform_provider_output(self):
+        row = self.runner._base("quiz_generation", VIDEO, "fixed_content_text", "gemini-3.8-flash", 1)
+        for unsafe in ({"status": "completed", "provider": "gemini", "usage": {
+                "inputTokens": 1, "outputTokens": 1, "thinkingTokens": None, "toolUseTokens": None},
+                "outputText": "Bearer unrelated-credential"},
+                       {"source": "fixture", "Authorization": "Bearer unrelated-credential"}):
+            with self.subTest(unsafe=unsafe), self.assertRaisesRegex(ValueError, "allowlisted"):
+                self.runner._save(row, unsafe)
+        self.assertFalse(self.results.exists())
+
+    def test_concurrent_manifest_publication_is_complete_and_rejects_different_content(self):
+        original_link = os.link
+        barrier = Barrier(2)
+        def synchronized_link(source, target):
+            barrier.wait(timeout=5)
+            return original_link(source, target)
+        hashes = ["a" * 64, "b" * 64]
+        with mock.patch("src.pilot_runner.os.link", side_effect=synchronized_link):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(self.runner._require_fixed_content, VIDEO, item) for item in hashes]
+                outcomes = []
+                for future in futures:
+                    try:
+                        future.result()
+                        outcomes.append("accepted")
+                    except ValueError:
+                        outcomes.append("mismatch")
+        self.assertEqual(sorted(outcomes), ["accepted", "mismatch"])
+        root = self.repository / "data" / "restricted" / "fixed-content"
+        manifests = list(root.glob("*.json"))
+        self.assertEqual(len(manifests), 1)
+        self.assertIn(json.loads(manifests[0].read_text(encoding="utf-8"))["contentTextSha256"], hashes)
+
+    def test_concurrent_manifest_publication_accepts_same_content(self):
+        original_link = os.link
+        barrier = Barrier(2)
+        def synchronized_link(source, target):
+            barrier.wait(timeout=5)
+            return original_link(source, target)
+        with mock.patch("src.pilot_runner.os.link", side_effect=synchronized_link):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(self.runner._require_fixed_content, VIDEO, "a" * 64)
+                           for _ in range(2)]
+                for future in futures:
+                    future.result()
+        root = self.repository / "data" / "restricted" / "fixed-content"
+        self.assertEqual(len(list(root.glob("*.json"))), 1)
+        self.assertEqual(len(list(root.glob("*.tmp"))), 0)
 
     def test_evidence_substring_is_only_an_automatic_contract_check(self):
         provider = FixtureProvider({"quiz": {"raw": dict(QUIZ, questions=[
@@ -167,7 +219,7 @@ class PilotRunnerTest(unittest.TestCase):
 
     def test_two_stage_results_are_linked_and_separate(self):
         provider = FixtureProvider({"grounding": {"raw": GROUNDING}, "quiz": {"raw": QUIZ}})
-        row = self.runner.run_end_to_end(VIDEO, "gemini_grounding_deepseek_quiz", 1, provider)
+        row = self.runner.run_end_to_end(VIDEO, "gemini_grounding_openai_quiz", 1, provider)
         grounding = self.rows("video-grounding.jsonl")[0]
         quiz = self.rows("quiz-generation.jsonl")[0]
         self.assertEqual(row["groundingRunId"], grounding["runId"])
