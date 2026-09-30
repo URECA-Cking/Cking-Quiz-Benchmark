@@ -1,5 +1,9 @@
-# 후속 실행 코드 경계
+# Pilot 실행 코드 경계
 
-Pilot 구현 시 이 디렉터리에서 Video Grounding, 고정 `contentText` 기반 Quiz Generation, End-to-End 조합의 실행을 분리합니다. Gemini·DeepSeek 호출, 응답 파싱, 자동 평가, 지연 시간·토큰·비용 기록도 각각 구분합니다. Grounding과 Quiz 결과는 별도 JSONL에 쓰고 실행 ID로 연결합니다. 현재 실행 코드는 없습니다.
+`pilot_runner.py`는 Video Grounding, 고정 `contentText` 기반 Quiz Generation, End-to-End 조합을 **한 조건씩** 실행합니다. 현재 CLI는 `FixtureProvider`만 사용하므로 외부 요청을 보낼 수 없습니다. 후속 Gemini·DeepSeek Adapter는 `invoke(kind, **kwargs)`를 구현하고 실제 API 호출 구현에만 `is_actual_api = True`를 명시해야 합니다. Adapter는 응답 **본문만** raw로 전달하며 요청, 헤더, API Key 및 인증 정보를 포함하면 안 됩니다. 실행기는 민감한 이름의 raw 필드를 거부합니다. 응답 파싱·자동 계약 검사와 결과 저장은 Provider 호출과 분리되어 있습니다. Grounding과 Quiz 결과는 별도 JSONL에 쓰고 `runId`로 End-to-End 결과와 연결합니다. 원시 응답은 무시되는 `results/raw/`에 별도로 남깁니다. `--results-dir`은 저장소의 `results/`와 그 하위 경로만 허용합니다.
 
-`Cking-BE`의 Provider 또는 Core Engine 코드를 복사해 독립 구현체로 발전시키지 않습니다. BE 계약을 평가 기준으로만 참조하고, Gemini 직접 Quiz 방식의 BE 호환성은 `not_applicable`로 기록합니다. 모델 비교에는 영상별 동일한 고정 `contentText`를 사용합니다. 외부 호출과 평가 결과는 운영 Quiz·Mission 데이터에 쓰지 않습니다.
+`pip install -r requirements.txt` 후 저장소 루트에서 예를 들어 `python -m src.pilot_runner quiz --video-id nasa-water-cycle-2019 --model gemini-3.8-flash --repetition 1 --content-file <로컬-고정-텍스트> --fixture <로컬-fixture.json>`처럼 한 조건을 지정합니다. fixture에는 `{"quiz":{"raw":{"promptVersion":"quiz-mcq-v1","questions":[...]}}}` 형식의 응답을 둡니다. 다른 두 mode는 `grounding`과 `end-to-end`이며 `--method`를 명시합니다. 허용 method/model/repetition은 `configs/pilot.yaml`에서 읽습니다. transcript 경로는 이용 권한을 확인한 파일을 `--authorized-transcript-file`로 **명시적으로** 제공할 때만 실행합니다. 입력 내용, 원본 응답과 로컬 결과는 Git에 올리지 않습니다.
+
+Quiz Generation의 독립 비교는 영상·Pilot prompt 버전당 첫 고정 `contentText`의 SHA-256을 로컬 `data/restricted/fixed-content/`에 기록합니다. 이후 실행은 결과 디렉터리와 무관하게 이 해시와 비교하고 다르면 Provider 호출 전에 거부합니다. 이 파일은 Git-ignore 대상이며 새로운 환경에서는 동일 입력을 다시 준비해야 합니다. End-to-End에서 새로 추출한 text는 `sourceGroundingRunId`로 구분하므로 독립적인 고정 입력 비교에 섞지 않습니다. fixture 및 로컬 transcript 경로는 `apiStatus=not_run`이며 API latency·token·cost를 모두 `null`로 둡니다. 향후 실제 API 실패만 `apiStatus=error`로 기록합니다. 사람 품질 판정은 `null`로 남습니다.
+
+`Cking-BE`의 Provider 또는 Core Engine 코드를 복사해 독립 구현체로 발전시키지 않습니다. BE 계약을 평가 기준으로만 참조하고, Gemini 직접 Quiz 방식의 BE 호환성은 `not_applicable`로 기록합니다. 문자열 포함·구조 검사 통과는 영상 사실성이나 사람 검수 통과를 뜻하지 않습니다. 외부 호출과 평가 결과는 운영 Quiz·Mission 데이터에 쓰지 않습니다.

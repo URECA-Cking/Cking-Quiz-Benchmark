@@ -12,7 +12,7 @@ AI 퀴즈의 영상 근거 확보 방식과 생성 모델을 **별도로** 비�
 
 기존 A/B/C와의 관계: **A**는 Gemini Grounding 후 Quiz 생성의 두 조합, **B**는 Gemini 직접 Quiz, **C**는 권한 있는 transcript 기반 두 조합입니다. 새로운 Quiz Generation Benchmark는 A/C의 한 실행을 그대로 비교하지 않고 **동일한 고정 입력**으로 생성 모델의 차이만 측정합니다.
 
-현재는 평가 계약과 영상 후보, 사람 검수를 마친 ground truth가 있습니다. Gemini·DeepSeek 호출 코드, 원본 영상 파일, transcript 전문 및 성능 결과는 없습니다. Pilot을 검증한 뒤에만 영상 12~18개와 추가 모델로 확대합니다.
+현재는 평가 계약과 영상 후보, 사람 검수를 마친 ground truth, **fixture 전용 단일 조건 실행기**가 있습니다. fixture 결과는 API 미실행(`apiStatus=not_run`)으로 기록하며 실제 latency·token·cost 성능 결과로 사용하지 않습니다. Gemini·DeepSeek 실제 호출 코드, 원본 영상 파일, transcript 전문 및 성능 결과는 없습니다. Pilot을 검증한 뒤에만 영상 12~18개와 추가 모델로 확대합니다.
 
 ## 평가 원칙
 
@@ -24,7 +24,7 @@ Grounding 결과와 Quiz 결과는 별도로 저장하고 실행 ID로 연결합
 
 ## 데이터와 설정
 
-- [`configs/pilot.yaml`](configs/pilot.yaml): 세 평가의 방식·모델·문제 수·반복 횟수 설정. 실행기는 아직 없습니다.
+- [`configs/pilot.yaml`](configs/pilot.yaml): 세 평가의 방식·모델·문제 수·반복 횟수 설정.
 - [`data/videos.schema.json`](data/videos.schema.json): 영상 메타데이터와 사용 조건 기록 계약.
 - [`data/ground_truth.schema.json`](data/ground_truth.schema.json): 사람이 확인한 사실·근거·구간의 기록 계약.
 - [`data/videos.jsonl`](data/videos.jsonl): 공식 링크와 자막을 확인한 Pilot 영상 후보 4개(영어 3, 한국어 1).
@@ -32,10 +32,10 @@ Grounding 결과와 Quiz 결과는 별도로 저장하고 실행 ID로 연결합
 - [`docs/pilot-data-review.md`](docs/pilot-data-review.md): 권리·언어·영상 확인의 남은 조건.
 - [`docs/results-format.md`](docs/results-format.md), [`docs/run-result.schema.json`](docs/run-result.schema.json): 계층별 실행 JSONL과 집계 CSV 계약.
 - [`docs/selection.md`](docs/selection.md): 실험 뒤 선택 근거를 기록할 자리.
-- [`src/README.md`](src/README.md): 후속 실행 코드의 책임 경계.
+- [`src/README.md`](src/README.md): fixture 실행 방법과 후속 Provider 경계.
 
 실제 API 키는 각각 `GEMINI_API_KEY`, `DEEPSEEK_API_KEY` 환경변수로만 전달합니다. 키를 코드, 설정 파일, `.env`, 로그, Git에 저장하지 않습니다. 공개 저장소에는 출처를 확인한 메타데이터와 재서술한 사실 후보만 올립니다. 영상·자막 전문, 제한된 transcript, 원시 API 응답 및 로컬 결과는 Git에 포함하지 않습니다.
 
 ## 다음 단계
 
-승인된 후보를 바탕으로 transcript 사용 권한 및 비용 상한을 확정한 뒤 실행기를 구현합니다. 현재는 아직 Benchmark를 실행할 수 없습니다.
+승인된 후보를 바탕으로 transcript 사용 권한, 실제 모델 ID와 비용 상한을 확정해야 합니다. 현재 실행기는 fixture만 읽으며 외부 AI API를 호출하는 Provider Adapter는 없습니다. 실제 Pilot 실행 전 별도 검토가 필요합니다.

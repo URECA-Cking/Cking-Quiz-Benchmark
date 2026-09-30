@@ -1,6 +1,6 @@
 # 결과 형식 계약
 
-실제 결과 파일은 로컬 `results/`에 저장하며 Git에 올리지 않습니다. 원시 Provider 응답은 별도 로컬 파일로 두고, 공유할 때 권리·개인정보·비밀정보를 검토합니다. 각 JSONL 행은 [`run-result.schema.json`](run-result.schema.json)의 세 결과 유형 중 하나입니다. 아직 실행기는 없으며 아래는 후속 구현의 데이터 계약입니다.
+실제 결과 파일은 저장소의 Git-ignore된 `results/` 안에 저장하며 Git에 올리지 않습니다. 다른 저장소 경로나 저장소 밖 경로는 실행기가 거부합니다. 원시 Provider 응답은 `results/raw/<runId>.json`에 별도로 두고, 공유할 때 권리·개인정보·비밀정보를 검토합니다. 각 JSONL 행은 [`run-result.schema.json`](run-result.schema.json)의 세 결과 유형 중 하나입니다. 현재 실행기는 fixture 전용이며 실제 Provider 호출은 지원하지 않습니다. fixture와 로컬 transcript는 `apiStatus=not_run`, API latency·token·cost는 `null`로 기록합니다. fixture가 모의한 오류는 `errorCategory=fixture_...`로 구분합니다.
 
 ## 분리된 실행 결과
 
