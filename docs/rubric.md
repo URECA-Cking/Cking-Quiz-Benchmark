@@ -18,7 +18,7 @@ Gemini 영상 분석과 **해당 영상에 사용할 권한이 확인된** trans
 
 ## Quiz Generation Benchmark
 
-영상별로 **한 번 고정한 동일 `contentText`와 해시**, 같은 질문 3개·보기 4개·프롬프트 버전·출력 계약을 `gemini-3.8-flash`와 `deepseek-flash`에 제공합니다. 모델별 입력 텍스트가 달라지면 생성 모델 비교로 집계하지 않습니다. 출력은 같은 JSON/Parser/Validator 계약으로 평가합니다.
+영상별로 **한 번 고정한 동일 `contentText`와 해시**, 같은 질문 3개·보기 4개·프롬프트 버전·출력 계약을 `gemini-3.8-flash`와 `gpt-5.4-mini`에 제공합니다. 모델별 입력 텍스트가 달라지면 생성 모델 비교로 집계하지 않습니다. 출력은 같은 JSON/Parser/Validator 계약으로 평가합니다.
 
 | 항목 | 자동 기록 | 사람 검수 |
 | --- | --- | --- |
@@ -32,6 +32,6 @@ Gemini 영상 분석과 **해당 영상에 사용할 권한이 확인된** trans
 
 ## End-to-End Benchmark
 
-Gemini Grounding → Gemini Quiz, Gemini Grounding → DeepSeek Quiz, Gemini 직접 Quiz, 권한 있는 transcript → 두 Quiz 모델을 각각 실행합니다. Grounding과 Quiz 결과를 별도 실행 ID로 보존해 실패 계층, 전체 지연·비용, 최종 퀴즈 품질을 함께 기록합니다. 직접 Quiz는 `contentText`가 없으므로 `beCompatibility = not_applicable`이며 BE 검증 통과율의 분모에도 넣지 않습니다.
+Gemini Grounding → Gemini Quiz, Gemini Grounding → OpenAI Quiz, Gemini 직접 Quiz, 권한 있는 transcript → 두 Quiz 모델을 각각 실행합니다. Grounding과 Quiz 결과를 별도 실행 ID로 보존해 실패 계층, 전체 지연·비용, 최종 퀴즈 품질을 함께 기록합니다. 직접 Quiz는 `contentText`가 없으므로 `beCompatibility = not_applicable`이며 BE 검증 통과율의 분모에도 넣지 않습니다.
 
 사람 검수는 사실·질문별로 `pass`, `fail`, `uncertain`을 기록하고 판단 근거를 남깁니다. `uncertain`을 성공으로 합산하지 않습니다. 승인되지 않은 ground truth 후보로는 확정 품질 점수를 만들지 않습니다. Timestamp나 모델이 작성한 `sourceEvidence` 문장만으로 영상 사실성이 입증되지 않습니다. 권한 있는 transcript가 없으면 해당 조건을 `not_run`으로 기록하고 다른 방식의 성공으로 대체하지 않습니다.

@@ -44,11 +44,11 @@
       "required": ["groundingFacts"]
     },
     {
-      "properties": {"benchmarkType": {"const": "quiz_generation"}, "method": {"const": "fixed_content_text"}, "model": {"enum": ["gemini-3.8-flash", "deepseek-flash"]}},
+      "properties": {"benchmarkType": {"const": "quiz_generation"}, "method": {"const": "fixed_content_text"}, "model": {"enum": ["gemini-3.8-flash", "gpt-5.4-mini"]}},
       "required": ["contentTextSha256", "parseStatus", "validatorStatus", "beCompatibility", "questionReviews"]
     },
     {
-      "properties": {"benchmarkType": {"const": "end_to_end"}, "method": {"enum": ["gemini_grounding_gemini_quiz", "gemini_grounding_deepseek_quiz", "gemini_direct_quiz", "transcript_gemini_quiz", "transcript_deepseek_quiz"]}},
+      "properties": {"benchmarkType": {"const": "end_to_end"}, "method": {"enum": ["gemini_grounding_gemini_quiz", "gemini_grounding_openai_quiz", "gemini_direct_quiz", "transcript_gemini_quiz", "transcript_openai_quiz"]}},
       "required": ["groundingRunId", "quizRunId", "beCompatibility", "questionReviews"],
       "allOf": [
         {
