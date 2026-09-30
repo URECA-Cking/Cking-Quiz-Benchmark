@@ -7,6 +7,9 @@ import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
 
 from src.pilot_runner import ProviderFailure
 
@@ -55,20 +58,31 @@ class LivePolicy:
     estimated_input_tokens: int = None
     input_price_per_million: float = None
     output_price_per_million: float = None
+    pricing_reference: str = None
+    provider_prices: dict = None
 
-    def authorize(self, kind, calls, reserved_cost):
+    def prices(self, provider):
+        if self.provider_prices is not None:
+            return self.provider_prices.get(provider, (None, None, None))
+        return (self.input_price_per_million, self.output_price_per_million,
+                self.pricing_reference)
+
+    def authorize(self, kind, calls, reserved_cost, provider):
+        input_price, output_price, reference = self.prices(provider)
         values = (self.per_call_cost_limit, self.total_cost_limit, self.timeout_seconds,
-                  self.input_price_per_million, self.output_price_per_million)
+                  input_price, output_price)
         if (self.enabled is not True or type(self.call_limit) is not int or self.call_limit < 1
                 or type(self.retry_attempts) is not int or self.retry_attempts < 0
                 or type(self.max_output_tokens) is not int or self.max_output_tokens < 1
                 or type(self.estimated_input_tokens) is not int or self.estimated_input_tokens < 1
                 or any(type(v) not in (int, float) or not math.isfinite(v) or v <= 0 for v in values)
-                or self.reasoning_effort not in ("none", "low", "medium", "high", "xhigh")
+                or not isinstance(reference, str) or not reference.strip()
+                or (provider == "openai" and self.reasoning_effort not in
+                    ("none", "low", "medium", "high", "xhigh"))
                 or (kind in ("grounding", "direct") and self.video_processing not in ("static", "agentic"))):
             raise ProviderFailure("live_guard")
-        estimate = (self.estimated_input_tokens * self.input_price_per_million
-                    + self.max_output_tokens * self.output_price_per_million) / 1000000
+        estimate = (self.estimated_input_tokens * input_price
+                    + self.max_output_tokens * output_price) / 1000000
         if (calls >= self.call_limit or estimate > self.per_call_cost_limit
                 or reserved_cost + estimate > self.total_cost_limit):
             raise ProviderFailure("live_guard")
@@ -88,24 +102,53 @@ def urllib_transport(url, headers, body, timeout):
 class ProviderRouter:
     is_actual_api = True
 
-    def __init__(self, policy, transport=None, api_keys=None):
+    def __init__(self, policy, transport=None, api_keys=None, pilot_config=None):
         self.policy = policy
         self.transport = transport or urllib_transport
         self.api_keys = api_keys
+        if pilot_config is None:
+            config_path = Path(__file__).resolve().parents[1] / "configs" / "pilot.yaml"
+            pilot_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))["pilot"]
+        self.models = self._model_registry(pilot_config)
         self.calls = 0
         self.reserved_cost = 0.0
 
+    @staticmethod
+    def _model_registry(config):
+        registry = {}
+        def register(model, provider, key_name, kind):
+            if (provider not in ("gemini", "openai") or not isinstance(key_name, str)
+                    or not key_name or not isinstance(model, str) or not model):
+                raise ValueError("Invalid Pilot provider configuration")
+            entry = registry.setdefault(model, {"provider": provider, "key_name": key_name,
+                                                "kinds": set()})
+            if entry["provider"] != provider or entry["key_name"] != key_name:
+                raise ValueError("Conflicting Pilot model configuration")
+            entry["kinds"].add(kind)
+        for method in config["video_grounding"]["methods"]:
+            if "model" in method:
+                register(method["model"], method["provider"],
+                         method["api_key_environment_variable"], "grounding")
+        for model in config["quiz_generation"]["models"]:
+            register(model["id"], model["provider"],
+                     model["api_key_environment_variable"], "quiz")
+        for method in config["end_to_end"]["methods"]:
+            if method["grounding"] == "direct_video":
+                model = method["quiz_model"]
+                if model not in registry or registry[model]["provider"] != "gemini":
+                    raise ValueError("Direct video requires a configured Gemini model")
+                registry[model]["kinds"].add("direct")
+        return registry
+
     def invoke(self, kind, **kwargs):
         model = kwargs.get("model")
-        if ((model == "gemini-3.8-flash" and kind in ("grounding", "quiz", "direct"))
-                or (model == "gpt-5.4-mini" and kind == "quiz")):
-            pass
-        else:
+        entry = self.models.get(model)
+        if entry is None or kind not in entry["kinds"]:
             raise ProviderFailure("unsupported_provider")
-        estimate = self.policy.authorize(kind, self.calls, self.reserved_cost)
-        provider = "gemini" if model == "gemini-3.8-flash" else "openai"
+        provider = entry["provider"]
+        estimate = self.policy.authorize(kind, self.calls, self.reserved_cost, provider)
         key = (self.api_keys or {}).get(provider) if self.api_keys is not None else os.getenv(
-            "GEMINI_API_KEY" if provider == "gemini" else "OPENAI_API_KEY")
+            entry["key_name"])
         if not key:
             raise ProviderFailure("api_key_missing")
         body = self._request(provider, kind, **kwargs)
@@ -116,7 +159,7 @@ class ProviderRouter:
         status = None
         for attempt in range(self.policy.retry_attempts + 1):
             # Count every HTTP attempt, including retries, against the explicit caps.
-            self.policy.authorize(kind, self.calls, self.reserved_cost)
+            self.policy.authorize(kind, self.calls, self.reserved_cost, provider)
             self.calls += 1
             self.reserved_cost += estimate
             try:
@@ -143,6 +186,14 @@ class ProviderRouter:
                 raise ProviderFailure("provider_error")
             else:
                 result = self._extract(provider, response)
+                input_tokens, output_tokens = result["inputTokens"], result["outputTokens"]
+                if input_tokens is not None and output_tokens is not None:
+                    input_price, output_price, reference = self.policy.prices(provider)
+                    billed_output = output_tokens + (result["thinkingTokens"] or 0) if provider == "gemini" else output_tokens
+                    result["estimatedCostUsd"] = (input_tokens * input_price
+                                                  + billed_output * output_price) / 1000000
+                    result["pricingReference"] = reference
+                    self.reserved_cost += result["estimatedCostUsd"] - estimate
                 return result
             if attempt == self.policy.retry_attempts:
                 raise ProviderFailure(category)

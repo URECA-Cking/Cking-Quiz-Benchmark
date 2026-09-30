@@ -3,6 +3,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from src.pilot_runner import PilotRunner, ProviderFailure
 from src.provider_adapters import LivePolicy, ProviderRouter
@@ -24,7 +25,7 @@ def policy(**overrides):
                   timeout_seconds=10, retry_attempts=0, reasoning_effort="none",
                   video_processing="static", max_output_tokens=2000,
                   estimated_input_tokens=10000, input_price_per_million=1.0,
-                  output_price_per_million=1.0)
+                  output_price_per_million=1.0, pricing_reference="operator-test-pricing")
     values.update(overrides)
     return LivePolicy(**values)
 
@@ -71,6 +72,67 @@ class ProviderAdapterTest(unittest.TestCase):
         self.assertEqual(result["thinkingTokens"], 3)
         self.assertNotIn("gemini-test-secret", json.dumps(result))
 
+    def test_configured_model_alias_uses_configured_provider_and_key_name(self):
+        config = {"video_grounding": {"methods": [{"id": "gemini_video", "model": "gemini-pilot-alias",
+                    "provider": "gemini", "api_key_environment_variable": "PILOT_GEMINI_KEY"}]},
+                  "quiz_generation": {"models": [{"id": "gemini-pilot-alias", "provider": "gemini",
+                    "api_key_environment_variable": "PILOT_GEMINI_KEY"}]},
+                  "end_to_end": {"methods": [{"id": "gemini_direct_quiz", "grounding": "direct_video",
+                    "quiz_model": "gemini-pilot-alias"}]}}
+        transport = FakeTransport(gemini_response(GROUNDING))
+        with mock.patch.dict("os.environ", {"PILOT_GEMINI_KEY": "alias-secret"}):
+            router = ProviderRouter(policy(reasoning_effort=None), transport=transport, pilot_config=config)
+            result = router.invoke("grounding", video=VIDEO, model="gemini-pilot-alias")
+        self.assertEqual(result["normalized"], GROUNDING)
+        self.assertEqual(transport.calls[0][1]["x-goog-api-key"], "alias-secret")
+        self.assertEqual(transport.calls[0][2]["model"], "gemini-pilot-alias")
+
+    def test_actual_usage_produces_cost_with_reference_and_gemini_thinking(self):
+        result = self.router(FakeTransport(gemini_response(GROUNDING)),
+                             input_price_per_million=2.0, output_price_per_million=3.0).invoke(
+                                 "grounding", video=VIDEO, model="gemini-3.8-flash")
+        self.assertAlmostEqual(result["estimatedCostUsd"], (10 * 2 + (20 + 3) * 3) / 1000000)
+        self.assertEqual(result["pricingReference"], "operator-test-pricing")
+
+    def test_mixed_provider_prices_are_applied_to_each_response(self):
+        prices = {"gemini": (2.0, 3.0, "gemini-price-source"),
+                  "openai": (5.0, 7.0, "openai-price-source")}
+        gemini = self.router(FakeTransport(gemini_response(GROUNDING)),
+                             provider_prices=prices).invoke("grounding", video=VIDEO,
+                                                             model="gemini-3.8-flash")
+        response = {"status": "completed", "output": [{"type": "message", "content": [
+                    {"type": "output_text", "text": json.dumps(QUIZ)}]}],
+                    "usage": {"input_tokens": 11, "output_tokens": 22,
+                              "output_tokens_details": {"reasoning_tokens": 2}}}
+        openai = self.router(FakeTransport(response), provider_prices=prices).invoke(
+            "quiz", model="gpt-5.4-mini", contentText=CONTENT, promptVersion="pilot-v1",
+            questionCount=3, optionCount=4)
+        self.assertAlmostEqual(gemini["estimatedCostUsd"], (10 * 2 + 23 * 3) / 1000000)
+        self.assertAlmostEqual(openai["estimatedCostUsd"], (11 * 5 + 22 * 7) / 1000000)
+        self.assertEqual(openai["pricingReference"], "openai-price-source")
+
+    def test_actual_usage_replaces_preflight_reservation_before_next_call(self):
+        transport = FakeTransport(gemini_response(GROUNDING))
+        router = self.router(transport, call_limit=2, estimated_input_tokens=1,
+                             max_output_tokens=1, total_cost_limit=0.000034)
+        router.invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
+        with self.assertRaises(ProviderFailure) as failure:
+            router.invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
+        self.assertEqual(failure.exception.category, "live_guard")
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_openai_requires_reasoning_but_gemini_does_not(self):
+        gemini = self.router(FakeTransport(gemini_response(GROUNDING)), reasoning_effort=None)
+        self.assertEqual(gemini.invoke("grounding", video=VIDEO,
+                                      model="gemini-3.8-flash")["normalized"], GROUNDING)
+        transport = FakeTransport({})
+        with self.assertRaises(ProviderFailure) as failure:
+            self.router(transport, reasoning_effort=None).invoke(
+                "quiz", model="gpt-5.4-mini", contentText=CONTENT, promptVersion="pilot-v1",
+                questionCount=3, optionCount=4)
+        self.assertEqual(failure.exception.category, "live_guard")
+        self.assertEqual(transport.calls, [])
+
     def test_gemini_quiz_and_direct_use_structured_output(self):
         for kind, arguments in (("quiz", {"contentText": CONTENT}), ("direct", {"video": VIDEO})):
             with self.subTest(kind=kind):
@@ -105,7 +167,7 @@ class ProviderAdapterTest(unittest.TestCase):
     def test_live_guard_blocks_before_transport(self):
         transport = FakeTransport(gemini_response(QUIZ))
         for config in ({"enabled": False}, {"per_call_cost_limit": None},
-                       {"reasoning_effort": None}, {"video_processing": None}):
+                       {"pricing_reference": None}, {"video_processing": None}):
             with self.subTest(config=config), self.assertRaises(ProviderFailure):
                 self.router(transport, **config).invoke("direct", video=VIDEO,
                     model="gemini-3.8-flash", promptVersion="pilot-v1", questionCount=3, optionCount=4)
@@ -151,6 +213,8 @@ class ProviderAdapterTest(unittest.TestCase):
                     router = self.router(FakeTransport(response))
                     row = runner.run_quiz(VIDEO["videoId"], model, 1, CONTENT, router)
                     self.assertEqual(row["apiStatus"], "success")
+                    self.assertIsNotNone(row["estimatedCostUsd"])
+                    self.assertEqual(row["pricingReference"], "operator-test-pricing")
                     self.assertEqual(row["validatorStatus"], "pass")
                     self.assertEqual(row["beCompatibility"], "pass")
                     self.assertTrue(all(review["answerAccuracy"] is None and
@@ -219,6 +283,7 @@ class ProviderAdapterTest(unittest.TestCase):
             self.assertIsNotNone(row["quizRunId"])
             self.assertNotEqual(row["groundingRunId"], row["quizRunId"])
             self.assertEqual(row["beCompatibility"], "pass")
+            self.assertIsNotNone(row["totalEstimatedCostUsd"])
             direct = runner.run_end_to_end(VIDEO["videoId"], "gemini_direct_quiz", 1,
                                            self.router(FakeTransport(gemini_response(QUIZ))))
             self.assertEqual(direct["beCompatibility"], "not_applicable")

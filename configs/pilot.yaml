@@ -10,6 +10,7 @@ pilot:
     methods:
       - id: gemini_video
         model: gemini-3.8-flash
+        provider: gemini
         api_key_environment_variable: GEMINI_API_KEY
       - id: authorized_transcript
         # 영상별 사용 권한이 확인된 transcript/caption이 있을 때만 실행한다.
@@ -19,8 +20,10 @@ pilot:
     fixed_content_text_required: true
     models:
       - id: gemini-3.8-flash
+        provider: gemini
         api_key_environment_variable: GEMINI_API_KEY
       - id: gpt-5.4-mini
+        provider: openai
         api_key_environment_variable: OPENAI_API_KEY
   end_to_end:
     methods:

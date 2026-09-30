@@ -441,12 +441,29 @@ def main():
     parser.add_argument("--estimated-input-tokens", type=int)
     parser.add_argument("--input-price-per-million", type=float)
     parser.add_argument("--output-price-per-million", type=float)
+    parser.add_argument("--pricing-reference", help="Source URL/date for the supplied token prices")
+    for provider_name in ("gemini", "openai"):
+        parser.add_argument(f"--{provider_name}-input-price-per-million", type=float)
+        parser.add_argument(f"--{provider_name}-output-price-per-million", type=float)
+        parser.add_argument(f"--{provider_name}-pricing-reference")
     parser.add_argument("--content-file", type=Path)
     parser.add_argument("--authorized-transcript-file", type=Path)
     parser.add_argument("--results-dir", type=Path, default=Path("results"))
     args = parser.parse_args()
+    runner = PilotRunner(Path(__file__).resolve().parents[1], args.results_dir)
     if args.live:
         from src.provider_adapters import LivePolicy, ProviderRouter
+        provider_prices = {}
+        for provider_name in ("gemini", "openai"):
+            provider_input = getattr(args, f"{provider_name}_input_price_per_million")
+            provider_output = getattr(args, f"{provider_name}_output_price_per_million")
+            provider_reference = getattr(args, f"{provider_name}_pricing_reference")
+            if any(value is not None for value in (provider_input, provider_output, provider_reference)):
+                provider_prices[provider_name] = (provider_input, provider_output, provider_reference)
+        if provider_prices and (args.input_price_per_million is not None
+                                or args.output_price_per_million is not None
+                                or args.pricing_reference is not None):
+            parser.error("Use either generic or provider-specific pricing options")
         policy = LivePolicy(enabled=True, call_limit=args.call_limit,
                             per_call_cost_limit=args.per_call_cost_limit,
                             total_cost_limit=args.total_cost_limit,
@@ -455,12 +472,39 @@ def main():
                             max_output_tokens=args.max_output_tokens,
                             estimated_input_tokens=args.estimated_input_tokens,
                             input_price_per_million=args.input_price_per_million,
-                            output_price_per_million=args.output_price_per_million)
-        policy.authorize("direct" if args.mode == "end-to-end" else args.mode, 0, 0)
-        provider = ProviderRouter(policy)
+                            output_price_per_million=args.output_price_per_million,
+                            pricing_reference=args.pricing_reference,
+                            provider_prices=provider_prices or None)
+        provider = ProviderRouter(policy, pilot_config=runner.config)
+        if args.mode == "quiz":
+            selected = [("quiz", args.model)]
+        elif args.mode == "grounding":
+            method = next((item for item in runner.config["video_grounding"]["methods"]
+                           if item["id"] == args.method), None)
+            selected = [("grounding", method["model"])] if method and "model" in method else []
+        else:
+            method = next((item for item in runner.config["end_to_end"]["methods"]
+                           if item["id"] == args.method), None)
+            if method is None:
+                parser.error("Unknown end-to-end method")
+            if method["grounding"] == "direct_video":
+                selected = [("direct", method["quiz_model"])]
+            else:
+                grounding = next((item for item in runner.config["video_grounding"]["methods"]
+                                  if item["id"] == method["grounding"]), None)
+                selected = ([("grounding", grounding["model"])] if grounding and "model" in grounding else [])
+                selected.append(("quiz", method["quiz_model"]))
+        providers = {provider.models[model]["provider"] for _, model in selected
+                     if model in provider.models}
+        if len(providers) > 1 and not provider_prices:
+            parser.error("Mixed-provider live runs require provider-specific pricing")
+        for kind, model in selected:
+            entry = provider.models.get(model)
+            if entry is None or kind not in entry["kinds"]:
+                parser.error("Unsupported live provider/model for the selected condition")
+            policy.authorize(kind, 0, 0, entry["provider"])
     else:
         provider = FixtureProvider(json.loads(args.fixture.read_text(encoding="utf-8")))
-    runner = PilotRunner(Path(__file__).resolve().parents[1], args.results_dir)
     transcript = args.authorized_transcript_file.read_text(encoding="utf-8") if args.authorized_transcript_file else None
     if args.mode == "grounding":
         if not args.method:

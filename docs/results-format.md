@@ -10,6 +10,8 @@
 
 공통 식별·호출 필드는 `runId`, `videoId`, `method`, `model`, `promptVersion`, `repetition`, `startedAt`, `apiStatus` (`success|error|not_run`), `errorCategory`, `latencyMs`, `inputTokens`, `outputTokens`, `thinkingTokens`, `estimatedCostUsd`, `pricingReference`입니다. transcript Grounding처럼 적용되지 않는 값과 Provider가 usage를 반환하지 않은 값은 `null`로 두며 `0`으로 채우지 않습니다. 로컬 원본의 경로·전체 텍스트·API Key는 공유 결과 행에 넣지 않습니다.
 
+실제 Provider가 입력·출력 usage를 반환하고 운영자가 모델별 단가와 출처를 제공한 경우 `estimatedCostUsd`는 usage × 입력/출력 단가의 추정치로 기록합니다. Gemini는 별도 thought token을 출력에 더하고, OpenAI는 reasoning token이 포함된 `outputTokens`를 그대로 사용합니다. usage가 없으면 비용은 `null`입니다. 이 값은 실제 청구액이 아니며 영상 입력 토큰의 사전 추정이나 캐시·계정별 요금 차이를 보장하지 않습니다.
+
 사람 판정 값은 `pass|fail|uncertain`입니다. 평가하지 않았거나 승인된 ground truth가 없어 확정할 수 없는 값은 `null`입니다. `uncertain`과 `null`을 성공으로 합산하지 않습니다. `evidenceTextContained`는 문자열 검사이고 `evidenceSupportsAnswer` 및 `videoGrounding`은 별도의 사람 판정입니다. timestamp의 값이 있다는 것과 `timestampAccurate=pass`는 다른 의미입니다.
 
 ## 집계 CSV
