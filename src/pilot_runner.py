@@ -438,7 +438,10 @@ def main():
     parser.add_argument("--reasoning-effort")
     parser.add_argument("--video-processing")
     parser.add_argument("--max-output-tokens", type=int)
-    parser.add_argument("--estimated-input-tokens", type=int)
+    parser.add_argument("--video-estimated-input-tokens", type=int,
+                        help="Pre-call input token estimate for video Grounding or Direct Quiz")
+    parser.add_argument("--quiz-estimated-input-tokens", type=int,
+                        help="Pre-call input token estimate for fixed contentText Quiz Generation")
     parser.add_argument("--input-price-per-million", type=float)
     parser.add_argument("--output-price-per-million", type=float)
     parser.add_argument("--pricing-reference", help="Source URL/date for the supplied token prices")
@@ -470,7 +473,8 @@ def main():
                             timeout_seconds=args.timeout_seconds, retry_attempts=args.retry_attempts,
                             reasoning_effort=args.reasoning_effort, video_processing=args.video_processing,
                             max_output_tokens=args.max_output_tokens,
-                            estimated_input_tokens=args.estimated_input_tokens,
+                            video_estimated_input_tokens=args.video_estimated_input_tokens,
+                            quiz_estimated_input_tokens=args.quiz_estimated_input_tokens,
                             input_price_per_million=args.input_price_per_million,
                             output_price_per_million=args.output_price_per_million,
                             pricing_reference=args.pricing_reference,

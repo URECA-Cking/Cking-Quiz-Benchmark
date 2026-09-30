@@ -55,7 +55,8 @@ class LivePolicy:
     reasoning_effort: str = None
     video_processing: str = None
     max_output_tokens: int = None
-    estimated_input_tokens: int = None
+    video_estimated_input_tokens: int = None
+    quiz_estimated_input_tokens: int = None
     input_price_per_million: float = None
     output_price_per_million: float = None
     pricing_reference: str = None
@@ -69,19 +70,25 @@ class LivePolicy:
 
     def authorize(self, kind, calls, reserved_cost, provider):
         input_price, output_price, reference = self.prices(provider)
+        if kind in ("grounding", "direct"):
+            estimated_input_tokens = self.video_estimated_input_tokens
+        elif kind == "quiz":
+            estimated_input_tokens = self.quiz_estimated_input_tokens
+        else:
+            raise ProviderFailure("live_guard")
         values = (self.per_call_cost_limit, self.total_cost_limit, self.timeout_seconds,
                   input_price, output_price)
         if (self.enabled is not True or type(self.call_limit) is not int or self.call_limit < 1
                 or type(self.retry_attempts) is not int or self.retry_attempts < 0
                 or type(self.max_output_tokens) is not int or self.max_output_tokens < 1
-                or type(self.estimated_input_tokens) is not int or self.estimated_input_tokens < 1
+                or type(estimated_input_tokens) is not int or estimated_input_tokens < 1
                 or any(type(v) not in (int, float) or not math.isfinite(v) or v <= 0 for v in values)
                 or not isinstance(reference, str) or not reference.strip()
                 or (provider == "openai" and self.reasoning_effort not in
                     ("none", "low", "medium", "high", "xhigh"))
                 or (kind in ("grounding", "direct") and self.video_processing not in ("static", "agentic"))):
             raise ProviderFailure("live_guard")
-        estimate = (self.estimated_input_tokens * input_price
+        estimate = (estimated_input_tokens * input_price
                     + self.max_output_tokens * output_price) / 1000000
         if (calls >= self.call_limit or estimate > self.per_call_cost_limit
                 or reserved_cost + estimate > self.total_cost_limit):

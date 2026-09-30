@@ -24,7 +24,8 @@ def policy(**overrides):
     values = dict(enabled=True, call_limit=1, per_call_cost_limit=1.0, total_cost_limit=1.0,
                   timeout_seconds=10, retry_attempts=0, reasoning_effort="none",
                   video_processing="static", max_output_tokens=2000,
-                  estimated_input_tokens=10000, input_price_per_million=1.0,
+                  video_estimated_input_tokens=10000, quiz_estimated_input_tokens=10000,
+                  input_price_per_million=1.0,
                   output_price_per_million=1.0, pricing_reference="operator-test-pricing")
     values.update(overrides)
     return LivePolicy(**values)
@@ -113,13 +114,74 @@ class ProviderAdapterTest(unittest.TestCase):
 
     def test_actual_usage_replaces_preflight_reservation_before_next_call(self):
         transport = FakeTransport(gemini_response(GROUNDING))
-        router = self.router(transport, call_limit=2, estimated_input_tokens=1,
+        router = self.router(transport, call_limit=2, video_estimated_input_tokens=1,
                              max_output_tokens=1, total_cost_limit=0.000034)
         router.invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
         with self.assertRaises(ProviderFailure) as failure:
             router.invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
         self.assertEqual(failure.exception.category, "live_guard")
         self.assertEqual(len(transport.calls), 1)
+
+    def test_pre_call_estimate_uses_the_selected_input_stage(self):
+        guard = policy(video_estimated_input_tokens=1000, quiz_estimated_input_tokens=100,
+                       max_output_tokens=1)
+        self.assertAlmostEqual(guard.authorize("grounding", 0, 0, "gemini"), 0.001001)
+        self.assertAlmostEqual(guard.authorize("direct", 0, 0, "gemini"), 0.001001)
+        self.assertAlmostEqual(guard.authorize("quiz", 0, 0, "gemini"), 0.000101)
+
+    def test_each_kind_requires_only_its_own_estimate_before_http(self):
+        grounding = FakeTransport(gemini_response(GROUNDING))
+        self.router(grounding, quiz_estimated_input_tokens=None).invoke(
+            "grounding", video=VIDEO, model="gemini-3.8-flash")
+        self.assertEqual(len(grounding.calls), 1)
+
+        quiz = FakeTransport(gemini_response(QUIZ))
+        self.router(quiz, video_estimated_input_tokens=None).invoke(
+            "quiz", model="gemini-3.8-flash", contentText=CONTENT,
+            promptVersion="pilot-v1", questionCount=3, optionCount=4)
+        self.assertEqual(len(quiz.calls), 1)
+
+        direct = FakeTransport(gemini_response(QUIZ))
+        self.router(direct, quiz_estimated_input_tokens=None).invoke(
+            "direct", video=VIDEO, model="gemini-3.8-flash",
+            promptVersion="pilot-v1", questionCount=3, optionCount=4)
+        self.assertEqual(len(direct.calls), 1)
+
+        for kind, missing, arguments in (
+                ("grounding", {"video_estimated_input_tokens": None},
+                 {"video": VIDEO}),
+                ("quiz", {"quiz_estimated_input_tokens": None},
+                 {"contentText": CONTENT, "promptVersion": "pilot-v1",
+                  "questionCount": 3, "optionCount": 4}),
+                ("direct", {"video_estimated_input_tokens": None},
+                 {"video": VIDEO, "promptVersion": "pilot-v1",
+                  "questionCount": 3, "optionCount": 4})):
+            transport = FakeTransport({})
+            with self.subTest(kind=kind), self.assertRaises(ProviderFailure) as failure:
+                self.router(transport, **missing).invoke(
+                    kind, model="gemini-3.8-flash", **arguments)
+            self.assertEqual(failure.exception.category, "live_guard")
+            self.assertEqual(transport.calls, [])
+
+    def test_end_to_end_uses_video_then_quiz_estimate_and_actual_usage(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as folder:
+            repository = Path(folder)
+            (repository / "configs").mkdir()
+            (repository / "data").mkdir()
+            shutil.copyfile(root / "configs" / "pilot.yaml", repository / "configs" / "pilot.yaml")
+            shutil.copyfile(root / "data" / "videos.jsonl", repository / "data" / "videos.jsonl")
+            runner = PilotRunner(repository, repository / "results")
+            transport = QueueTransport((gemini_response(GROUNDING), gemini_response(QUIZ)))
+            router = self.router(transport, call_limit=2, max_output_tokens=1,
+                                 video_estimated_input_tokens=1000,
+                                 quiz_estimated_input_tokens=100,
+                                 total_cost_limit=0.00102)
+            row = runner.run_end_to_end(VIDEO["videoId"], "gemini_grounding_gemini_quiz", 1,
+                                        router)
+            self.assertEqual(row["apiStatus"], "success")
+            self.assertEqual(len(transport.calls), 2)
+            self.assertAlmostEqual(router.reserved_cost, 0.000066)
 
     def test_openai_requires_reasoning_but_gemini_does_not(self):
         gemini = self.router(FakeTransport(gemini_response(GROUNDING)), reasoning_effort=None)
