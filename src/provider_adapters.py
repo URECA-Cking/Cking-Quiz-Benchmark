@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from src.pilot_runner import ProviderFailure
+from src.provider_failure import ProviderFailure
 
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
@@ -164,9 +164,15 @@ class ProviderRouter:
         headers["x-goog-api-key" if provider == "gemini" else "Authorization"] = (
             key if provider == "gemini" else "Bearer " + key)
         status = None
+        last_http_failure = None
         for attempt in range(self.policy.retry_attempts + 1):
             # Count every HTTP attempt, including retries, against the explicit caps.
-            self.policy.authorize(kind, self.calls, self.reserved_cost, provider)
+            try:
+                self.policy.authorize(kind, self.calls, self.reserved_cost, provider)
+            except ProviderFailure:
+                if last_http_failure is not None:
+                    raise last_http_failure
+                raise
             self.calls += 1
             self.reserved_cost += estimate
             try:
@@ -188,9 +194,9 @@ class ProviderRouter:
             elif 500 <= status < 600:
                 category = "server_error"
             elif 400 <= status < 500:
-                raise ProviderFailure("client_error")
+                raise ProviderFailure("client_error", status)
             elif not 200 <= status < 300:
-                raise ProviderFailure("provider_error")
+                raise ProviderFailure("provider_error", status)
             else:
                 result = self._extract(provider, response)
                 input_tokens, output_tokens = result["inputTokens"], result["outputTokens"]
@@ -203,7 +209,8 @@ class ProviderRouter:
                     self.reserved_cost += result["estimatedCostUsd"] - estimate
                 return result
             if attempt == self.policy.retry_attempts:
-                raise ProviderFailure(category)
+                raise ProviderFailure(category, status)
+            last_http_failure = ProviderFailure(category, status)
         raise ProviderFailure("provider_error")
 
     def _request(self, provider, kind, **kwargs):

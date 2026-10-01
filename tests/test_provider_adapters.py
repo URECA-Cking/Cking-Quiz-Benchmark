@@ -1,5 +1,9 @@
+import contextlib
+import io
 import json
+import runpy
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -58,6 +62,81 @@ def gemini_response(payload, status="completed"):
 
 
 class ProviderAdapterTest(unittest.TestCase):
+    @staticmethod
+    def cli_runner_namespace():
+        captured = {}
+
+        def capture(frame, event, _arg):
+            if (event == "call" and frame.f_code.co_name == "main"
+                    and frame.f_globals.get("__name__") == "__main__"):
+                captured.update(runner=frame.f_globals["PilotRunner"],
+                                failure=frame.f_globals["ProviderFailure"])
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(capture)
+            with mock.patch.object(sys, "argv", ["src.pilot_runner", "--help"]):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        runpy.run_module("src.pilot_runner", run_name="__main__", alter_sys=True)
+                    except SystemExit as exc:
+                        if exc.code != 0:
+                            raise
+        finally:
+            sys.setprofile(previous_profile)
+        return captured["runner"], captured["failure"]
+
+    def test_python_m_runner_and_adapter_share_provider_failure_class(self):
+        _, cli_failure = self.cli_runner_namespace()
+        self.assertIs(cli_failure, ProviderFailure)
+
+    def test_python_m_runner_preserves_http_failure_categories_without_secrets(self):
+        cli_runner, _ = self.cli_runner_namespace()
+        root = Path(__file__).resolve().parents[1]
+        for status, expected in ((400, "client_error"), (401, "client_error"),
+                                 (403, "client_error"), (429, "rate_limit"),
+                                 (500, "server_error")):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as folder:
+                repository = Path(folder)
+                (repository / "configs").mkdir()
+                (repository / "data").mkdir()
+                shutil.copyfile(root / "configs" / "pilot.yaml", repository / "configs" / "pilot.yaml")
+                shutil.copyfile(root / "data" / "videos.jsonl", repository / "data" / "videos.jsonl")
+                row = cli_runner(repository, repository / "results").run_grounding(
+                    VIDEO["videoId"], "gemini_video", 1,
+                    self.router(FakeTransport({"error": "Bearer unrelated-secret"}, status)))
+                self.assertEqual(row["errorCategory"], expected)
+                self.assertEqual(row["httpStatus"], status)
+                saved = (repository / "results" / "video-grounding.jsonl").read_text(encoding="utf-8")
+                self.assertNotIn("gemini-test-secret", saved)
+                self.assertNotIn("unrelated-secret", saved)
+                self.assertNotIn("Authorization", saved)
+                self.assertNotIn("request", saved)
+                self.assertEqual(json.loads(saved)["httpStatus"], status)
+
+    def test_python_m_runner_keeps_generic_exception_as_provider_error(self):
+        cli_runner, _ = self.cli_runner_namespace()
+
+        class BrokenProvider:
+            is_actual_api = True
+
+            def invoke(self, _kind, **_kwargs):
+                raise RuntimeError("Bearer unrelated-secret")
+
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as folder:
+            repository = Path(folder)
+            (repository / "configs").mkdir()
+            (repository / "data").mkdir()
+            shutil.copyfile(root / "configs" / "pilot.yaml", repository / "configs" / "pilot.yaml")
+            shutil.copyfile(root / "data" / "videos.jsonl", repository / "data" / "videos.jsonl")
+            row = cli_runner(repository, repository / "results").run_grounding(
+                VIDEO["videoId"], "gemini_video", 1, BrokenProvider())
+            self.assertEqual(row["errorCategory"], "provider_error")
+            self.assertIsNone(row["httpStatus"])
+            saved = (repository / "results" / "video-grounding.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn("unrelated-secret", saved)
+
     def router(self, transport, **overrides):
         return ProviderRouter(policy(**overrides), transport=transport,
                               api_keys={"gemini": "gemini-test-secret", "openai": "openai-test-secret"})
@@ -290,12 +369,39 @@ class ProviderAdapterTest(unittest.TestCase):
                     self.assertNotIn("openai-test-secret", json.dumps(saved))
 
     def test_retry_cannot_exceed_http_call_limit(self):
+        for status, category in ((429, "rate_limit"), (500, "server_error")):
+            with self.subTest(status=status):
+                transport = FakeTransport({"error": "Bearer unrelated-secret"}, status)
+                with self.assertRaises(ProviderFailure) as failure:
+                    self.router(transport, retry_attempts=2, call_limit=1).invoke(
+                        "grounding", video=VIDEO, model="gemini-3.8-flash")
+                self.assertEqual((failure.exception.category, failure.exception.http_status),
+                                 (category, status))
+                self.assertEqual(len(transport.calls), 1)
+                with tempfile.TemporaryDirectory() as folder:
+                    repository = Path(folder)
+                    (repository / "configs").mkdir()
+                    (repository / "data").mkdir()
+                    root = Path(__file__).resolve().parents[1]
+                    shutil.copyfile(root / "configs" / "pilot.yaml", repository / "configs" / "pilot.yaml")
+                    shutil.copyfile(root / "data" / "videos.jsonl", repository / "data" / "videos.jsonl")
+                    row = PilotRunner(repository, repository / "results").run_grounding(
+                        VIDEO["videoId"], "gemini_video", 1,
+                        self.router(FakeTransport({"error": "Bearer unrelated-secret"}, status),
+                                    retry_attempts=2, call_limit=1))
+                    self.assertEqual((row["errorCategory"], row["httpStatus"]), (category, status))
+                    saved = (repository / "results" / "video-grounding.jsonl").read_text(encoding="utf-8")
+                    self.assertNotIn("unrelated-secret", saved)
+                    self.assertNotIn("gemini-test-secret", saved)
+
+    def test_first_call_guard_rejection_remains_live_guard_without_http_status(self):
         transport = FakeTransport({}, 429)
         with self.assertRaises(ProviderFailure) as failure:
-            self.router(transport, retry_attempts=2, call_limit=1).invoke(
+            self.router(transport, retry_attempts=2, call_limit=0).invoke(
                 "grounding", video=VIDEO, model="gemini-3.8-flash")
-        self.assertEqual(failure.exception.category, "live_guard")
-        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual((failure.exception.category, failure.exception.http_status),
+                         ("live_guard", None))
+        self.assertEqual(transport.calls, [])
 
     def test_provider_echo_keeps_evaluation_output_but_not_persisted_metadata(self):
         for echoed in ("gemini-test-secret", "Bearer unrelated-credential"):

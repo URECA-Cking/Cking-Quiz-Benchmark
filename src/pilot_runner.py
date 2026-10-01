@@ -13,11 +13,7 @@ from pathlib import Path
 
 import yaml
 
-
-class ProviderFailure(Exception):
-    def __init__(self, category):
-        super().__init__(category)
-        self.category = category
+from src.provider_failure import ProviderFailure
 
 
 class FixtureProvider:
@@ -73,13 +69,39 @@ class PilotRunner:
         if not 1 <= repetition <= self.config["repetitions_per_condition"]:
             raise ValueError("Repetition is outside pilot configuration")
 
-    def _base(self, benchmark_type, video_id, method, model, repetition):
+    def _next_attempt(self, benchmark_type, video_id, method, model, repetition,
+                      prompt_version=None, content_hash=None):
+        result_file = self.results / self.FILES[benchmark_type]
+        if not result_file.exists():
+            return 1
+        if result_file.resolve() != result_file:
+            raise ValueError("Result file must not be a link")
+        latest = 0
+        for line in result_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            existing = json.loads(line)
+            if (existing.get("videoId") == video_id and existing.get("method") == method
+                    and existing.get("model") == model and existing.get("repetition") == repetition
+                    and (benchmark_type != "quiz_generation"
+                         or (existing.get("promptVersion") == prompt_version
+                             and existing.get("contentTextSha256") == content_hash))):
+                attempt = existing.get("attempt", 1)
+                if type(attempt) is not int or attempt < 1:
+                    raise ValueError("Invalid attempt in existing result")
+                latest = max(latest, attempt)
+        return latest + 1
+
+    def _base(self, benchmark_type, video_id, method, model, repetition, content_hash=None):
+        prompt_version = self.config["prompt_version"] if benchmark_type != "video_grounding" else None
         return {
             "benchmarkType": benchmark_type, "runId": uuid.uuid4().hex,
             "videoId": video_id, "method": method, "model": model,
-            "promptVersion": self.config["prompt_version"] if benchmark_type != "video_grounding" else None,
+            "attempt": self._next_attempt(benchmark_type, video_id, method, model, repetition,
+                                          prompt_version, content_hash),
+            "promptVersion": prompt_version,
             "repetition": repetition, "startedAt": datetime.now(timezone.utc).isoformat(),
-            "apiStatus": "not_run", "errorCategory": None, "latencyMs": None,
+            "apiStatus": "not_run", "errorCategory": None, "httpStatus": None, "latencyMs": None,
             "inputTokens": None, "outputTokens": None, "thinkingTokens": None,
             "estimatedCostUsd": None, "pricingReference": None,
         }
@@ -168,6 +190,7 @@ class PilotRunner:
         category = failure.category
         category = category if isinstance(category, str) and category else "provider_error"
         row["errorCategory"] = category if actual else "fixture_" + category
+        row["httpStatus"] = failure.http_status if actual else None
         if actual:
             row["latencyMs"] = round((time.monotonic() - started) * 1000, 3)
 
@@ -344,7 +367,8 @@ class PilotRunner:
         content_hash = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
         if source_grounding_run_id is None:
             self._require_fixed_content(video_id, content_hash)
-        row = self._base("quiz_generation", video_id, "fixed_content_text", model, repetition)
+        row = self._base("quiz_generation", video_id, "fixed_content_text", model, repetition,
+                         content_hash)
         row.update(contentTextSha256=content_hash,
                    sourceGroundingRunId=source_grounding_run_id, parseStatus="not_run",
                    validatorStatus="not_run", beCompatibility="not_run", questionCount=None,

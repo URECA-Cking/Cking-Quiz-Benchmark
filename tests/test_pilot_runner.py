@@ -61,6 +61,79 @@ class PilotRunnerTest(unittest.TestCase):
         self.assertTrue((self.results / "raw" / (row["runId"] + ".json")).exists())
         self.assertNotIn("contentText", row)
 
+    def test_attempt_starts_at_one_and_failed_run_increments_without_overwrite(self):
+        failed = self.runner.run_grounding(
+            VIDEO, "gemini_video", 1, FixtureProvider({"grounding": {"errorCategory": "rate_limit"}}))
+        retried = self.runner.run_grounding(
+            VIDEO, "gemini_video", 1, FixtureProvider({"grounding": {"raw": GROUNDING}}))
+        rows = self.rows("video-grounding.jsonl")
+        self.assertEqual([row["attempt"] for row in rows], [1, 2])
+        self.assertEqual([row["runId"] for row in rows], [failed["runId"], retried["runId"]])
+        self.assertNotEqual(failed["runId"], retried["runId"])
+        self.assertEqual(rows[0]["errorCategory"], "fixture_rate_limit")
+
+    def test_legacy_result_without_attempt_counts_as_first_attempt(self):
+        self.results.mkdir()
+        existing = {"videoId": VIDEO, "method": "gemini_video", "repetition": 1,
+                    "model": "gemini-3.8-flash", "runId": "existing-failure", "apiStatus": "error"}
+        result_file = self.results / "video-grounding.jsonl"
+        original = json.dumps(existing) + "\n"
+        result_file.write_text(original, encoding="utf-8")
+        row = self.runner.run_grounding(VIDEO, "gemini_video", 1,
+                                        FixtureProvider({"grounding": {"raw": GROUNDING}}))
+        self.assertEqual(row["attempt"], 2)
+        self.assertTrue(result_file.read_text(encoding="utf-8").startswith(original))
+        self.assertNotIn("attempt", self.rows("video-grounding.jsonl")[0])
+
+    def test_attempt_sequence_is_separate_for_repetition_video_method_and_model(self):
+        provider = FixtureProvider({"grounding": {"raw": GROUNDING}, "quiz": {"raw": QUIZ}})
+        self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)
+        second_repetition = self.runner.run_grounding(VIDEO, "gemini_video", 2, provider)
+        other_video = self.runner.run_grounding("nasa-methane-2020", "gemini_video", 1, provider)
+        other_method = self.runner.run_grounding(VIDEO, "authorized_transcript", 1, provider,
+                                                 authorized_transcript=CONTENT)
+        gemini = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
+        openai = self.runner.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, provider)
+        for row in (second_repetition, other_video, other_method, gemini, openai):
+            self.assertEqual(row["attempt"], 1)
+
+    def test_grounding_attempt_uses_video_method_model_and_repetition(self):
+        provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+        first = self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)
+        same = self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)
+        other_repetition = self.runner.run_grounding(VIDEO, "gemini_video", 2, provider)
+        self.assertEqual((first["attempt"], same["attempt"], other_repetition["attempt"]), (1, 2, 1))
+
+        # A previously used model must not consume this model's attempt sequence.
+        other_model = dict(first, model="another-video-model", attempt=5)
+        with (self.results / "video-grounding.jsonl").open("a", encoding="utf-8") as target:
+            target.write(json.dumps(other_model) + "\n")
+        self.assertEqual(self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)["attempt"], 3)
+
+    def test_quiz_attempt_uses_model_prompt_version_content_hash_and_repetition(self):
+        provider = FixtureProvider({"quiz": {"raw": QUIZ}})
+        first = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
+        self.assertEqual(first["attempt"], 1)
+        self.assertEqual(self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)["attempt"], 2)
+        self.assertEqual(self.runner.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, provider)["attempt"], 1)
+        self.assertEqual(self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 2, CONTENT, provider)["attempt"], 1)
+
+        result_file = self.results / "quiz-generation.jsonl"
+        with result_file.open("a", encoding="utf-8") as target:
+            target.write(json.dumps(dict(first, promptVersion="pilot-v2", attempt=8)) + "\n")
+            target.write(json.dumps(dict(first, contentTextSha256="0" * 64, attempt=9)) + "\n")
+        self.assertEqual(self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)["attempt"], 3)
+
+        for changed in ({"promptVersion": "pilot-v2"}, {"contentTextSha256": "0" * 64}):
+            with self.subTest(changed=changed):
+                isolated = self.results / ("changed-prompt" if "promptVersion" in changed else "changed-content")
+                isolated.mkdir()
+                (isolated / "quiz-generation.jsonl").write_text(
+                    json.dumps(dict(first, attempt=7, **changed)) + "\n", encoding="utf-8")
+                row = PilotRunner(self.repository, isolated).run_quiz(
+                    VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
+                self.assertEqual(row["attempt"], 1)
+
     def test_two_models_use_exact_same_fixed_content_and_hash(self):
         provider = FixtureProvider({"quiz": {"raw": QUIZ}})
         gemini = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
