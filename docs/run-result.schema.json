@@ -17,6 +17,7 @@
     "apiStatus": {"enum": ["success", "error", "not_run"]},
     "errorCategory": {"type": ["string", "null"]},
     "httpStatus": {"type": ["integer", "null"], "minimum": 100, "maximum": 599},
+    "providerErrorCode": {"type": ["string", "null"]},
     "latencyMs": {"type": ["number", "null"], "minimum": 0},
     "inputTokens": {"type": ["integer", "null"], "minimum": 0},
     "outputTokens": {"type": ["integer", "null"], "minimum": 0},
@@ -27,6 +28,7 @@
     "omission": {"$ref": "#/$defs/nullableReview"},
     "hallucination": {"$ref": "#/$defs/nullableReview"},
     "contentTextSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "contentTextApprovalStatus": {"enum": ["approved", null]},
     "sourceGroundingRunId": {"type": ["string", "null"]},
     "parseStatus": {"enum": ["pass", "fail", "not_run"]},
     "validatorStatus": {"enum": ["pass", "fail", "not_run"]},
@@ -43,7 +45,9 @@
   "oneOf": [
     {
       "properties": {"benchmarkType": {"const": "video_grounding"}, "method": {"enum": ["gemini_video", "authorized_transcript"]}},
-      "required": ["groundingFacts"]
+      "required": ["groundingFacts"],
+      "if": {"properties": {"contentTextApprovalStatus": {"const": "approved"}}, "required": ["contentTextApprovalStatus"]},
+      "then": {"required": ["contentTextSha256"]}
     },
     {
       "properties": {"benchmarkType": {"const": "quiz_generation"}, "method": {"const": "fixed_content_text"}, "model": {"enum": ["gemini-3.8-flash", "gpt-5.4-mini"]}},

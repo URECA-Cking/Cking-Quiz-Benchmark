@@ -1,8 +1,10 @@
 import json
+import hashlib
 import os
 import shutil
 import tempfile
 import unittest
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
@@ -48,6 +50,107 @@ class PilotRunnerTest(unittest.TestCase):
     def rows(self, name):
         return [json.loads(line) for line in (self.results / name).read_text(encoding="utf-8").splitlines()]
 
+    def approved_source(self, content=CONTENT, video_id=VIDEO, approval="approved",
+                        api_status="success", evaluation_content=None):
+        source = self.runner._base("video_grounding", video_id, "gemini_video",
+                                   "gemini-3.8-flash", 1)
+        source.update(runId=uuid.uuid4().hex, apiStatus=api_status,
+                      contentTextSha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                      contentTextApprovalStatus=approval, groundingFacts=[],
+                      omission=None, hallucination=None)
+        self.results.mkdir(exist_ok=True)
+        with (self.results / "video-grounding.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(source) + "\n")
+        evaluation_dir = self.results / "evaluation"
+        evaluation_dir.mkdir(exist_ok=True)
+        (evaluation_dir / (source["runId"] + ".json")).write_text(
+            json.dumps({"contentText": content if evaluation_content is None else evaluation_content,
+                        "facts": []}), encoding="utf-8")
+        raw_dir = self.results / "raw"
+        raw_dir.mkdir(exist_ok=True)
+        (raw_dir / (source["runId"] + ".json")).write_text(
+            json.dumps({"source": "fixture"}), encoding="utf-8")
+        return source["runId"]
+
+    def run_approved_quiz(self, video_id, model, repetition, content, provider, runner=None):
+        source_id = self.approved_source(content, video_id)
+        return (runner or self.runner).run_quiz(video_id, model, repetition, content, provider,
+                                               source_grounding_run_id=source_id)
+
+    def test_quiz_rejects_missing_human_approval_before_provider_call(self):
+        provider = FixtureProvider({"quiz": {"raw": QUIZ}})
+        with self.assertRaisesRegex(ValueError, "approved"):
+            self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
+        self.assertEqual(provider.calls, [])
+
+    def test_quiz_accepts_only_matching_approved_grounding_content(self):
+        source_id = self.approved_source()
+        provider = FixtureProvider({"quiz": {"raw": QUIZ}})
+        row = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                                   source_grounding_run_id=source_id)
+        self.assertEqual(row["sourceGroundingRunId"], source_id)
+        self.assertEqual(row["contentTextSha256"], hashlib.sha256(CONTENT.encode()).hexdigest())
+        self.assertEqual(provider.calls[0]["contentText"], CONTENT)
+
+    def test_quiz_rejects_unapproved_legacy_and_mismatched_sources(self):
+        provider = FixtureProvider({"quiz": {"raw": QUIZ}})
+        legacy_id = self.approved_source(approval=None)
+        result_file = self.results / "video-grounding.jsonl"
+        legacy = self.rows("video-grounding.jsonl")
+        legacy[0].pop("contentTextApprovalStatus")
+        result_file.write_text(json.dumps(legacy[0]) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "approved"):
+            self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                                 source_grounding_run_id=legacy_id)
+        for kwargs in ({"approval": None}, {"api_status": "error"},
+                       {"evaluation_content": CONTENT + " changed"}):
+            with self.subTest(kwargs=kwargs):
+                source_id = self.approved_source(**kwargs)
+                with self.assertRaisesRegex(ValueError, "approved"):
+                    self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                                         source_grounding_run_id=source_id)
+        source_id = self.approved_source()
+        for video_id, content in (("nasa-methane-2020", CONTENT), (VIDEO, CONTENT + " changed")):
+            with self.subTest(video_id=video_id, content=content):
+                with self.assertRaisesRegex(ValueError, "approved"):
+                    self.runner.run_quiz(video_id, "gemini-3.8-flash", 1, content, provider,
+                                         source_grounding_run_id=source_id)
+        self.assertEqual(provider.calls, [])
+
+    def test_explicit_approval_registration_preserves_existing_run_data(self):
+        source_id = self.approved_source(approval=None)
+        result_file = self.results / "video-grounding.jsonl"
+        legacy = self.rows("video-grounding.jsonl")[0]
+        legacy.pop("contentTextSha256")
+        legacy.pop("contentTextApprovalStatus")
+        result_file.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+        before = self.rows("video-grounding.jsonl")[0]
+        evaluation_file = self.results / "evaluation" / (source_id + ".json")
+        evaluation_before = evaluation_file.read_bytes()
+        self.runner.approve_content(source_id)
+        after = self.rows("video-grounding.jsonl")[0]
+        self.assertEqual(after["contentTextApprovalStatus"], "approved")
+        self.assertEqual(after["contentTextSha256"], hashlib.sha256(CONTENT.encode()).hexdigest())
+        for key in before:
+            if key not in ("contentTextApprovalStatus", "contentTextSha256"):
+                self.assertEqual(after[key], before[key])
+        self.assertEqual(evaluation_file.read_bytes(), evaluation_before)
+        self.assertEqual(len(self.rows("video-grounding.jsonl")), 1)
+
+    def test_explicit_approval_rejects_changed_evaluation_without_rewriting_result(self):
+        source_id = self.approved_source(approval=None, evaluation_content=CONTENT + " changed")
+        result_file = self.results / "video-grounding.jsonl"
+        before = result_file.read_bytes()
+        with self.assertRaisesRegex(ValueError, "hash does not match"):
+            self.runner.approve_content(source_id)
+        self.assertEqual(result_file.read_bytes(), before)
+
+    def test_two_stage_e2e_does_not_call_grounding_or_quiz(self):
+        provider = FixtureProvider({"grounding": {"raw": GROUNDING}, "quiz": {"raw": QUIZ}})
+        with self.assertRaisesRegex(ValueError, "approval"):
+            self.runner.run_end_to_end(VIDEO, "gemini_grounding_openai_quiz", 1, provider)
+        self.assertEqual(provider.calls, [])
+
     def test_grounding_keeps_human_reviews_unset_and_separates_raw(self):
         provider = FixtureProvider({"grounding": {"raw": GROUNDING, "inputTokens": 10}})
         row = self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)
@@ -57,9 +160,39 @@ class PilotRunnerTest(unittest.TestCase):
         self.assertIsNone(row["groundingFacts"][0]["factExists"])
         self.assertIsNone(row["groundingFacts"][0]["timestampAccurate"])
         self.assertIsNone(row["hallucination"])
+        self.assertEqual(row["contentTextSha256"], hashlib.sha256(CONTENT.encode()).hexdigest())
+        self.assertIsNone(row["contentTextApprovalStatus"])
         self.assertEqual(self.rows("video-grounding.jsonl")[0]["runId"], row["runId"])
         self.assertTrue((self.results / "raw" / (row["runId"] + ".json")).exists())
         self.assertNotIn("contentText", row)
+
+    def test_grounding_evidence_type_contract_accepts_only_three_values(self):
+        for value in ("speech", "visual", "unknown", "narration", "combined"):
+            with self.subTest(evidence_type=value):
+                fact = dict(GROUNDING["facts"][0], evidenceType=value)
+                payload = dict(GROUNDING, facts=[fact])
+                row = self.runner.run_grounding(
+                    VIDEO, "gemini_video", 1, FixtureProvider({"grounding": {"raw": payload}}))
+                if value in ("speech", "visual", "unknown"):
+                    self.assertIsNone(row["errorCategory"])
+                    self.assertEqual(row["groundingFacts"][0]["evidenceType"], value)
+                else:
+                    self.assertEqual(row["errorCategory"], "fixture_invalid_grounding_response")
+                    self.assertNotIn("contentTextSha256", row)
+
+    def test_existing_three_attempts_are_preserved_before_fourth(self):
+        self.results.mkdir()
+        result_file = self.results / "video-grounding.jsonl"
+        existing = "".join(json.dumps({"videoId": VIDEO, "method": "gemini_video",
+                                        "model": "gemini-3.8-flash", "repetition": 1,
+                                        "runId": "previous-" + str(number), "apiStatus": "error",
+                                        **({} if number == 1 else {"attempt": number})}) + "\n"
+                           for number in (1, 2, 3))
+        result_file.write_text(existing, encoding="utf-8")
+        row = self.runner.run_grounding(
+            VIDEO, "gemini_video", 1, FixtureProvider({"grounding": {"raw": GROUNDING}}))
+        self.assertEqual(row["attempt"], 4)
+        self.assertTrue(result_file.read_text(encoding="utf-8").startswith(existing))
 
     def test_attempt_starts_at_one_and_failed_run_increments_without_overwrite(self):
         failed = self.runner.run_grounding(
@@ -92,8 +225,8 @@ class PilotRunnerTest(unittest.TestCase):
         other_video = self.runner.run_grounding("nasa-methane-2020", "gemini_video", 1, provider)
         other_method = self.runner.run_grounding(VIDEO, "authorized_transcript", 1, provider,
                                                  authorized_transcript=CONTENT)
-        gemini = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
-        openai = self.runner.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, provider)
+        gemini = self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
+        openai = self.run_approved_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, provider)
         for row in (second_repetition, other_video, other_method, gemini, openai):
             self.assertEqual(row["attempt"], 1)
 
@@ -112,17 +245,17 @@ class PilotRunnerTest(unittest.TestCase):
 
     def test_quiz_attempt_uses_model_prompt_version_content_hash_and_repetition(self):
         provider = FixtureProvider({"quiz": {"raw": QUIZ}})
-        first = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
+        first = self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
         self.assertEqual(first["attempt"], 1)
-        self.assertEqual(self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)["attempt"], 2)
-        self.assertEqual(self.runner.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, provider)["attempt"], 1)
-        self.assertEqual(self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 2, CONTENT, provider)["attempt"], 1)
+        self.assertEqual(self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)["attempt"], 2)
+        self.assertEqual(self.run_approved_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, provider)["attempt"], 1)
+        self.assertEqual(self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 2, CONTENT, provider)["attempt"], 1)
 
         result_file = self.results / "quiz-generation.jsonl"
         with result_file.open("a", encoding="utf-8") as target:
             target.write(json.dumps(dict(first, promptVersion="pilot-v2", attempt=8)) + "\n")
             target.write(json.dumps(dict(first, contentTextSha256="0" * 64, attempt=9)) + "\n")
-        self.assertEqual(self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)["attempt"], 3)
+        self.assertEqual(self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)["attempt"], 3)
 
         for changed in ({"promptVersion": "pilot-v2"}, {"contentTextSha256": "0" * 64}):
             with self.subTest(changed=changed):
@@ -130,44 +263,56 @@ class PilotRunnerTest(unittest.TestCase):
                 isolated.mkdir()
                 (isolated / "quiz-generation.jsonl").write_text(
                     json.dumps(dict(first, attempt=7, **changed)) + "\n", encoding="utf-8")
-                row = PilotRunner(self.repository, isolated).run_quiz(
-                    VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
+                for directory in ("raw", "evaluation"):
+                    target = isolated / directory
+                    target.mkdir()
+                    shutil.copyfile(self.results / directory / (first["runId"] + ".json"),
+                                    target / (first["runId"] + ".json"))
+                row = self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                                             runner=PilotRunner(self.repository, isolated))
                 self.assertEqual(row["attempt"], 1)
 
     def test_two_models_use_exact_same_fixed_content_and_hash(self):
         provider = FixtureProvider({"quiz": {"raw": QUIZ}})
-        gemini = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
-        openai = self.runner.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, provider)
+        source_id = self.approved_source()
+        gemini = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                                      source_grounding_run_id=source_id)
+        openai = self.runner.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, provider,
+                                      source_grounding_run_id=source_id)
         self.assertEqual(provider.calls[0]["contentText"], provider.calls[1]["contentText"])
         self.assertEqual(gemini["contentTextSha256"], openai["contentTextSha256"])
+        self.assertEqual(gemini["sourceGroundingRunId"], openai["sourceGroundingRunId"])
         self.assertEqual(gemini["beCompatibility"], "pass")
         self.assertIsNone(gemini["questionReviews"][0]["answerAccuracy"])
 
     def test_fixed_content_cannot_differ_between_models(self):
         provider = FixtureProvider({"quiz": {"raw": QUIZ}})
-        self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
+        self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
         with self.assertRaisesRegex(ValueError, "fixed contentText"):
-            self.runner.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT + " changed", provider)
+            self.run_approved_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT + " changed", provider)
         self.assertEqual(len(provider.calls), 1)
 
     def test_canonical_input_survives_different_result_directories(self):
         first = PilotRunner(self.repository, self.repository / "results" / "first")
         second = PilotRunner(self.repository, self.repository / "results" / "second")
-        first.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, FixtureProvider({"quiz": {"raw": QUIZ}}))
+        self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
+                               FixtureProvider({"quiz": {"raw": QUIZ}}), runner=first)
         provider = FixtureProvider({"quiz": {"raw": QUIZ}})
         with self.assertRaisesRegex(ValueError, "fixed contentText"):
-            second.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT + " changed", provider)
+            self.run_approved_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT + " changed",
+                                   provider, runner=second)
         self.assertFalse(provider.calls)
 
     def test_canonical_input_is_scoped_to_video_and_prompt_version(self):
         provider = FixtureProvider({"quiz": {"raw": QUIZ}})
-        self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
+        self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
         other_video = "nasa-methane-2020"
-        self.runner.run_quiz(other_video, "gpt-5.4-mini", 1, CONTENT + " other", provider)
+        self.run_approved_quiz(other_video, "gpt-5.4-mini", 1, CONTENT + " other", provider)
         config = self.repository / "configs" / "pilot.yaml"
         config.write_text(config.read_text(encoding="utf-8").replace("pilot-v1", "pilot-v2"), encoding="utf-8")
         next_version = PilotRunner(self.repository, self.repository / "results" / "next")
-        next_version.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT + " changed", provider)
+        self.run_approved_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT + " changed",
+                               provider, runner=next_version)
         self.assertEqual(len(provider.calls), 3)
 
     def test_unsafe_result_paths_are_rejected(self):
@@ -183,7 +328,7 @@ class PilotRunnerTest(unittest.TestCase):
             def invoke(self, kind, **kwargs):
                 return {"raw": QUIZ, "inputTokens": "10", "estimatedCostUsd": -1}
 
-        row = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, SimulatedApiProvider())
+        row = self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, SimulatedApiProvider())
         self.assertEqual(row["apiStatus"], "error")
         self.assertEqual(row["errorCategory"], "invalid_measurement")
         self.assertIsNone(row["inputTokens"])
@@ -203,14 +348,14 @@ class PilotRunnerTest(unittest.TestCase):
                             {"outputTokens": -3}, {"thinkingTokens": "2"},
                             {"estimatedCostUsd": "0.01"}, {"estimatedCostUsd": float("inf")}):
             with self.subTest(measurement=measurement):
-                row = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
+                row = self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
                                            SimulatedApiProvider(measurement))
                 self.assertEqual(row["errorCategory"], "invalid_measurement")
                 self.assertIsNone(row["inputTokens"])
                 self.assertIsNone(row["estimatedCostUsd"])
 
     def test_raw_response_with_authorization_header_is_not_saved(self):
-        row = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
+        row = self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
                                    FixtureProvider({"quiz": {"raw": dict(QUIZ, Authorization="Bearer example")}}))
         self.assertNotIn("Bearer example", (self.results / "raw" / (row["runId"] + ".json")).read_text(encoding="utf-8"))
 
@@ -267,7 +412,7 @@ class PilotRunnerTest(unittest.TestCase):
         provider = FixtureProvider({"quiz": {"raw": dict(QUIZ, questions=[
             dict(question, sourceEvidence="not in source") for question in QUIZ["questions"]
         ])}})
-        row = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
+        row = self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
         self.assertEqual(row["parseStatus"], "pass")
         self.assertEqual(row["validatorStatus"], "fail")
         self.assertEqual(row["beCompatibility"], "fail")
@@ -276,7 +421,7 @@ class PilotRunnerTest(unittest.TestCase):
     def test_duplicate_options_fail_validator_without_human_quality_claim(self):
         questions = [dict(item) for item in QUIZ["questions"]]
         questions[0]["options"] = ["A", "a ", "C", "D"]
-        row = self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
+        row = self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
                                    FixtureProvider({"quiz": {"raw": dict(QUIZ, questions=questions)}}))
         self.assertEqual(row["validatorStatus"], "fail")
         self.assertIsNone(row["questionReviews"][0]["uniqueAnswer"])
@@ -290,34 +435,26 @@ class PilotRunnerTest(unittest.TestCase):
         self.assertIsNone(row["quizRunId"])
         self.assertIsNone(row["questionReviews"][0]["answerAccuracy"])
 
-    def test_two_stage_results_are_linked_and_separate(self):
-        provider = FixtureProvider({"grounding": {"raw": GROUNDING}, "quiz": {"raw": QUIZ}})
-        row = self.runner.run_end_to_end(VIDEO, "gemini_grounding_openai_quiz", 1, provider)
-        grounding = self.rows("video-grounding.jsonl")[0]
-        quiz = self.rows("quiz-generation.jsonl")[0]
-        self.assertEqual(row["groundingRunId"], grounding["runId"])
-        self.assertEqual(row["quizRunId"], quiz["runId"])
-        self.assertEqual(quiz["sourceGroundingRunId"], grounding["runId"])
-        self.assertEqual(provider.calls[1]["contentText"], CONTENT)
-
-    def test_failed_call_and_missing_transcript_are_recorded_without_fake_success(self):
+    def test_failed_call_and_blocked_two_stage_e2e_are_not_falsely_successful(self):
         provider = FixtureProvider({"grounding": {"errorCategory": "rate_limit"}})
         failed = self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)
         self.assertEqual(failed["apiStatus"], "not_run")
         self.assertEqual(failed["errorCategory"], "fixture_rate_limit")
-        skipped = self.runner.run_end_to_end(VIDEO, "transcript_gemini_quiz", 1,
-                                             FixtureProvider({}), authorized_transcript=None)
-        self.assertEqual(skipped["apiStatus"], "not_run")
-        self.assertEqual(skipped["beCompatibility"], "not_run")
+        with self.assertRaisesRegex(ValueError, "approval"):
+            self.runner.run_end_to_end(VIDEO, "transcript_gemini_quiz", 1,
+                                       FixtureProvider({}), authorized_transcript=None)
         self.assertEqual(len(provider.calls), 1)
 
     def test_result_rows_follow_schema_top_level_contract(self):
         provider = FixtureProvider({"grounding": {"raw": GROUNDING}, "quiz": {"raw": QUIZ},
                                     "direct": {"raw": QUIZ}})
         self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)
-        self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
+        self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
         self.runner.run_end_to_end(VIDEO, "gemini_direct_quiz", 1, provider)
         schema = json.loads((ROOT / "docs" / "run-result.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["contentTextApprovalStatus"]["enum"],
+                         ["approved", None])
+        self.assertEqual(schema["oneOf"][0]["then"]["required"], ["contentTextSha256"])
         for filename in ("video-grounding.jsonl", "quiz-generation.jsonl", "end-to-end.jsonl"):
             for row in self.rows(filename):
                 self.assertTrue(set(schema["required"]).issubset(row))

@@ -16,6 +16,11 @@ Gemini 영상 분석과 **해당 영상에 사용할 권한이 확인된** trans
 
 근거가 영상에 있더라도 timestamp가 틀릴 수 있으며, 정확한 timestamp라도 모델의 해석이 틀릴 수 있습니다. transcript는 발화 근거의 비교 기준이지만 화면에만 나온 정보까지 포함한다고 가정하지 않습니다.
 
+`omission`과 `hallucination`은 `contentText`와 `groundingFacts` 전체를 함께 살펴 사람이 판정합니다. Ground truth는 영상의 모든 사실 목록이 아니라 사전에 사람이 선정·승인한 핵심 사실 집합입니다. 단순 문자열·키워드 일치로 자동 판정하지 않습니다.
+
+- `omission`: 승인된 ground truth의 각 핵심 의미가 `contentText` 또는 `groundingFacts` 중 하나 이상에 충분히 반영되면 `pass`, 하나 이상의 핵심 의미가 양쪽 모두에서 빠졌으면 `fail`입니다. 검토했지만 의미 포함 여부를 신뢰성 있게 결정하기 어려우면 `uncertain`, 아직 검토하지 않았으면 `null`입니다.
+- `hallucination`: `contentText`와 `groundingFacts`의 실질적인 주장을 원본 영상과 대조합니다. 모두 영상에서 확인되면 `pass`, 영상에서 확인되지 않는 주장이 하나 이상 있으면 `fail`입니다. 검토했지만 영상 근거 여부를 신뢰성 있게 결정하기 어려우면 `uncertain`, 아직 검토하지 않았으면 `null`입니다. Ground truth에 없는 주장도 영상에서 확인되면 그 이유만으로 환각이 아닙니다.
+
 ## Quiz Generation Benchmark
 
 영상별로 **한 번 고정한 동일 `contentText`와 해시**, 같은 질문 3개·보기 4개·프롬프트 버전·출력 계약을 `gemini-3.8-flash`와 `gpt-5.4-mini`에 제공합니다. 모델별 입력 텍스트가 달라지면 생성 모델 비교로 집계하지 않습니다. 출력은 같은 JSON/Parser/Validator 계약으로 평가합니다.
@@ -23,7 +28,7 @@ Gemini 영상 분석과 **해당 영상에 사용할 권한이 확인된** trans
 | 항목 | 자동 기록 | 사람 검수 |
 | --- | --- | --- |
 | API/파싱/검증 | 상태, 오류 범주, 필수 필드·타입, 문제·보기 수, 0-based 정답 인덱스 | 필요 시 오류 분류 확인 |
-| BE 호환성 | `sourceEvidence ∈ contentText` 및 Core 계약 검사 | 문자열 근거의 의미 확인 |
+| Benchmark 내부 Quiz 형식/계약 검사 | 구조·개수·인덱스·프롬프트 버전과 `sourceEvidence ∈ contentText` 문자열 포함 검사 | 문자열 근거의 의미 확인 |
 | 정답 정확성·유일성 | 자동으로 사실성 판정하지 않음 | 고정 입력·실제 영상 및 ground truth와 대조, 정답 하나인지 확인 |
 | 근거성·환각 | 문자열 포함 여부만 자동 판정 | `sourceEvidence`가 **정답을 실제로 뒷받침**하는지, 영상 밖 주장은 없는지 확인 |
 | 한국어·모호성 | 중복 문구 후보 탐지 | 질문·보기의 자연스러움, 중의성 및 여러 정답 가능성 확인 |
@@ -32,6 +37,6 @@ Gemini 영상 분석과 **해당 영상에 사용할 권한이 확인된** trans
 
 ## End-to-End Benchmark
 
-Gemini Grounding → Gemini Quiz, Gemini Grounding → OpenAI Quiz, Gemini 직접 Quiz, 권한 있는 transcript → 두 Quiz 모델을 각각 실행합니다. Grounding과 Quiz 결과를 별도 실행 ID로 보존해 실패 계층, 전체 지연·비용, 최종 퀴즈 품질을 함께 기록합니다. 직접 Quiz는 `contentText`가 없으므로 `beCompatibility = not_applicable`이며 BE 검증 통과율의 분모에도 넣지 않습니다.
+Gemini Grounding → Gemini Quiz, Gemini Grounding → OpenAI Quiz, Gemini 직접 Quiz, 권한 있는 transcript → 두 Quiz 모델을 각각 실행합니다. Grounding과 Quiz 결과를 별도 실행 ID로 보존해 실패 계층, 전체 지연·비용, 최종 퀴즈 품질을 함께 기록합니다. `beCompatibility=pass`와 `beCompatibilityRate`는 Benchmark 내부 로컬 검사 통과(율)이며 실제 Cking-BE validator 실행 결과가 아닙니다. Grounding에는 이 필드를 적용하지 않습니다. 직접 Quiz는 고정 `contentText`가 없어 동일한 로컬 evidence/contentText 검사를 할 수 없으므로 `beCompatibility=not_applicable`이며 해당 통과율의 분모에 넣지 않습니다. 이는 직접 Quiz의 품질·정답 정확성·실제 BE 호환성 통과를 뜻하지 않습니다.
 
 사람 검수는 사실·질문별로 `pass`, `fail`, `uncertain`을 기록하고 판단 근거를 남깁니다. `uncertain`을 성공으로 합산하지 않습니다. 승인되지 않은 ground truth 후보로는 확정 품질 점수를 만들지 않습니다. Timestamp나 모델이 작성한 `sourceEvidence` 문장만으로 영상 사실성이 입증되지 않습니다. 권한 있는 transcript가 없으면 해당 조건을 `not_run`으로 기록하고 다른 방식의 성공으로 대체하지 않습니다.

@@ -11,11 +11,12 @@ from pathlib import Path
 
 import yaml
 
-from src.provider_failure import ProviderFailure
+from src.provider_failure import GEMINI_INTERACTIONS_HTTP_ERROR_CODES, ProviderFailure
 
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 OPENAI_URL = "https://api.openai.com/v1/responses"
+MAX_ERROR_BODY_BYTES = 16384
 
 
 def _string():
@@ -35,7 +36,7 @@ def quiz_schema():
 
 def grounding_schema():
     fact = {"type": "object", "additionalProperties": False,
-            "properties": {"fact": _string(), "evidenceType": _string(), "evidence": _string(),
+            "properties": {"fact": _string(), "evidenceType": {"type": "string", "enum": ["speech", "visual", "unknown"]}, "evidence": _string(),
                            "timestampStartSeconds": {"type": ["number", "null"]},
                            "timestampEndSeconds": {"type": ["number", "null"]}},
             "required": ["fact", "evidenceType", "evidence", "timestampStartSeconds", "timestampEndSeconds"]}
@@ -96,6 +97,18 @@ class LivePolicy:
         return estimate
 
 
+def _gemini_http_error_code(error):
+    try:
+        body = error.read(MAX_ERROR_BODY_BYTES + 1)
+        if len(body) > MAX_ERROR_BODY_BYTES:
+            return None
+        parsed = json.loads(body)
+        code = parsed.get("error", {}).get("code")
+        return code if type(code) is str and code in GEMINI_INTERACTIONS_HTTP_ERROR_CODES else None
+    except (AttributeError, OSError, TypeError, ValueError, UnicodeError):
+        return None
+
+
 def urllib_transport(url, headers, body, timeout):
     request = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers,
                                      method="POST")
@@ -103,7 +116,8 @@ def urllib_transport(url, headers, body, timeout):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        return error.code, {}
+        code = _gemini_http_error_code(error) if url == GEMINI_URL else None
+        return error.code, {"providerErrorCode": code} if url == GEMINI_URL else {}
 
 
 class ProviderRouter:
@@ -189,29 +203,41 @@ class ProviderRouter:
                 raise ProviderFailure("invalid_provider_response")
             if type(status) is not int:
                 raise ProviderFailure("invalid_provider_response")
+            error_code = response.get("providerErrorCode") if provider == "gemini" and isinstance(response, dict) else None
             if status == 429:
                 category = "rate_limit"
             elif 500 <= status < 600:
                 category = "server_error"
             elif 400 <= status < 500:
-                raise ProviderFailure("client_error", status)
+                raise ProviderFailure("client_error", status, error_code)
             elif not 200 <= status < 300:
-                raise ProviderFailure("provider_error", status)
+                raise ProviderFailure("provider_error", status, error_code)
             else:
-                result = self._extract(provider, response)
-                input_tokens, output_tokens = result["inputTokens"], result["outputTokens"]
-                if input_tokens is not None and output_tokens is not None:
-                    input_price, output_price, reference = self.policy.prices(provider)
-                    billed_output = output_tokens + (result["thinkingTokens"] or 0) if provider == "gemini" else output_tokens
-                    result["estimatedCostUsd"] = (input_tokens * input_price
-                                                  + billed_output * output_price) / 1000000
-                    result["pricingReference"] = reference
-                    self.reserved_cost += result["estimatedCostUsd"] - estimate
+                try:
+                    result = self._extract(provider, response)
+                except ProviderFailure as failure:
+                    if failure.measurements is not None:
+                        self._price_usage(provider, failure.measurements, estimate)
+                    raise
+                self._price_usage(provider, result, estimate)
                 return result
             if attempt == self.policy.retry_attempts:
-                raise ProviderFailure(category, status)
-            last_http_failure = ProviderFailure(category, status)
+                raise ProviderFailure(category, status, error_code)
+            last_http_failure = ProviderFailure(category, status, error_code)
         raise ProviderFailure("provider_error")
+
+    def _price_usage(self, provider, measurements, pre_call_estimate):
+        input_tokens = measurements["inputTokens"]
+        output_tokens = measurements["outputTokens"]
+        if input_tokens is None or output_tokens is None:
+            return
+        input_price, output_price, reference = self.policy.prices(provider)
+        billed_output = (output_tokens + (measurements["thinkingTokens"] or 0)
+                         if provider == "gemini" else output_tokens)
+        measurements["estimatedCostUsd"] = (input_tokens * input_price
+                                             + billed_output * output_price) / 1000000
+        measurements["pricingReference"] = reference
+        self.reserved_cost += measurements["estimatedCostUsd"] - pre_call_estimate
 
     def _request(self, provider, kind, **kwargs):
         model = kwargs["model"]
@@ -226,7 +252,12 @@ class ProviderRouter:
                 raise ProviderFailure("invalid_input")
             source = video["youtubeUrl"]
         if kind == "grounding":
-            prompt = "영상에서 확인 가능한 사실과 발화/화면 근거, 제시된 timestamp를 추출하세요. 추측은 제외하세요."
+            prompt = ("영상에서 확인 가능한 사실과 발화/화면 근거, 제시된 timestamp를 추출하세요. 추측은 제외하세요. "
+                      "evidenceType은 speech, visual, unknown 중 하나만 사용하세요. "
+                      "speech는 주된 근거가 영상의 발화 또는 나레이션인 경우, "
+                      "visual은 주된 근거가 화면에서 확인되는 시각 정보인 경우입니다. "
+                      "발화와 화면 양쪽에 근거가 있어도 주된 근거에 따라 speech 또는 visual을 선택하세요. "
+                      "주된 근거를 speech 또는 visual 중 하나로 신뢰성 있게 분류할 수 없을 때만 unknown을 사용하세요.")
             schema = grounding_schema()
         else:
             question_count, option_count = kwargs.get("questionCount"), kwargs.get("optionCount")
@@ -252,35 +283,51 @@ class ProviderRouter:
                                      "strict": True, "schema": schema}}}
 
     @staticmethod
+    def _usage(provider, response):
+        try:
+            usage = response.get("usage", {})
+            if not isinstance(usage, dict):
+                return None
+            if provider == "gemini":
+                tokens = (usage.get("total_input_tokens"), usage.get("total_output_tokens"),
+                          usage.get("total_thought_tokens"))
+                tool_tokens = usage.get("total_tool_use_tokens")
+            else:
+                details = usage.get("output_tokens_details", {})
+                if not isinstance(details, dict):
+                    return None
+                tokens = (usage.get("input_tokens"), usage.get("output_tokens"),
+                          details.get("reasoning_tokens"))
+                tool_tokens = None
+            if (any(value is not None and (type(value) is not int or value < 0) for value in tokens)
+                    or tool_tokens is not None and (type(tool_tokens) is not int or tool_tokens < 0)):
+                return None
+            return {"inputTokens": tokens[0], "outputTokens": tokens[1],
+                    "thinkingTokens": tokens[2], "toolUseTokens": tool_tokens}
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    @staticmethod
     def _extract(provider, response):
         if not isinstance(response, dict):
             raise ProviderFailure("invalid_provider_response")
+        measurements = ProviderRouter._usage(provider, response)
         if response.get("status") != "completed":
-            raise ProviderFailure("incomplete_response")
+            raise ProviderFailure("incomplete_response", measurements=measurements)
+        if measurements is None:
+            raise ProviderFailure("invalid_provider_response")
         try:
             if provider == "gemini":
                 steps = response["steps"]
                 outputs = [item["text"] for step in steps if step.get("type") == "model_output"
                            for item in step["content"] if item.get("type") == "text"]
-                usage = response.get("usage", {})
-                tokens = (usage.get("total_input_tokens"), usage.get("total_output_tokens"),
-                          usage.get("total_thought_tokens"))
-                tool_tokens = usage.get("total_tool_use_tokens")
             else:
                 outputs = [item["text"] for output in response["output"] if output.get("type") == "message"
                            for item in output["content"] if item.get("type") == "output_text"]
-                usage = response.get("usage", {})
-                tokens = (usage.get("input_tokens"), usage.get("output_tokens"),
-                          usage.get("output_tokens_details", {}).get("reasoning_tokens"))
-                tool_tokens = None
             if len(outputs) != 1 or not isinstance(outputs[0], str) or not outputs[0].strip():
                 raise ValueError()
-            if any(value is not None and (type(value) is not int or value < 0) for value in tokens):
-                raise ValueError()
-            if tool_tokens is not None and (type(tool_tokens) is not int or tool_tokens < 0):
-                raise ValueError()
         except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-            raise ProviderFailure("invalid_provider_response")
+            raise ProviderFailure("invalid_provider_response", measurements=measurements)
         try:
             normalized = json.loads(outputs[0])
         except json.JSONDecodeError:
@@ -288,8 +335,7 @@ class ProviderRouter:
             normalized = outputs[0]
         # Generated text belongs to normalized evaluation data, never persisted raw metadata.
         return {"normalized": normalized, "responseBody": {"status": "completed", "provider": provider,
-                                                                "usage": {"inputTokens": tokens[0],
-                                                                          "outputTokens": tokens[1],
-                                                                          "thinkingTokens": tokens[2],
-                                                                          "toolUseTokens": tool_tokens}},
-                "inputTokens": tokens[0], "outputTokens": tokens[1], "thinkingTokens": tokens[2]}
+                                                                "usage": measurements.copy()},
+                "inputTokens": measurements["inputTokens"],
+                "outputTokens": measurements["outputTokens"],
+                "thinkingTokens": measurements["thinkingTokens"]}

@@ -6,11 +6,12 @@ import shutil
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
 from src.pilot_runner import PilotRunner, ProviderFailure
-from src.provider_adapters import LivePolicy, ProviderRouter
+from src.provider_adapters import LivePolicy, ProviderRouter, urllib_transport
 
 
 CONTENT = "NASA measures global rain and snow every 30 minutes."
@@ -22,6 +23,18 @@ QUIZ = {"promptVersion": "pilot-v1", "questions": [
 GROUNDING = {"contentText": CONTENT, "facts": [{
     "fact": "NASA measures rainfall", "evidenceType": "speech", "evidence": "global rain and snow",
     "timestampStartSeconds": 61, "timestampEndSeconds": 73}]}
+
+
+def approve_test_source(runner, content=CONTENT):
+    """Create an explicitly approved source only in a temporary test repository."""
+    row = runner._base("video_grounding", VIDEO["videoId"], "gemini_video",
+                       "gemini-3.8-flash", 1)
+    row.update(apiStatus="success", groundingFacts=[], omission=None, hallucination=None,
+               contentTextSha256=None, contentTextApprovalStatus=None)
+    runner._save(row, raw={"source": "fixture"},
+                 evaluation={"contentText": content, "facts": []})
+    runner.approve_content(row["runId"])
+    return row["runId"]
 
 
 def policy(**overrides):
@@ -62,6 +75,138 @@ def gemini_response(payload, status="completed"):
 
 
 class ProviderAdapterTest(unittest.TestCase):
+    @staticmethod
+    def temporary_runner(folder):
+        root = Path(__file__).resolve().parents[1]
+        repository = Path(folder)
+        (repository / "configs").mkdir()
+        (repository / "data").mkdir()
+        shutil.copyfile(root / "configs" / "pilot.yaml", repository / "configs" / "pilot.yaml")
+        shutil.copyfile(root / "data" / "videos.jsonl", repository / "data" / "videos.jsonl")
+        return PilotRunner(repository, repository / "results")
+
+    def test_grounding_validation_failure_keeps_returned_usage_and_estimated_cost(self):
+        invalid = dict(GROUNDING, facts=[dict(GROUNDING["facts"][0], evidenceType="narration")])
+        with tempfile.TemporaryDirectory() as folder:
+            runner = self.temporary_runner(folder)
+            row = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1,
+                                       self.router(FakeTransport(gemini_response(invalid))))
+            self.assertEqual((row["apiStatus"], row["errorCategory"]),
+                             ("error", "invalid_grounding_response"))
+            self.assertEqual((row["inputTokens"], row["outputTokens"], row["thinkingTokens"]),
+                             (10, 20, 3))
+            self.assertAlmostEqual(row["estimatedCostUsd"], 33 / 1000000)
+            self.assertEqual(row["pricingReference"], "operator-test-pricing")
+
+    def test_grounding_validation_failure_with_usage_passes_next_storage_preflight(self):
+        invalid = dict(GROUNDING, facts=[dict(GROUNDING["facts"][0], evidenceType="narration")])
+        with tempfile.TemporaryDirectory() as folder:
+            repository = Path(folder)
+            (repository / "configs").mkdir()
+            (repository / "data").mkdir()
+            shutil.copyfile(Path(__file__).resolve().parents[1] / "configs" / "pilot.yaml",
+                            repository / "configs" / "pilot.yaml")
+            (repository / "data" / "videos.jsonl").write_text(
+                json.dumps({"videoId": VIDEO["videoId"],
+                            "youtubeUrl": "https://www.youtube.com/watch?v=mock-video"}) + "\n",
+                encoding="utf-8")
+            runner = PilotRunner(repository, repository / "results")
+
+            first_transport = FakeTransport(gemini_response(invalid))
+            failed = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1,
+                                          self.router(first_transport))
+            self.assertEqual(len(first_transport.calls), 1)
+            self.assertEqual((failed["apiStatus"], failed["errorCategory"]),
+                             ("error", "invalid_grounding_response"))
+            self.assertEqual((failed["inputTokens"], failed["outputTokens"]), (10, 20))
+            self.assertIsNotNone(failed["estimatedCostUsd"])
+            self.assertTrue((repository / "results" / "raw" / f'{failed["runId"]}.json').is_file())
+            self.assertTrue((repository / "results" / "evaluation" / f'{failed["runId"]}.json').is_file())
+
+            next_transport = FakeTransport(gemini_response(GROUNDING))
+            next_row = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1,
+                                            self.router(next_transport))
+            self.assertEqual(len(next_transport.calls), 1)
+            self.assertEqual((next_row["apiStatus"], next_row["attempt"]), ("success", 2))
+            rows = [json.loads(line) for line in
+                    (repository / "results" / "video-grounding.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([row["runId"] for row in rows], [failed["runId"], next_row["runId"]])
+            self.assertEqual(rows[0]["errorCategory"], "invalid_grounding_response")
+
+    def test_incomplete_response_keeps_safe_usage_for_both_providers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = self.temporary_runner(folder)
+            gemini = gemini_response(GROUNDING, status="in_progress")
+            grounding = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1,
+                                             self.router(FakeTransport(gemini)))
+            self.assertEqual((grounding["errorCategory"], grounding["inputTokens"],
+                              grounding["outputTokens"], grounding["thinkingTokens"]),
+                             ("incomplete_response", 10, 20, 3))
+            self.assertAlmostEqual(grounding["estimatedCostUsd"], 33 / 1000000)
+
+            source_id = approve_test_source(runner)
+            openai = {"status": "incomplete", "usage": {"input_tokens": 12, "output_tokens": 18,
+                       "output_tokens_details": {"reasoning_tokens": 4}}}
+            quiz = runner.run_quiz(VIDEO["videoId"], "gpt-5.4-mini", 1, CONTENT,
+                                   self.router(FakeTransport(openai)),
+                                   source_grounding_run_id=source_id)
+            self.assertEqual((quiz["errorCategory"], quiz["inputTokens"],
+                              quiz["outputTokens"], quiz["thinkingTokens"]),
+                             ("incomplete_response", 12, 18, 4))
+            self.assertAlmostEqual(quiz["estimatedCostUsd"], 30 / 1000000)
+            self.assertEqual(quiz["pricingReference"], "operator-test-pricing")
+
+    def test_http_error_and_malformed_or_missing_usage_do_not_create_metrics(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = self.temporary_runner(folder)
+            responses = ((503, {}, "server_error"),
+                         (200, {"status": "incomplete"}, "incomplete_response"),
+                         (200, {"status": "incomplete", "usage": {"total_input_tokens": "10",
+                                  "total_output_tokens": 20}}, "incomplete_response"))
+            for status, response, category in responses:
+                with self.subTest(status=status, response=response):
+                    row = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1,
+                                               self.router(FakeTransport(response, status)))
+                    self.assertEqual(row["errorCategory"], category)
+                    for key in ("inputTokens", "outputTokens", "thinkingTokens",
+                                "estimatedCostUsd", "pricingReference"):
+                        self.assertIsNone(row[key])
+
+    def test_partial_incomplete_usage_preserves_only_returned_tokens(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = self.temporary_runner(folder)
+            response = {"status": "in_progress", "usage": {"total_input_tokens": 11}}
+            row = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1,
+                                       self.router(FakeTransport(response)))
+            self.assertEqual(row["errorCategory"], "incomplete_response")
+            self.assertEqual(row["inputTokens"], 11)
+            for key in ("outputTokens", "thinkingTokens", "estimatedCostUsd", "pricingReference"):
+                self.assertIsNone(row[key])
+
+    def test_completed_malformed_output_and_direct_quiz_keep_returned_usage(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = self.temporary_runner(folder)
+            response = gemini_response(GROUNDING)
+            response["steps"] = []
+            direct = runner.run_end_to_end(VIDEO["videoId"], "gemini_direct_quiz", 1,
+                                           self.router(FakeTransport(response)))
+            self.assertEqual((direct["apiStatus"], direct["errorCategory"]),
+                             ("error", "invalid_provider_response"))
+            self.assertEqual((direct["inputTokens"], direct["outputTokens"],
+                              direct["thinkingTokens"]), (10, 20, 3))
+            self.assertAlmostEqual(direct["estimatedCostUsd"], 33 / 1000000)
+
+            source_id = approve_test_source(runner)
+            malformed_quiz = gemini_response(QUIZ)
+            malformed_quiz["steps"][0]["content"][0]["text"] = "{broken"
+            quiz = runner.run_quiz(VIDEO["videoId"], "gemini-3.8-flash", 1, CONTENT,
+                                   self.router(FakeTransport(malformed_quiz)),
+                                   source_grounding_run_id=source_id)
+            self.assertEqual((quiz["apiStatus"], quiz["parseStatus"]), ("success", "fail"))
+            self.assertEqual((quiz["inputTokens"], quiz["outputTokens"],
+                              quiz["thinkingTokens"]), (10, 20, 3))
+            self.assertAlmostEqual(quiz["estimatedCostUsd"], 33 / 1000000)
+
     @staticmethod
     def cli_runner_namespace():
         captured = {}
@@ -151,6 +296,21 @@ class ProviderAdapterTest(unittest.TestCase):
         self.assertEqual(result["inputTokens"], 10)
         self.assertEqual(result["thinkingTokens"], 3)
         self.assertNotIn("gemini-test-secret", json.dumps(result))
+
+    def test_grounding_request_limits_and_defines_evidence_types(self):
+        transport = FakeTransport(gemini_response(GROUNDING))
+        self.router(transport).invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
+        body = transport.calls[0][2]
+        evidence_type = body["response_format"]["schema"]["properties"]["facts"]["items"]["properties"]["evidenceType"]
+        self.assertEqual(evidence_type, {"type": "string", "enum": ["speech", "visual", "unknown"]})
+        prompt = body["input"][1]["text"]
+        for value in ("speech", "visual", "unknown"):
+            self.assertIn(value, prompt)
+        self.assertIn("주된 근거", prompt)
+        self.assertIn("발화", prompt)
+        self.assertIn("나레이션", prompt)
+        self.assertIn("화면", prompt)
+        self.assertIn("신뢰성 있게", prompt)
 
     def test_configured_model_alias_uses_configured_provider_and_key_name(self):
         config = {"video_grounding": {"methods": [{"id": "gemini_video", "model": "gemini-pilot-alias",
@@ -242,7 +402,7 @@ class ProviderAdapterTest(unittest.TestCase):
             self.assertEqual(failure.exception.category, "live_guard")
             self.assertEqual(transport.calls, [])
 
-    def test_end_to_end_uses_video_then_quiz_estimate_and_actual_usage(self):
+    def test_approved_separate_grounding_and_quiz_use_stage_estimates(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as folder:
             repository = Path(folder)
@@ -256,8 +416,10 @@ class ProviderAdapterTest(unittest.TestCase):
                                  video_estimated_input_tokens=1000,
                                  quiz_estimated_input_tokens=100,
                                  total_cost_limit=0.00102)
-            row = runner.run_end_to_end(VIDEO["videoId"], "gemini_grounding_gemini_quiz", 1,
-                                        router)
+            grounding = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1, router)
+            runner.approve_content(grounding["runId"])
+            row = runner.run_quiz(VIDEO["videoId"], "gemini-3.8-flash", 1, CONTENT,
+                                  router, source_grounding_run_id=grounding["runId"])
             self.assertEqual(row["apiStatus"], "success")
             self.assertEqual(len(transport.calls), 2)
             self.assertAlmostEqual(router.reserved_cost, 0.000066)
@@ -326,6 +488,85 @@ class ProviderAdapterTest(unittest.TestCase):
                 promptVersion="pilot-v1", questionCount=3, optionCount=4)
         self.assertEqual(failure.exception.category, "incomplete_response")
 
+    def test_gemini_http_error_keeps_only_allowlisted_code(self):
+        cases = (
+            (b'{"error":{"code":"service_unavailable","message":"Bearer unrelated-secret"}}',
+             "service_unavailable"),
+            (b"<html>Bearer unrelated-secret</html>", None),
+            (b'{"error":{"code":', None),
+            (b'{"error":{"code":"Bearer unrelated-secret","message":"secret"}}', None),
+            (b'{"error":{"code":503,"message":"secret"}}', None),
+            (b'{"error":{"code":"service_unavailable","message":"' + b"x" * 17000 + b'"}}', None),
+        )
+        root = Path(__file__).resolve().parents[1]
+        for body, expected in cases:
+            with self.subTest(expected=expected, body=body[:12]), tempfile.TemporaryDirectory() as folder:
+                repository = Path(folder)
+                (repository / "configs").mkdir()
+                (repository / "data").mkdir()
+                shutil.copyfile(root / "configs" / "pilot.yaml", repository / "configs" / "pilot.yaml")
+                shutil.copyfile(root / "data" / "videos.jsonl", repository / "data" / "videos.jsonl")
+                error = urllib.error.HTTPError("https://generativelanguage.googleapis.com/v1beta/interactions",
+                                               503, "error", {"x-test": "header-secret"}, io.BytesIO(body))
+                with mock.patch("src.provider_adapters.urllib.request.urlopen", side_effect=error):
+                    row = PilotRunner(repository, repository / "results").run_end_to_end(
+                        VIDEO["videoId"], "gemini_direct_quiz", 1, self.router(urllib_transport))
+                self.assertEqual((row["errorCategory"], row["httpStatus"]), ("server_error", 503))
+                self.assertEqual(row["providerErrorCode"], expected)
+                saved = (repository / "results" / "end-to-end.jsonl").read_text(encoding="utf-8")
+                self.assertNotIn("unrelated-secret", saved)
+                self.assertNotIn("header-secret", saved)
+                self.assertNotIn("gemini-test-secret", saved)
+                self.assertNotIn("message", saved)
+                self.assertFalse((repository / "results" / "raw" / (row["runId"] + ".json")).exists())
+
+    def test_provider_failure_old_constructor_and_retry_keep_safe_code(self):
+        old = ProviderFailure("server_error", 503)
+        self.assertIsNone(old.provider_error_code)
+        transport = FakeTransport({"providerErrorCode": "service_unavailable"}, 503)
+        with self.assertRaises(ProviderFailure) as failure:
+            self.router(transport, retry_attempts=2, call_limit=1).invoke(
+                "grounding", video=VIDEO, model="gemini-3.8-flash")
+        self.assertEqual((failure.exception.category, failure.exception.http_status,
+                          failure.exception.provider_error_code),
+                         ("server_error", 503, "service_unavailable"))
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_gemini_client_error_keeps_code_and_success_has_null_code(self):
+        transport = FakeTransport({"providerErrorCode": "invalid_request"}, 400)
+        with self.assertRaises(ProviderFailure) as failure:
+            self.router(transport).invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
+        self.assertEqual((failure.exception.category, failure.exception.http_status,
+                          failure.exception.provider_error_code),
+                         ("client_error", 400, "invalid_request"))
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as folder:
+            repository = Path(folder)
+            (repository / "configs").mkdir()
+            (repository / "data").mkdir()
+            shutil.copyfile(root / "configs" / "pilot.yaml", repository / "configs" / "pilot.yaml")
+            shutil.copyfile(root / "data" / "videos.jsonl", repository / "data" / "videos.jsonl")
+            row = PilotRunner(repository, repository / "results").run_grounding(
+                VIDEO["videoId"], "gemini_video", 1,
+                self.router(FakeTransport(gemini_response(GROUNDING))))
+            self.assertIsNone(row["providerErrorCode"])
+
+    def test_provider_error_code_schema_is_optional_for_legacy_rows(self):
+        schema = json.loads((Path(__file__).resolve().parents[1] / "docs" /
+                             "run-result.schema.json").read_text(encoding="utf-8"))
+        self.assertNotIn("providerErrorCode", schema["required"])
+        self.assertEqual(schema["properties"]["providerErrorCode"]["type"], ["string", "null"])
+        self.assertIn("providerErrorCode", schema["properties"])
+        legacy = {"benchmarkType": "end_to_end", "runId": "legacy", "videoId": VIDEO["videoId"],
+                  "method": "gemini_direct_quiz", "model": "gemini-3.8-flash",
+                  "promptVersion": "pilot-v1", "repetition": 1, "startedAt": "2026-10-01T00:00:00Z",
+                  "apiStatus": "error", "errorCategory": "server_error", "httpStatus": 503,
+                  "groundingRunId": None, "quizRunId": None,
+                  "beCompatibility": "not_applicable", "questionReviews": []}
+        self.assertTrue(set(schema["required"]).issubset(legacy))
+        self.assertTrue(set(schema["oneOf"][2]["required"]).issubset(legacy))
+        self.assertTrue(set(legacy).issubset(schema["properties"]))
+
     def test_malformed_envelope_and_network_error_are_classified(self):
         with self.assertRaises(ProviderFailure) as failure:
             self.router(FakeTransport({"status": "completed", "steps": []})).invoke(
@@ -346,13 +587,15 @@ class ProviderAdapterTest(unittest.TestCase):
             shutil.copyfile(root / "configs" / "pilot.yaml", repository / "configs" / "pilot.yaml")
             shutil.copyfile(root / "data" / "videos.jsonl", repository / "data" / "videos.jsonl")
             runner = PilotRunner(repository, repository / "results")
+            source_id = approve_test_source(runner)
             for model, response in (("gemini-3.8-flash", gemini_response(QUIZ)),
                                     ("gpt-5.4-mini", {"status": "completed", "output": [{
                                         "type": "message", "content": [{"type": "output_text", "text": json.dumps(QUIZ)}]}],
                                         "usage": {"input_tokens": 10, "output_tokens": 20}})):
                 with self.subTest(model=model):
                     router = self.router(FakeTransport(response))
-                    row = runner.run_quiz(VIDEO["videoId"], model, 1, CONTENT, router)
+                    row = runner.run_quiz(VIDEO["videoId"], model, 1, CONTENT, router,
+                                          source_grounding_run_id=source_id)
                     self.assertEqual(row["apiStatus"], "success")
                     self.assertIsNotNone(row["estimatedCostUsd"])
                     self.assertEqual(row["pricingReference"], "operator-test-pricing")
@@ -426,16 +669,18 @@ class ProviderAdapterTest(unittest.TestCase):
                 payload = dict(QUIZ, questions=[dict(question, sourceEvidence=echoed)
                                                 for question in QUIZ["questions"]])
                 runner = PilotRunner(repository, repository / "results")
+                source_id = approve_test_source(runner, CONTENT + " " + echoed)
                 row = runner.run_quiz(VIDEO["videoId"], "gemini-3.8-flash", 1,
                                       CONTENT + " " + echoed,
-                                      self.router(FakeTransport(gemini_response(payload))))
+                                      self.router(FakeTransport(gemini_response(payload))),
+                                      source_grounding_run_id=source_id)
                 self.assertEqual(row["validatorStatus"], "pass")
                 raw_file = repository / "results" / "raw" / (row["runId"] + ".json")
                 evaluation_file = repository / "results" / "evaluation" / (row["runId"] + ".json")
                 self.assertNotIn(echoed, raw_file.read_text(encoding="utf-8"))
                 self.assertEqual(json.loads(evaluation_file.read_text(encoding="utf-8")), payload)
 
-    def test_two_stage_mock_results_link_runs_and_direct_never_claims_be_validation(self):
+    def test_separate_approved_results_link_runs_and_direct_never_claims_be_validation(self):
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as folder:
             repository = Path(folder)
@@ -445,13 +690,14 @@ class ProviderAdapterTest(unittest.TestCase):
             shutil.copyfile(root / "data" / "videos.jsonl", repository / "data" / "videos.jsonl")
             runner = PilotRunner(repository, repository / "results")
             transport = QueueTransport((gemini_response(GROUNDING), gemini_response(QUIZ)))
-            row = runner.run_end_to_end(VIDEO["videoId"], "gemini_grounding_gemini_quiz", 1,
-                                        self.router(transport, call_limit=2))
-            self.assertIsNotNone(row["groundingRunId"])
-            self.assertIsNotNone(row["quizRunId"])
-            self.assertNotEqual(row["groundingRunId"], row["quizRunId"])
-            self.assertEqual(row["beCompatibility"], "pass")
-            self.assertIsNotNone(row["totalEstimatedCostUsd"])
+            router = self.router(transport, call_limit=2)
+            grounding = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1, router)
+            runner.approve_content(grounding["runId"])
+            quiz = runner.run_quiz(VIDEO["videoId"], "gemini-3.8-flash", 1,
+                                   CONTENT, router, source_grounding_run_id=grounding["runId"])
+            self.assertEqual(quiz["sourceGroundingRunId"], grounding["runId"])
+            self.assertEqual(quiz["beCompatibility"], "pass")
+            self.assertIsNotNone(quiz["estimatedCostUsd"])
             direct = runner.run_end_to_end(VIDEO["videoId"], "gemini_direct_quiz", 1,
                                            self.router(FakeTransport(gemini_response(QUIZ))))
             self.assertEqual(direct["beCompatibility"], "not_applicable")
@@ -466,10 +712,12 @@ class ProviderAdapterTest(unittest.TestCase):
             shutil.copyfile(root / "configs" / "pilot.yaml", repository / "configs" / "pilot.yaml")
             shutil.copyfile(root / "data" / "videos.jsonl", repository / "data" / "videos.jsonl")
             runner = PilotRunner(repository, repository / "results")
+            source_id = approve_test_source(runner)
             envelope = {"status": "completed", "steps": [{"type": "model_output",
                         "content": [{"type": "text", "text": "{broken"}]}]}
             row = runner.run_quiz(VIDEO["videoId"], "gemini-3.8-flash", 1, CONTENT,
-                                  self.router(FakeTransport(envelope)))
+                                  self.router(FakeTransport(envelope)),
+                                  source_grounding_run_id=source_id)
             self.assertEqual(row["apiStatus"], "success")
             self.assertEqual(row["parseStatus"], "fail")
             self.assertEqual(row["errorCategory"], "parse_error")
@@ -507,9 +755,12 @@ class ProviderAdapterTest(unittest.TestCase):
             (repository / "data").mkdir()
             shutil.copyfile(root / "configs" / "pilot.yaml", repository / "configs" / "pilot.yaml")
             shutil.copyfile(root / "data" / "videos.jsonl", repository / "data" / "videos.jsonl")
-            row = PilotRunner(repository, repository / "results").run_quiz(
+            runner = PilotRunner(repository, repository / "results")
+            source_id = approve_test_source(runner)
+            row = runner.run_quiz(
                 VIDEO["videoId"], "gemini-3.8-flash", 1, CONTENT,
-                self.router(FakeTransport(gemini_response(dict(QUIZ, promptVersion="other")))))
+                self.router(FakeTransport(gemini_response(dict(QUIZ, promptVersion="other")))),
+                source_grounding_run_id=source_id)
             self.assertEqual(row["validatorStatus"], "fail")
             self.assertEqual(row["beCompatibility"], "fail")
 
