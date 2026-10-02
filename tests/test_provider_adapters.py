@@ -621,6 +621,7 @@ class ProviderAdapterTest(unittest.TestCase):
                         "grounding", video=VIDEO, model="gemini-3.8-flash")
                 self.assertEqual((failure.exception.category, failure.exception.http_status),
                                  (category, status))
+                self.assertEqual(failure.exception.retry_stop_reason, "live_guard")
                 self.assertEqual(len(transport.calls), 1)
                 with tempfile.TemporaryDirectory() as folder:
                     repository = Path(folder)
@@ -634,6 +635,7 @@ class ProviderAdapterTest(unittest.TestCase):
                         self.router(FakeTransport({"error": "Bearer unrelated-secret"}, status),
                                     retry_attempts=2, call_limit=1))
                     self.assertEqual((row["errorCategory"], row["httpStatus"]), (category, status))
+                    self.assertEqual(row["retryStopReason"], "live_guard")
                     saved = (repository / "results" / "video-grounding.jsonl").read_text(encoding="utf-8")
                     self.assertNotIn("unrelated-secret", saved)
                     self.assertNotIn("gemini-test-secret", saved)
@@ -645,7 +647,76 @@ class ProviderAdapterTest(unittest.TestCase):
                 "grounding", video=VIDEO, model="gemini-3.8-flash")
         self.assertEqual((failure.exception.category, failure.exception.http_status),
                          ("live_guard", None))
+        self.assertIsNone(failure.exception.retry_stop_reason)
         self.assertEqual(transport.calls, [])
+        with tempfile.TemporaryDirectory() as folder:
+            row = self.temporary_runner(folder).run_grounding(
+                VIDEO["videoId"], "gemini_video", 1,
+                self.router(transport, retry_attempts=2, call_limit=0))
+        self.assertEqual((row["errorCategory"], row["httpStatus"], row["retryStopReason"]),
+                         ("live_guard", None, None))
+        self.assertEqual(transport.calls, [])
+
+    def test_retry_stop_keeps_last_provider_failure_for_each_runner_path(self):
+        schema_path = Path(__file__).resolve().parents[1] / "docs" / "run-result.schema.json"
+        rules = json.loads(schema_path.read_text(encoding="utf-8"))["allOf"]
+        invariant = next(rule["then"]["properties"] for rule in rules
+                         if "retryStopReason" in rule["if"].get("required", []))
+        for status, category, code in ((429, "rate_limit", "rate_limit_exceeded"),
+                                       (503, "server_error", "service_unavailable")):
+            for path in ("grounding", "quiz", "direct"):
+                with self.subTest(status=status, path=path), \
+                        tempfile.TemporaryDirectory() as folder:
+                    runner = self.temporary_runner(folder)
+                    source_id = approve_test_source(runner) if path == "quiz" else None
+                    transport = FakeTransport({"providerErrorCode": code}, status)
+                    router = self.router(transport, retry_attempts=2, call_limit=1)
+                    if path == "grounding":
+                        row = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1, router)
+                    elif path == "quiz":
+                        row = runner.run_quiz(VIDEO["videoId"], "gemini-3.8-flash", 1, CONTENT,
+                                              router, source_grounding_run_id=source_id)
+                    else:
+                        row = runner.run_end_to_end(VIDEO["videoId"], "gemini_direct_quiz", 1,
+                                                    router)
+                    self.assertEqual((row["apiStatus"], row["errorCategory"], row["httpStatus"],
+                                      row["providerErrorCode"], row["retryStopReason"]),
+                                     ("error", category, status, code, "live_guard"))
+                    self.assertEqual(len(transport.calls), 1)
+                    # The production row satisfies the schema's retryStopReason invariant.
+                    self.assertEqual(row["apiStatus"], invariant["apiStatus"]["const"])
+                    self.assertIs(type(row["httpStatus"]), int)
+                    self.assertNotEqual(row["errorCategory"], invariant["errorCategory"]["not"]["const"])
+
+    def test_cost_guard_stops_retry_after_server_error(self):
+        # Each call reserves (10000 + 2000) / 1e6 = 0.012 USD, so the second call exceeds 0.02.
+        transport = FakeTransport({"providerErrorCode": "service_unavailable"}, 503)
+        with self.assertRaises(ProviderFailure) as failure:
+            self.router(transport, retry_attempts=2, call_limit=5, total_cost_limit=0.02).invoke(
+                "grounding", video=VIDEO, model="gemini-3.8-flash")
+        self.assertEqual((failure.exception.category, failure.exception.http_status,
+                          failure.exception.provider_error_code, failure.exception.retry_stop_reason),
+                         ("server_error", 503, "service_unavailable", "live_guard"))
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_exhausted_retries_do_not_record_retry_stop_reason(self):
+        transport = FakeTransport({"providerErrorCode": "service_unavailable"}, 503)
+        with tempfile.TemporaryDirectory() as folder:
+            row = self.temporary_runner(folder).run_grounding(
+                VIDEO["videoId"], "gemini_video", 1,
+                self.router(transport, retry_attempts=1, call_limit=5))
+        self.assertEqual((row["errorCategory"], row["httpStatus"], row["retryStopReason"]),
+                         ("server_error", 503, None))
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_successful_live_row_has_null_retry_stop_reason(self):
+        with tempfile.TemporaryDirectory() as folder:
+            row = self.temporary_runner(folder).run_grounding(
+                VIDEO["videoId"], "gemini_video", 1,
+                self.router(FakeTransport(gemini_response(GROUNDING))))
+        self.assertEqual(row["apiStatus"], "success")
+        self.assertIn("retryStopReason", row)
+        self.assertIsNone(row["retryStopReason"])
 
     def test_provider_echo_keeps_evaluation_output_but_not_persisted_metadata(self):
         for echoed in ("gemini-test-secret", "Bearer unrelated-credential"):

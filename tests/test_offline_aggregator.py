@@ -168,6 +168,21 @@ class OfflineAggregatorTest(unittest.TestCase):
                          ["legacy", "ground-5"])
         self.assertEqual(result["groundingAttemptHistory"][0]["attempt"], 1)
 
+    def test_attempt_history_exposes_retry_stop_reason_and_accepts_legacy_rows(self):
+        legacy = self.row("video_grounding", "ground-1", "gemini_video", "gemini-3.8-flash", 1,
+                          apiStatus="error", errorCategory="server_error", httpStatus=503)
+        stopped = self.row("video_grounding", "ground-2", "gemini_video", "gemini-3.8-flash", 2,
+                           apiStatus="error", errorCategory="rate_limit", httpStatus=429,
+                           providerErrorCode="rate_limit_exceeded", retryStopReason="live_guard")
+        self.write([legacy, stopped, {**self.grounding, "retryStopReason": None}], [self.quiz])
+        history = self.aggregate()["groundingAttemptHistory"]
+        self.assertEqual([item["runId"] for item in history], ["ground-1", "ground-2", "ground-5"])
+        self.assertNotIn("retryStopReason", history[0])
+        self.assertEqual((history[1]["errorCategory"], history[1]["httpStatus"],
+                          history[1]["providerErrorCode"], history[1]["retryStopReason"]),
+                         ("rate_limit", 429, "rate_limit_exceeded", "live_guard"))
+        self.assertIsNone(history[2]["retryStopReason"])
+
     def test_quiz_failure_history_excludes_other_prompt_and_content(self):
         prior = {**self.quiz, "runId": "quiz-failed", "attempt": 1,
                  "apiStatus": "error", "errorCategory": "rate_limit"}

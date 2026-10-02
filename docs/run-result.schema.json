@@ -9,6 +9,10 @@
     {
       "if": {"required": ["approvedBy"]},
       "then": {"required": ["contentTextApprovalStatus"], "properties": {"benchmarkType": {"const": "video_grounding"}, "contentTextApprovalStatus": {"const": "approved"}}}
+    },
+    {
+      "if": {"required": ["retryStopReason"], "properties": {"retryStopReason": {"const": "live_guard"}}},
+      "then": {"required": ["apiStatus", "httpStatus", "errorCategory"], "properties": {"apiStatus": {"const": "error"}, "httpStatus": {"type": "integer"}, "errorCategory": {"type": "string", "not": {"const": "live_guard"}}}}
     }
   ],
   "properties": {
@@ -25,6 +29,7 @@
     "errorCategory": {"type": ["string", "null"]},
     "httpStatus": {"type": ["integer", "null"], "minimum": 100, "maximum": 599},
     "providerErrorCode": {"type": ["string", "null"]},
+    "retryStopReason": {"enum": ["live_guard", null]},
     "latencyMs": {"type": ["number", "null"], "minimum": 0},
     "inputTokens": {"type": ["integer", "null"], "minimum": 0},
     "outputTokens": {"type": ["integer", "null"], "minimum": 0},

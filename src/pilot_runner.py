@@ -193,7 +193,7 @@ class PilotRunner:
             "promptVersion": prompt_version,
             "repetition": repetition, "startedAt": datetime.now(timezone.utc).isoformat(),
             "apiStatus": "not_run", "errorCategory": None, "httpStatus": None,
-            "providerErrorCode": None, "latencyMs": None,
+            "providerErrorCode": None, "retryStopReason": None, "latencyMs": None,
             "inputTokens": None, "outputTokens": None, "thinkingTokens": None,
             "estimatedCostUsd": None, "pricingReference": None,
         }
@@ -300,6 +300,7 @@ class PilotRunner:
         row["errorCategory"] = category if actual else "fixture_" + category
         row["httpStatus"] = failure.http_status if actual else None
         row["providerErrorCode"] = failure.provider_error_code if actual else None
+        row["retryStopReason"] = failure.retry_stop_reason if actual else None
         if actual:
             row["latencyMs"] = round((time.monotonic() - started) * 1000, 3)
             measurements = response if response is not None else failure.measurements
