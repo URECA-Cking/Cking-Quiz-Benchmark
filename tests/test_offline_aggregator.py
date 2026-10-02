@@ -119,6 +119,22 @@ class OfflineAggregatorTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.aggregate()
 
+    def test_approval_tracking_validity_matches_runner(self):
+        valid_at = "2026-10-02T05:00:00.123456+00:00"
+        self.assertEqual(self.aggregate()["contentTextApprovalStatus"], "approved")  # legacy
+        self.write([{**self.grounding, "approvedBy": "Reviewer Kim", "approvedAt": valid_at}],
+                   [self.quiz])
+        self.assertEqual(self.aggregate()["groundingRunId"], "ground-5")
+        for fields in ({"approvedBy": "Reviewer Kim"}, {"approvedAt": valid_at},
+                       {"approvedBy": " padded ", "approvedAt": valid_at},
+                       {"approvedBy": "Reviewer Kim", "approvedAt": "2026-10-02T05:00:00Z"},
+                       {"approvedBy": "Reviewer Kim", "approvedAt": valid_at,
+                        "contentTextApprovalStatus": None}):
+            with self.subTest(fields=fields):
+                self.write([{**self.grounding, **fields}], [self.quiz])
+                with self.assertRaisesRegex(ValueError, "approv"):
+                    self.aggregate()
+
     def test_rejects_evaluation_content_hash_mismatch(self):
         (self.results / "evaluation" / "ground-5.json").write_text(
             json.dumps({"contentText": "altered"}), encoding="utf-8")

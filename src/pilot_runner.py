@@ -13,6 +13,7 @@ from pathlib import Path
 
 import yaml
 
+from src.approval_tracking import normalize_approved_by, require_valid_approval_tracking
 from src.provider_failure import ProviderFailure
 
 
@@ -366,6 +367,7 @@ class PilotRunner:
                 or len(approved_hash) != 64
                 or any(char not in "0123456789abcdef" for char in approved_hash)):
             raise ValueError("An approved Grounding result is required")
+        require_valid_approval_tracking(source)
         evaluation = json.loads(evaluation_file.read_text(encoding="utf-8"))
         original = evaluation.get("contentText") if isinstance(evaluation, dict) else None
         if (not isinstance(original, str) or not original.strip()
@@ -373,12 +375,13 @@ class PilotRunner:
                 or hashlib.sha256(content_text.encode("utf-8")).hexdigest() != approved_hash):
             raise ValueError("Quiz contentText must match approved Grounding contentText")
 
-    def approve_content(self, source_grounding_run_id):
+    def approve_content(self, source_grounding_run_id, approved_by):
         """Explicit human-review action; never called by a benchmark run."""
         if (not isinstance(source_grounding_run_id, str)
                 or len(source_grounding_run_id) != 32
                 or any(char not in "0123456789abcdef" for char in source_grounding_run_id)):
             raise ValueError("A Grounding runId is required for human approval")
+        approved_by = normalize_approved_by(approved_by)
         self._check_storage_integrity()
         result_file = self.results / self.FILES["video_grounding"]
         evaluation_file = (self.results / "evaluation"
@@ -403,8 +406,14 @@ class PilotRunner:
             raise ValueError("Grounding contentText hash does not match evaluation")
         if row.get("contentTextApprovalStatus") not in (None, "approved"):
             raise ValueError("Invalid Grounding human approval status")
+        require_valid_approval_tracking(row)
+        if row.get("contentTextApprovalStatus") == "approved":
+            # Tracked and legacy approvals are kept as recorded; never backfill or rewrite.
+            return row
         row["contentTextSha256"] = content_hash
         row["contentTextApprovalStatus"] = "approved"
+        row["approvedBy"] = approved_by
+        row["approvedAt"] = datetime.now(timezone.utc).isoformat()
         newline = "\r\n" if lines[index].endswith("\r\n") else "\n" if lines[index].endswith("\n") else ""
         lines[index] = json.dumps(row, ensure_ascii=False) + newline
         temp_path = None

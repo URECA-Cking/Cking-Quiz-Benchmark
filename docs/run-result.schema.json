@@ -4,7 +4,12 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["benchmarkType", "runId", "videoId", "method", "model", "promptVersion", "repetition", "startedAt", "apiStatus"],
+  "dependentRequired": {"approvedBy": ["approvedAt"], "approvedAt": ["approvedBy"]},
   "allOf": [
+    {
+      "if": {"required": ["approvedBy"]},
+      "then": {"required": ["contentTextApprovalStatus"], "properties": {"benchmarkType": {"const": "video_grounding"}, "contentTextApprovalStatus": {"const": "approved"}}}
+    },
     {
       "if": {"required": ["retryStopReason"], "properties": {"retryStopReason": {"const": "live_guard"}}},
       "then": {"required": ["apiStatus", "httpStatus", "errorCategory"], "properties": {"apiStatus": {"const": "error"}, "httpStatus": {"type": "integer"}, "errorCategory": {"type": "string", "not": {"const": "live_guard"}}}}
@@ -36,6 +41,8 @@
     "hallucination": {"$ref": "#/$defs/nullableReview"},
     "contentTextSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "contentTextApprovalStatus": {"enum": ["approved", null]},
+    "approvedBy": {"type": "string", "minLength": 1, "maxLength": 100},
+    "approvedAt": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?\\+00:00$"},
     "sourceGroundingRunId": {"type": ["string", "null"]},
     "parseStatus": {"enum": ["pass", "fail", "not_run"]},
     "validatorStatus": {"enum": ["pass", "fail", "not_run"]},
