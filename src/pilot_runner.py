@@ -344,9 +344,9 @@ class PilotRunner:
                 or len(source_grounding_run_id) != 32
                 or any(char not in "0123456789abcdef" for char in source_grounding_run_id)):
             raise ValueError("An approved source Grounding runId is required")
-        self._check_storage_integrity(self.repository / "results")
-        result_file = self.repository / "results" / self.FILES["video_grounding"]
-        evaluation_file = (self.repository / "results" / "evaluation"
+        self._check_storage_integrity()
+        result_file = self.results / self.FILES["video_grounding"]
+        evaluation_file = (self.results / "evaluation"
                            / (source_grounding_run_id + ".json"))
         if (result_file.resolve() != result_file or evaluation_file.resolve() != evaluation_file
                 or not result_file.is_file() or not evaluation_file.is_file()):
@@ -378,9 +378,9 @@ class PilotRunner:
                 or len(source_grounding_run_id) != 32
                 or any(char not in "0123456789abcdef" for char in source_grounding_run_id)):
             raise ValueError("A Grounding runId is required for human approval")
-        self._check_storage_integrity(self.repository / "results")
-        result_file = self.repository / "results" / self.FILES["video_grounding"]
-        evaluation_file = (self.repository / "results" / "evaluation"
+        self._check_storage_integrity()
+        result_file = self.results / self.FILES["video_grounding"]
+        evaluation_file = (self.results / "evaluation"
                            / (source_grounding_run_id + ".json"))
         if (result_file.resolve() != result_file or evaluation_file.resolve() != evaluation_file
                 or not result_file.is_file() or not evaluation_file.is_file()):

@@ -33,6 +33,15 @@ GROUNDING = {
 }
 
 
+FIXTURE_RAW = {"source": "fixture"}
+
+
+class SimulatedApiFixture(FixtureProvider):
+    """Offline double whose responses are recorded as successful API runs."""
+
+    is_actual_api = True
+
+
 class PilotRunnerTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -51,31 +60,33 @@ class PilotRunnerTest(unittest.TestCase):
         return [json.loads(line) for line in (self.results / name).read_text(encoding="utf-8").splitlines()]
 
     def approved_source(self, content=CONTENT, video_id=VIDEO, approval="approved",
-                        api_status="success", evaluation_content=None):
-        source = self.runner._base("video_grounding", video_id, "gemini_video",
-                                   "gemini-3.8-flash", 1)
+                        api_status="success", evaluation_content=None, runner=None):
+        runner = runner or self.runner
+        source = runner._base("video_grounding", video_id, "gemini_video",
+                              "gemini-3.8-flash", 1)
         source.update(runId=uuid.uuid4().hex, apiStatus=api_status,
                       contentTextSha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
                       contentTextApprovalStatus=approval, groundingFacts=[],
                       omission=None, hallucination=None)
-        self.results.mkdir(exist_ok=True)
-        with (self.results / "video-grounding.jsonl").open("a", encoding="utf-8") as stream:
+        runner.results.mkdir(parents=True, exist_ok=True)
+        with (runner.results / "video-grounding.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(source) + "\n")
-        evaluation_dir = self.results / "evaluation"
+        evaluation_dir = runner.results / "evaluation"
         evaluation_dir.mkdir(exist_ok=True)
         (evaluation_dir / (source["runId"] + ".json")).write_text(
             json.dumps({"contentText": content if evaluation_content is None else evaluation_content,
                         "facts": []}), encoding="utf-8")
-        raw_dir = self.results / "raw"
+        raw_dir = runner.results / "raw"
         raw_dir.mkdir(exist_ok=True)
         (raw_dir / (source["runId"] + ".json")).write_text(
             json.dumps({"source": "fixture"}), encoding="utf-8")
         return source["runId"]
 
     def run_approved_quiz(self, video_id, model, repetition, content, provider, runner=None):
-        source_id = self.approved_source(content, video_id)
-        return (runner or self.runner).run_quiz(video_id, model, repetition, content, provider,
-                                               source_grounding_run_id=source_id)
+        runner = runner or self.runner
+        source_id = self.approved_source(content, video_id, runner=runner)
+        return runner.run_quiz(video_id, model, repetition, content, provider,
+                               source_grounding_run_id=source_id)
 
     def test_quiz_rejects_missing_human_approval_before_provider_call(self):
         provider = FixtureProvider({"quiz": {"raw": QUIZ}})
@@ -314,6 +325,55 @@ class PilotRunnerTest(unittest.TestCase):
         self.run_approved_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT + " changed",
                                provider, runner=next_version)
         self.assertEqual(len(provider.calls), 3)
+
+    def test_custom_results_directory_links_grounding_approval_and_quiz(self):
+        custom = PilotRunner(self.repository, self.results / "custom")
+        grounding = custom.run_grounding(VIDEO, "gemini_video", 1,
+                                         SimulatedApiFixture({"grounding": {
+                                             "normalized": GROUNDING, "responseBody": FIXTURE_RAW}}))
+        self.assertEqual(grounding["apiStatus"], "success")
+        self.assertFalse((self.results / "video-grounding.jsonl").exists())
+        custom.approve_content(grounding["runId"])
+        saved = [json.loads(line) for line in
+                 (custom.results / "video-grounding.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(saved[0]["contentTextApprovalStatus"], "approved")
+        self.assertEqual(saved[0]["contentTextSha256"], hashlib.sha256(CONTENT.encode()).hexdigest())
+        provider = SimulatedApiFixture({"quiz": {"normalized": QUIZ, "responseBody": FIXTURE_RAW}})
+        row = custom.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                              source_grounding_run_id=grounding["runId"])
+        self.assertEqual((row["apiStatus"], row["sourceGroundingRunId"]),
+                         ("success", grounding["runId"]))
+        self.assertEqual(len(provider.calls), 1)
+        self.assertTrue((custom.results / "quiz-generation.jsonl").is_file())
+        self.assertFalse((self.results / "quiz-generation.jsonl").exists())
+
+    def test_grounding_from_another_results_directory_is_rejected(self):
+        def snapshot(directory):
+            return {path: path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+
+        custom = PilotRunner(self.repository, self.results / "custom")
+        default_source = self.approved_source()
+        default_before = snapshot(self.results)
+        provider = SimulatedApiFixture({"quiz": {"normalized": QUIZ, "responseBody": FIXTURE_RAW}})
+        with self.assertRaisesRegex(ValueError, "approved"):
+            custom.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                            source_grounding_run_id=default_source)
+        with self.assertRaisesRegex(ValueError, "human approval"):
+            custom.approve_content(default_source)
+        self.assertEqual(snapshot(self.results), default_before)
+
+        grounding = custom.run_grounding(VIDEO, "gemini_video", 1,
+                                         SimulatedApiFixture({"grounding": {
+                                             "normalized": GROUNDING, "responseBody": FIXTURE_RAW}}))
+        custom.approve_content(grounding["runId"])
+        custom_before = snapshot(custom.results)
+        with self.assertRaisesRegex(ValueError, "human approval"):
+            self.runner.approve_content(grounding["runId"])
+        with self.assertRaisesRegex(ValueError, "approved"):
+            self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                                 source_grounding_run_id=grounding["runId"])
+        self.assertEqual(snapshot(custom.results), custom_before)
+        self.assertEqual(provider.calls, [])
 
     def test_unsafe_result_paths_are_rejected(self):
         for path in (self.repository / "data" / "output", Path("results/../data/output"),
