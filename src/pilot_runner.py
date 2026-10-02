@@ -13,11 +13,7 @@ from pathlib import Path
 
 import yaml
 
-
-class ProviderFailure(Exception):
-    def __init__(self, category):
-        super().__init__(category)
-        self.category = category
+from src.provider_failure import ProviderFailure
 
 
 class FixtureProvider:
@@ -73,16 +69,148 @@ class PilotRunner:
         if not 1 <= repetition <= self.config["repetitions_per_condition"]:
             raise ValueError("Repetition is outside pilot configuration")
 
-    def _base(self, benchmark_type, video_id, method, model, repetition):
+    def _next_attempt(self, benchmark_type, video_id, method, model, repetition,
+                      prompt_version=None, content_hash=None):
+        result_file = self.results / self.FILES[benchmark_type]
+        if not result_file.exists():
+            return 1
+        if result_file.resolve() != result_file:
+            raise ValueError("Result file must not be a link")
+        latest = 0
+        for line in result_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            existing = json.loads(line)
+            if (existing.get("videoId") == video_id and existing.get("method") == method
+                    and existing.get("model") == model and existing.get("repetition") == repetition
+                    and (benchmark_type != "quiz_generation"
+                         or (existing.get("promptVersion") == prompt_version
+                             and existing.get("contentTextSha256") == content_hash))):
+                attempt = existing.get("attempt", 1)
+                if type(attempt) is not int or attempt < 1:
+                    raise ValueError("Invalid attempt in existing result")
+                latest = max(latest, attempt)
+        return latest + 1
+
+    @staticmethod
+    def _strict_json(data):
+        def reject_constant(_value):
+            raise ValueError("Non-finite JSON value")
+        return json.loads(data, parse_constant=reject_constant)
+
+    def _check_storage_integrity(self, results=None):
+        """Reject incomplete prior results before a new run or human approval."""
+        results = self.results if results is None else self._safe_results_path(results)
+        self._safe_results_path(results)
+        known_ids = set()
+        rows = []
+        for benchmark_type, filename in self.FILES.items():
+            result_file = results / filename
+            if not result_file.exists():
+                if result_file.is_symlink():
+                    raise ValueError("Result storage integrity error: linked summary file")
+                continue
+            if result_file.is_symlink() or not result_file.is_file():
+                raise ValueError("Result storage integrity error: invalid summary file")
+            try:
+                lines = result_file.read_text(encoding="utf-8").splitlines()
+            except UnicodeError as exc:
+                raise ValueError("Result storage integrity error: unreadable summary file") from exc
+            for line_number, line in enumerate(lines, 1):
+                if not line.strip():
+                    continue
+                try:
+                    row = self._strict_json(line)
+                except ValueError as exc:
+                    raise ValueError(f"Result storage integrity error: malformed {filename} line {line_number}") from exc
+                run_id = row.get("runId") if isinstance(row, dict) else None
+                if (not isinstance(row, dict) or not isinstance(run_id, str) or not run_id
+                        or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+                               for char in run_id)
+                        or not isinstance(row.get("videoId"), str) or not row["videoId"]
+                        or not isinstance(row.get("method"), str) or not row["method"]
+                        or row.get("model") is not None and not isinstance(row["model"], str)
+                        or type(row.get("repetition")) is not int or row["repetition"] < 1
+                        or row.get("apiStatus") not in ("success", "error", "not_run")
+                        or row.get("benchmarkType", benchmark_type) != benchmark_type
+                        or ("attempt" in row and
+                            (type(row["attempt"]) is not int or row["attempt"] < 1))):
+                    raise ValueError(f"Result storage integrity error: invalid {filename} line {line_number}")
+                known_ids.add(run_id)
+                rows.append((benchmark_type, row))
+
+        for benchmark_type, row in rows:
+            run_id = row["runId"]
+            raw_file = results / "raw" / (run_id + ".json")
+            evaluation_file = results / "evaluation" / (run_id + ".json")
+            if raw_file.is_symlink() or evaluation_file.is_symlink():
+                raise ValueError("Result storage integrity error: linked result payload")
+            has_raw, has_evaluation = raw_file.is_file(), evaluation_file.is_file()
+            completed_grounding = benchmark_type == "video_grounding" and (
+                row["apiStatus"] == "success" or
+                (row["apiStatus"] == "not_run" and row["method"] != "authorized_transcript"
+                 and row.get("contentTextSha256")))
+            completed_quiz = (benchmark_type != "video_grounding" and
+                              row.get("parseStatus") in ("pass", "fail"))
+            needs_raw = (row["apiStatus"] == "success" or completed_grounding or completed_quiz
+                         or row["apiStatus"] == "error" and row.get("errorCategory") in
+                         ("invalid_grounding_response",))
+            needs_evaluation = completed_grounding or (completed_quiz and row["parseStatus"] == "pass")
+            if (needs_raw and not has_raw or needs_evaluation and not has_evaluation
+                    or has_evaluation and not has_raw):
+                raise ValueError("Result storage integrity error: missing linked result payload")
+            for payload in (raw_file, evaluation_file):
+                if payload.is_file():
+                    try:
+                        parsed = self._strict_json(payload.read_text(encoding="utf-8"))
+                        if payload == raw_file:
+                            if parsed is None:
+                                raise ValueError("Raw metadata file cannot be null")
+                            self._validate_raw_metadata(parsed)
+                    except (UnicodeError, ValueError) as exc:
+                        raise ValueError("Result storage integrity error: malformed linked result payload") from exc
+
+        for directory in (results, results / "raw", results / "evaluation"):
+            if not directory.exists():
+                continue
+            if directory.is_symlink() or not directory.is_dir():
+                raise ValueError("Result storage integrity error: invalid result directory")
+            if any(directory.glob("*.tmp")):
+                raise ValueError("Result storage integrity error: unfinished temporary file")
+            if directory != results:
+                if any(path.stem not in known_ids for path in directory.glob("*.json")):
+                    raise ValueError("Result storage integrity error: orphaned result payload")
+
+    def _base(self, benchmark_type, video_id, method, model, repetition, content_hash=None):
+        self._check_storage_integrity()
+        prompt_version = self.config["prompt_version"] if benchmark_type != "video_grounding" else None
         return {
             "benchmarkType": benchmark_type, "runId": uuid.uuid4().hex,
             "videoId": video_id, "method": method, "model": model,
-            "promptVersion": self.config["prompt_version"] if benchmark_type != "video_grounding" else None,
+            "attempt": self._next_attempt(benchmark_type, video_id, method, model, repetition,
+                                          prompt_version, content_hash),
+            "promptVersion": prompt_version,
             "repetition": repetition, "startedAt": datetime.now(timezone.utc).isoformat(),
-            "apiStatus": "not_run", "errorCategory": None, "latencyMs": None,
+            "apiStatus": "not_run", "errorCategory": None, "httpStatus": None,
+            "providerErrorCode": None, "latencyMs": None,
             "inputTokens": None, "outputTokens": None, "thinkingTokens": None,
             "estimatedCostUsd": None, "pricingReference": None,
         }
+
+    @staticmethod
+    def _atomic_write(path, data):
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile("wb", dir=path.parent, prefix=".result-",
+                                             suffix=".tmp", delete=False) as stream:
+                temp_path = Path(stream.name)
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, path)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     def _save(self, row, raw=None, evaluation=None):
         self._safe_results_path(self.results)
@@ -104,8 +232,7 @@ class PilotRunner:
             raw_file = raw_dir / (row["runId"] + ".json")
             if raw_file.resolve() != raw_file:
                 raise ValueError("Raw result file must not be a link")
-            raw_file.write_text(
-                json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._atomic_write(raw_file, json.dumps(raw, ensure_ascii=False, indent=2).encode("utf-8"))
         if evaluation is not None:
             evaluation_dir = self.results / "evaluation"
             if evaluation_dir.resolve() != evaluation_dir:
@@ -114,13 +241,15 @@ class PilotRunner:
             evaluation_file = evaluation_dir / (row["runId"] + ".json")
             if evaluation_file.resolve() != evaluation_file:
                 raise ValueError("Evaluation result file must not be a link")
-            evaluation_file.write_text(
-                json.dumps(evaluation, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._atomic_write(evaluation_file,
+                               json.dumps(evaluation, ensure_ascii=False, indent=2).encode("utf-8"))
         result_file = self.results / self.FILES[row["benchmarkType"]]
         if result_file.resolve() != result_file:
             raise ValueError("Result file must not be a link")
-        with result_file.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+        previous = result_file.read_bytes() if result_file.exists() else b""
+        separator = b"\n" if previous and not previous.endswith(b"\n") else b""
+        new_row = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+        self._atomic_write(result_file, previous + separator + new_row)
         return row
 
     @staticmethod
@@ -162,14 +291,22 @@ class PilotRunner:
             row["apiStatus"] = "success"
         # Offline fixtures have no measured API latency, usage, cost or API success.
 
-    def _failure(self, row, provider, failure, started):
+    def _failure(self, row, provider, failure, started, response=None):
         actual = self._actual(provider)
         row["apiStatus"] = "error" if actual else "not_run"
         category = failure.category
         category = category if isinstance(category, str) and category else "provider_error"
         row["errorCategory"] = category if actual else "fixture_" + category
+        row["httpStatus"] = failure.http_status if actual else None
+        row["providerErrorCode"] = failure.provider_error_code if actual else None
         if actual:
             row["latencyMs"] = round((time.monotonic() - started) * 1000, 3)
+            measurements = response if response is not None else failure.measurements
+            if measurements is not None:
+                try:
+                    self._metrics(row, measurements, row["latencyMs"])
+                except ProviderFailure:
+                    pass
 
     def _require_fixed_content(self, video_id, content_hash):
         root = self.repository / "data" / "restricted" / "fixed-content"
@@ -202,6 +339,88 @@ class PilotRunner:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
 
+    def _require_approved_content(self, video_id, content_text, source_grounding_run_id):
+        if (not isinstance(source_grounding_run_id, str)
+                or len(source_grounding_run_id) != 32
+                or any(char not in "0123456789abcdef" for char in source_grounding_run_id)):
+            raise ValueError("An approved source Grounding runId is required")
+        self._check_storage_integrity()
+        result_file = self.results / self.FILES["video_grounding"]
+        evaluation_file = (self.results / "evaluation"
+                           / (source_grounding_run_id + ".json"))
+        if (result_file.resolve() != result_file or evaluation_file.resolve() != evaluation_file
+                or not result_file.is_file() or not evaluation_file.is_file()):
+            raise ValueError("An approved Grounding result and evaluation are required")
+        matching = [row for row in self._jsonl(result_file)
+                    if row.get("runId") == source_grounding_run_id]
+        if len(matching) != 1:
+            raise ValueError("Exactly one approved Grounding result is required")
+        source = matching[0]
+        approved_hash = source.get("contentTextSha256")
+        if (source.get("benchmarkType") != "video_grounding"
+                or source.get("apiStatus") != "success"
+                or source.get("videoId") != video_id
+                or source.get("contentTextApprovalStatus") != "approved"
+                or not isinstance(approved_hash, str)
+                or len(approved_hash) != 64
+                or any(char not in "0123456789abcdef" for char in approved_hash)):
+            raise ValueError("An approved Grounding result is required")
+        evaluation = json.loads(evaluation_file.read_text(encoding="utf-8"))
+        original = evaluation.get("contentText") if isinstance(evaluation, dict) else None
+        if (not isinstance(original, str) or not original.strip()
+                or hashlib.sha256(original.encode("utf-8")).hexdigest() != approved_hash
+                or hashlib.sha256(content_text.encode("utf-8")).hexdigest() != approved_hash):
+            raise ValueError("Quiz contentText must match approved Grounding contentText")
+
+    def approve_content(self, source_grounding_run_id):
+        """Explicit human-review action; never called by a benchmark run."""
+        if (not isinstance(source_grounding_run_id, str)
+                or len(source_grounding_run_id) != 32
+                or any(char not in "0123456789abcdef" for char in source_grounding_run_id)):
+            raise ValueError("A Grounding runId is required for human approval")
+        self._check_storage_integrity()
+        result_file = self.results / self.FILES["video_grounding"]
+        evaluation_file = (self.results / "evaluation"
+                           / (source_grounding_run_id + ".json"))
+        if (result_file.resolve() != result_file or evaluation_file.resolve() != evaluation_file
+                or not result_file.is_file() or not evaluation_file.is_file()):
+            raise ValueError("Grounding result and evaluation are required for human approval")
+        lines = result_file.read_text(encoding="utf-8").splitlines(keepends=True)
+        matches = [(index, json.loads(line)) for index, line in enumerate(lines) if line.strip()
+                   and json.loads(line).get("runId") == source_grounding_run_id]
+        if len(matches) != 1:
+            raise ValueError("Exactly one Grounding result is required for human approval")
+        index, row = matches[0]
+        if row.get("benchmarkType") != "video_grounding" or row.get("apiStatus") != "success":
+            raise ValueError("Only a successful Grounding result can receive human approval")
+        evaluation = json.loads(evaluation_file.read_text(encoding="utf-8"))
+        content = evaluation.get("contentText") if isinstance(evaluation, dict) else None
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Grounding evaluation must contain contentText")
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if row.get("contentTextSha256") not in (None, content_hash):
+            raise ValueError("Grounding contentText hash does not match evaluation")
+        if row.get("contentTextApprovalStatus") not in (None, "approved"):
+            raise ValueError("Invalid Grounding human approval status")
+        row["contentTextSha256"] = content_hash
+        row["contentTextApprovalStatus"] = "approved"
+        newline = "\r\n" if lines[index].endswith("\r\n") else "\n" if lines[index].endswith("\n") else ""
+        lines[index] = json.dumps(row, ensure_ascii=False) + newline
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="",
+                                             dir=result_file.parent, prefix=".grounding-",
+                                             suffix=".tmp", delete=False) as stream:
+                temp_path = Path(stream.name)
+                stream.writelines(lines)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, result_file)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
+        return row
+
     @staticmethod
     def _call(provider, kind, **kwargs):
         start = time.monotonic()
@@ -222,13 +441,15 @@ class PilotRunner:
         if method not in methods:
             raise ValueError("Unknown grounding method")
         row = self._base("video_grounding", video_id, method, methods[method].get("model"), repetition)
-        row.update(groundingFacts=[], omission=None, hallucination=None)
+        row.update(groundingFacts=[], omission=None, hallucination=None,
+                   contentTextApprovalStatus=None)
         if method == "authorized_transcript" and not authorized_transcript:
             row["errorCategory"] = "authorized_transcript_unavailable"
             return self._save(row), None
         started = time.monotonic()
         raw = None
         normalized = None
+        response = None
         try:
             if method == "authorized_transcript":
                 # The caller must supply text whose use rights have been checked. No AI call.
@@ -263,9 +484,10 @@ class PilotRunner:
                         "timestampAccurate": None, "reviewNote": None,
                     })
                 self._success(row, provider, response, elapsed)
+            row["contentTextSha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
             return self._save(row, raw, normalized), content
         except ProviderFailure as exc:
-            self._failure(row, provider, exc, started)
+            self._failure(row, provider, exc, started, response)
             return self._save(row, raw, normalized), None
 
     def run_grounding(self, video_id, method, repetition, provider, authorized_transcript=None):
@@ -342,14 +564,16 @@ class PilotRunner:
         if model not in models or not isinstance(content_text, str) or not content_text.strip():
             raise ValueError("Configured quiz model and nonempty fixed contentText are required")
         content_hash = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
-        if source_grounding_run_id is None:
-            self._require_fixed_content(video_id, content_hash)
-        row = self._base("quiz_generation", video_id, "fixed_content_text", model, repetition)
+        self._require_approved_content(video_id, content_text, source_grounding_run_id)
+        self._require_fixed_content(video_id, content_hash)
+        row = self._base("quiz_generation", video_id, "fixed_content_text", model, repetition,
+                         content_hash)
         row.update(contentTextSha256=content_hash,
                    sourceGroundingRunId=source_grounding_run_id, parseStatus="not_run",
                    validatorStatus="not_run", beCompatibility="not_run", questionCount=None,
                    evidenceTextContained=None, questionReviews=[])
         started = time.monotonic()
+        response = None
         try:
             response, elapsed = self._call(provider, "quiz", contentText=content_text,
                                            model=model, promptVersion=row["promptVersion"],
@@ -362,7 +586,7 @@ class PilotRunner:
             row["beCompatibility"] = "pass" if row["validatorStatus"] == "pass" else "fail"
             return self._save(row, raw, normalized)
         except ProviderFailure as exc:
-            self._failure(row, provider, exc, started)
+            self._failure(row, provider, exc, started, response)
             return self._save(row)
 
     def run_end_to_end(self, video_id, method, repetition, provider, authorized_transcript=None):
@@ -371,6 +595,8 @@ class PilotRunner:
         if method not in methods:
             raise ValueError("Unknown end-to-end method")
         setting = methods[method]
+        if method != "gemini_direct_quiz":
+            raise ValueError("Two-stage end-to-end Quiz requires separate human approval")
         row = self._base("end_to_end", video_id, method, setting["quiz_model"], repetition)
         row.update(groundingRunId=None, quizRunId=None, beCompatibility="not_run",
                    questionReviews=[], totalLatencyMs=None, totalEstimatedCostUsd=None,
@@ -380,6 +606,7 @@ class PilotRunner:
             row.update(parseStatus="not_run", validatorStatus="not_run", questionCount=None,
                        evidenceTextContained=None)
             started = time.monotonic()
+            response = None
             try:
                 response, elapsed = self._call(provider, "direct", video=self.videos[video_id],
                                                model=row["model"], promptVersion=row["promptVersion"],
@@ -395,7 +622,7 @@ class PilotRunner:
                 row["totalEstimatedCostUsd"] = row["estimatedCostUsd"]
                 return self._save(row, raw, normalized)
             except ProviderFailure as exc:
-                self._failure(row, provider, exc, started)
+                self._failure(row, provider, exc, started, response)
                 return self._save(row)
         grounding, content = self._run_grounding(video_id, setting["grounding"], repetition,
                                                  provider, authorized_transcript)
@@ -450,6 +677,7 @@ def main():
         parser.add_argument(f"--{provider_name}-output-price-per-million", type=float)
         parser.add_argument(f"--{provider_name}-pricing-reference")
     parser.add_argument("--content-file", type=Path)
+    parser.add_argument("--source-grounding-run-id")
     parser.add_argument("--authorized-transcript-file", type=Path)
     parser.add_argument("--results-dir", type=Path, default=Path("results"))
     args = parser.parse_args()
@@ -515,10 +743,11 @@ def main():
             parser.error("--method is required for grounding")
         row = runner.run_grounding(args.video_id, args.method, args.repetition, provider, transcript)
     elif args.mode == "quiz":
-        if not args.model or not args.content_file:
-            parser.error("--model and --content-file are required for quiz")
+        if not args.model or not args.content_file or not args.source_grounding_run_id:
+            parser.error("--model, --content-file and --source-grounding-run-id are required for quiz")
         row = runner.run_quiz(args.video_id, args.model, args.repetition,
-                              args.content_file.read_text(encoding="utf-8"), provider)
+                              args.content_file.read_text(encoding="utf-8"), provider,
+                              source_grounding_run_id=args.source_grounding_run_id)
     else:
         if not args.method:
             parser.error("--method is required for end-to-end")

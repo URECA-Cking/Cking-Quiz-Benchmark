@@ -1,3 +1,3 @@
 # 방식·모델 선택 기록
 
-Pilot은 아직 실행되지 않았고 선택된 방식·모델도 없습니다. 결과가 생기면 Video Grounding, 고정 입력 Quiz Generation, End-to-End 결과를 구분해 기록합니다. 각 선택에는 사용 데이터와 권리 확인, 실행 날짜, 모델 ID, 프롬프트 버전, 가격 출처, 자동 지표, 실제 영상과 승인된 ground truth를 대조한 사람 검수 근거, 제한사항 및 Cking-BE 적용 결정을 남깁니다. 직접 Quiz의 BE 호환성은 `not_applicable`입니다.
+첫 Pilot 영상 `nasa-water-cycle-2019`에서는 Grounding attempt 1~4 실패 후 attempt 5가 성공했고 `contentText`가 사람에게 승인됐습니다. 동일 승인 Grounding·`contentText`를 공유한 Gemini Quiz A와 OpenAI Quiz B의 실행 및 사람 평가도 완료돼 offline 집계가 가능합니다. Gemini Direct Quiz는 이 영상의 현재 조건에서 technical attempt 1~3이 완료되지 않았으며, 세 번째는 HTTP 503 / `service_unavailable`로 기록됐습니다. 다른 영상의 Pilot과 최종 방식·모델 선정은 완료되지 않았습니다. 결과를 선택 근거로 사용할 때 Video Grounding, 고정 입력 Quiz Generation, End-to-End 결과를 구분해 기록합니다. 각 선택에는 사용 데이터와 권리 확인, 실행 날짜, 모델 ID, 프롬프트 버전, 가격 출처, 자동 지표, 실제 영상과 승인된 ground truth를 대조한 사람 검수 근거, 제한사항 및 Cking-BE 적용 결정을 남깁니다. 직접 Quiz의 `beCompatibility`는 `not_applicable`입니다.

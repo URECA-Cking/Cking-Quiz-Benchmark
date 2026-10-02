@@ -12,13 +12,13 @@ AI 퀴즈의 영상 근거 확보 방식과 생성 모델을 **별도로** 비�
 
 기존 A/B/C와의 관계: **A**는 Gemini Grounding 후 Quiz 생성의 두 조합, **B**는 Gemini 직접 Quiz, **C**는 권한 있는 transcript 기반 두 조합입니다. 새로운 Quiz Generation Benchmark는 A/C의 한 실행을 그대로 비교하지 않고 **동일한 고정 입력**으로 생성 모델의 차이만 측정합니다.
 
-현재는 평가 계약과 영상 후보, 사람 검수를 마친 ground truth, **fixture 및 명시적 live 단일 조건 실행기**가 있습니다. fixture 결과는 API 미실행(`apiStatus=not_run`)으로 기록하며 실제 latency·token·cost 성능 결과로 사용하지 않습니다. Gemini·OpenAI Provider Adapter는 mock 기반으로 구현됐으며 실제 Pilot 호출, 원본 영상 파일, transcript 전문 및 성능 결과는 없습니다. Pilot을 검증한 뒤에만 영상 12~18개와 추가 모델로 확대합니다.
+현재는 평가 계약과 영상 후보, 사람 검수를 마친 ground truth, **fixture 및 명시적 live 단일 조건 실행기**가 있습니다. fixture 결과는 API 미실행(`apiStatus=not_run`)으로 기록하며 실제 latency·token·cost 성능 결과로 사용하지 않습니다. 첫 Pilot 영상 `nasa-water-cycle-2019`에서는 Grounding attempt 1~4 실패 후 attempt 5가 성공했고, 해당 `contentText`의 사람 승인과 동일 승인 입력을 공유한 Gemini Quiz A·OpenAI Quiz B의 실행 및 사람 평가를 마쳤습니다. A/B의 offline 집계가 가능하지만 Pilot 전체가 완료된 것은 아닙니다. Gemini Direct Quiz는 이 영상의 현재 조건에서 technical attempt 1~3이 완료되지 않았으며, 세 번째는 HTTP 503 / `service_unavailable`로 기록됐습니다. 원본 영상 파일과 transcript 전문은 저장하지 않습니다. Pilot을 검증한 뒤에만 영상 12~18개와 추가 모델로 확대합니다.
 
 ## 평가 원칙
 
-Grounding 결과와 Quiz 결과는 별도로 저장하고 실행 ID로 연결합니다. 모델이 제시한 사실·시점·근거 문구는 실제 영상 및 사람 검수 ground truth와 대조합니다. timestamp가 있다는 이유만으로 정확하다고 판정하지 않습니다. API 성공, JSON 파싱, `Cking-BE` 계약 검사와 영상 기반 사실성 판단을 구분합니다. 세부 기준은 [평가 기준](docs/rubric.md)을 따릅니다.
+Grounding 결과와 Quiz 결과는 별도로 저장하고 실행 ID로 연결합니다. 모델이 제시한 사실·시점·근거 문구는 실제 영상 및 사람 검수 ground truth와 대조합니다. timestamp가 있다는 이유만으로 정확하다고 판정하지 않습니다. API 성공, JSON 파싱, Benchmark 내부 Quiz 형식/계약 검사와 영상 기반 사실성 판단을 구분합니다. 세부 기준은 [평가 기준](docs/rubric.md)을 따릅니다.
 
-`Cking-BE`의 현재 입력 계약은 `QuizGenerationInput(contentText)`이며 `sourceEvidence`가 해당 `contentText`에 포함되어야 합니다. `contentText`가 있는 A/C와 고정 입력 Quiz Benchmark에는 BE 호환 여부를 기록합니다. B는 원문 `contentText`가 없으므로 `beCompatibility`를 항상 `not_applicable`로 기록합니다. 문자열 포함 검사는 해당 문장이 **실제 영상에 존재하거나 정답을 뒷받침함**을 증명하지 않습니다.
+`Cking-BE`의 입력 계약을 참고해 고정 `contentText` Quiz의 `sourceEvidence`가 입력 텍스트에 포함되는지 Benchmark 내부에서 검사합니다. 기존 필드명 `beCompatibility=pass`는 이 로컬 형식/계약 검사 통과만 뜻하며, 실제 Cking-BE validator·production DTO/domain validation 또는 서비스 integration test 통과를 뜻하지 않습니다. Gemini 직접 Quiz는 비교할 고정 `contentText`가 없어 `beCompatibility=not_applicable`입니다. 이 값도 품질이나 정답 정확성의 통과를 뜻하지 않습니다. 문자열 포함 검사는 해당 문장이 **실제 영상에 존재하거나 정답을 의미적으로 뒷받침함**을 증명하지 않습니다.
 
 현재 [ground truth 후보](data/ground_truth_candidates.jsonl) 12개는 영상별 3개이며 모두 `approved`입니다. 사용자가 YouTube 영상의 자막·내용을 확인해 후보 사실과 일치한다고 판정했습니다. 이는 timestamp의 프레임 단위 정확성이나 원본 transcript 전문을 검증했다는 뜻은 아닙니다. 새 후보는 `pending_human`으로 등록하고 사람이 검수한 뒤에만 승인합니다.
 
