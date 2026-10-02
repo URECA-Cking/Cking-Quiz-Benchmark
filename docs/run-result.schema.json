@@ -4,6 +4,7 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["benchmarkType", "runId", "videoId", "method", "model", "promptVersion", "repetition", "startedAt", "apiStatus"],
+  "dependentRequired": {"approvedBy": ["approvedAt"], "approvedAt": ["approvedBy"]},
   "properties": {
     "benchmarkType": {"enum": ["video_grounding", "quiz_generation", "end_to_end"]},
     "runId": {"type": "string", "minLength": 1},
@@ -29,6 +30,8 @@
     "hallucination": {"$ref": "#/$defs/nullableReview"},
     "contentTextSha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "contentTextApprovalStatus": {"enum": ["approved", null]},
+    "approvedBy": {"type": "string", "minLength": 1, "maxLength": 100},
+    "approvedAt": {"type": "string", "format": "date-time"},
     "sourceGroundingRunId": {"type": ["string", "null"]},
     "parseStatus": {"enum": ["pass", "fail", "not_run"]},
     "validatorStatus": {"enum": ["pass", "fail", "not_run"]},

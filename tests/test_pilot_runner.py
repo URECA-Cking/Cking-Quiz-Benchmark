@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier
 from unittest import mock
@@ -16,6 +17,7 @@ from src.pilot_runner import FixtureProvider, PilotRunner
 ROOT = Path(__file__).resolve().parents[1]
 VIDEO = "nasa-water-cycle-2019"
 CONTENT = "NASA measures global rain and snow every 30 minutes."
+APPROVER = "pilot-reviewer"
 QUIZ = {
     "promptVersion": "pilot-v1",
     "questions": [
@@ -138,7 +140,7 @@ class PilotRunnerTest(unittest.TestCase):
         before = self.rows("video-grounding.jsonl")[0]
         evaluation_file = self.results / "evaluation" / (source_id + ".json")
         evaluation_before = evaluation_file.read_bytes()
-        self.runner.approve_content(source_id)
+        self.runner.approve_content(source_id, APPROVER)
         after = self.rows("video-grounding.jsonl")[0]
         self.assertEqual(after["contentTextApprovalStatus"], "approved")
         self.assertEqual(after["contentTextSha256"], hashlib.sha256(CONTENT.encode()).hexdigest())
@@ -153,8 +155,178 @@ class PilotRunnerTest(unittest.TestCase):
         result_file = self.results / "video-grounding.jsonl"
         before = result_file.read_bytes()
         with self.assertRaisesRegex(ValueError, "hash does not match"):
-            self.runner.approve_content(source_id)
+            self.runner.approve_content(source_id, APPROVER)
         self.assertEqual(result_file.read_bytes(), before)
+
+    def update_grounding(self, run_id, remove=(), **fields):
+        result_file = self.results / "video-grounding.jsonl"
+        rows = self.rows("video-grounding.jsonl")
+        for row in rows:
+            if row["runId"] == run_id:
+                for key in remove:
+                    row.pop(key, None)
+                row.update(fields)
+        result_file.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    def test_approval_records_trimmed_approver_and_utc_time(self):
+        source_id = self.approved_source(approval=None)
+        before = self.rows("video-grounding.jsonl")[0]
+        started = datetime.now(timezone.utc)
+        returned = self.runner.approve_content(source_id, "  Reviewer Kim  ")
+        after = self.rows("video-grounding.jsonl")[0]
+        self.assertEqual(returned, after)
+        self.assertEqual(after["approvedBy"], "Reviewer Kim")
+        approved_at = datetime.fromisoformat(after["approvedAt"])
+        self.assertEqual(approved_at.utcoffset(), timedelta(0))
+        self.assertTrue(started <= approved_at <= datetime.now(timezone.utc))
+        self.assertEqual(after["approvedAt"][-6:], before["startedAt"][-6:])
+        self.assertIsNotNone(PilotRunner.APPROVED_AT_PATTERN.fullmatch(after["approvedAt"]))
+        for key in before:
+            if key != "contentTextApprovalStatus":
+                self.assertEqual(after[key], before[key])
+        provider = FixtureProvider({"quiz": {"raw": QUIZ}})
+        self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                             source_grounding_run_id=source_id)
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_approved_by_length_allows_100_code_points_after_strip(self):
+        source_id = self.approved_source(approval=None)
+        self.runner.approve_content(source_id, "  " + "가" * 100 + "  ")
+        self.assertEqual(self.rows("video-grounding.jsonl")[0]["approvedBy"], "가" * 100)
+
+    def test_invalid_approved_by_is_rejected_without_rewriting_result(self):
+        source_id = self.approved_source(approval=None)
+        result_file = self.results / "video-grounding.jsonl"
+        before = result_file.read_bytes()
+        for value in (None, 123, b"reviewer", "", "   ", "a\nb", "reviewer\n", "\treviewer",
+                      "a\x00b", "a b", "a b", "a​b", "a‮b", "﻿reviewer",
+                      "a\ud800b",
+                      "x" * 101, "  " + "x" * 101 + "  "):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "approved_by"):
+                    self.runner.approve_content(source_id, value)
+                self.assertEqual(result_file.read_bytes(), before)
+
+    def test_reapproval_of_tracked_row_is_quiet_noop(self):
+        source_id = self.approved_source(approval=None)
+        self.runner.approve_content(source_id, "first reviewer")
+        result_file = self.results / "video-grounding.jsonl"
+        before = result_file.read_bytes()
+        self.runner.approve_content(source_id, "second reviewer")
+        self.assertEqual(result_file.read_bytes(), before)
+        self.assertEqual(self.rows("video-grounding.jsonl")[0]["approvedBy"], "first reviewer")
+
+    def test_reapproval_rejects_invalid_approved_by_without_changing_tracking(self):
+        source_id = self.approved_source(approval=None)
+        self.runner.approve_content(source_id, "first reviewer")
+        tracked = self.rows("video-grounding.jsonl")[0]
+        result_file = self.results / "video-grounding.jsonl"
+        before = result_file.read_bytes()
+        for value in ("", "bad\nreviewer"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "approved_by"):
+                    self.runner.approve_content(source_id, value)
+                self.assertEqual(result_file.read_bytes(), before)
+        after = self.rows("video-grounding.jsonl")[0]
+        self.assertEqual((after["approvedBy"], after["approvedAt"]),
+                         (tracked["approvedBy"], tracked["approvedAt"]))
+
+    def test_reapproval_of_approved_row_still_checks_evaluation_hash(self):
+        tracking = {"approvedBy": APPROVER, "approvedAt": datetime.now(timezone.utc).isoformat()}
+        for fields in ({}, tracking):
+            with self.subTest(tracked=bool(fields)):
+                source_id = self.approved_source(evaluation_content=CONTENT + " changed")
+                self.update_grounding(source_id, **fields)
+                result_file = self.results / "video-grounding.jsonl"
+                before = result_file.read_bytes()
+                with self.assertRaisesRegex(ValueError, "hash does not match"):
+                    self.runner.approve_content(source_id, APPROVER)
+                self.assertEqual(result_file.read_bytes(), before)
+                shutil.rmtree(self.results)
+
+    def test_approved_at_accepts_only_canonical_utc_isoformat(self):
+        cases = (("2026-10-02T05:00:00+00:00", True), ("2026-10-02T05:00:00.123456+00:00", True),
+                 ("2026-10-02T05:00:00Z", False), ("2026-10-02 05:00:00+00:00", False),
+                 ("2026-10-02T05:00+00:00", False), ("2026-10-02T05:00:00-00:00", False),
+                 ("20261002T050000+0000", False), ("2026-10-02T05:00:00.123+00:00", False),
+                 ("2026-02-30T05:00:00+00:00", False), ("2026-10-02T24:00:00+00:00", False),
+                 ("٢٠٢٦-10-02T05:00:00+00:00", False))
+        for approved_at, valid in cases:
+            with self.subTest(approved_at=approved_at):
+                source_id = self.approved_source()
+                self.update_grounding(source_id, approvedBy=APPROVER, approvedAt=approved_at)
+                result_file = self.results / "video-grounding.jsonl"
+                before = result_file.read_bytes()
+                provider = FixtureProvider({"quiz": {"raw": QUIZ}})
+                if valid:
+                    self.runner.approve_content(source_id, APPROVER)
+                    self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                                         source_grounding_run_id=source_id)
+                    self.assertEqual(len(provider.calls), 1)
+                else:
+                    with self.assertRaisesRegex(ValueError, "approval tracking"):
+                        self.runner.approve_content(source_id, APPROVER)
+                    with self.assertRaisesRegex(ValueError, "approval tracking"):
+                        self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                                             source_grounding_run_id=source_id)
+                    self.assertEqual(provider.calls, [])
+                self.assertEqual(result_file.read_bytes(), before)
+                shutil.rmtree(self.results)
+
+    def test_reapproval_of_legacy_approved_row_is_noop_without_backfill(self):
+        source_id = self.approved_source()
+        result_file = self.results / "video-grounding.jsonl"
+        before = result_file.read_bytes()
+        self.runner.approve_content(source_id, APPROVER)
+        self.assertEqual(result_file.read_bytes(), before)
+        row = self.rows("video-grounding.jsonl")[0]
+        self.assertNotIn("approvedBy", row)
+        self.assertNotIn("approvedAt", row)
+        provider = FixtureProvider({"quiz": {"raw": QUIZ}})
+        self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                             source_grounding_run_id=source_id)
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_invalid_approval_tracking_fails_closed_for_approval_and_quiz(self):
+        valid_at = datetime.now(timezone.utc).isoformat()
+        cases = (
+            ({"approvedBy": APPROVER}, ()),
+            ({"approvedAt": valid_at}, ()),
+            ({"approvedBy": APPROVER, "approvedAt": valid_at, "contentTextApprovalStatus": None}, ()),
+            ({"approvedBy": APPROVER, "approvedAt": valid_at}, ("contentTextApprovalStatus",)),
+        ) + tuple(({"approvedBy": value, "approvedAt": valid_at}, ())
+                  for value in (None, 123, "", " padded ", "a\nb", "a​b", "a\ud800b",
+                                "x" * 101)) \
+          + tuple(({"approvedBy": APPROVER, "approvedAt": value}, ())
+                  for value in (None, 123, "not-a-date", "2026-10-02T05:00:00",
+                                "2026-10-02T14:00:00+09:00"))
+        for fields, remove in cases:
+            with self.subTest(fields=fields, remove=remove):
+                source_id = self.approved_source()
+                self.update_grounding(source_id, remove=remove, **fields)
+                result_file = self.results / "video-grounding.jsonl"
+                before = result_file.read_bytes()
+                with self.assertRaisesRegex(ValueError, "approv"):
+                    self.runner.approve_content(source_id, APPROVER)
+                self.assertEqual(result_file.read_bytes(), before)
+                provider = FixtureProvider({"quiz": {"raw": QUIZ}})
+                with self.assertRaisesRegex(ValueError, "approv"):
+                    self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                                         source_grounding_run_id=source_id)
+                self.assertEqual(provider.calls, [])
+                shutil.rmtree(self.results)
+
+    def test_approval_is_independent_of_human_evaluation(self):
+        for omission, hallucination in ((None, None), ("fail", "fail"), ("uncertain", None)):
+            with self.subTest(omission=omission, hallucination=hallucination):
+                source_id = self.approved_source(approval=None)
+                self.update_grounding(source_id, omission=omission, hallucination=hallucination)
+                self.runner.approve_content(source_id, APPROVER)
+                row = [row for row in self.rows("video-grounding.jsonl")
+                       if row["runId"] == source_id][0]
+                self.assertEqual((row["contentTextApprovalStatus"], row["approvedBy"],
+                                  row["omission"], row["hallucination"]),
+                                 ("approved", APPROVER, omission, hallucination))
 
     def test_two_stage_e2e_does_not_call_grounding_or_quiz(self):
         provider = FixtureProvider({"grounding": {"raw": GROUNDING}, "quiz": {"raw": QUIZ}})
@@ -333,11 +505,13 @@ class PilotRunnerTest(unittest.TestCase):
                                              "normalized": GROUNDING, "responseBody": FIXTURE_RAW}}))
         self.assertEqual(grounding["apiStatus"], "success")
         self.assertFalse((self.results / "video-grounding.jsonl").exists())
-        custom.approve_content(grounding["runId"])
+        custom.approve_content(grounding["runId"], APPROVER)
         saved = [json.loads(line) for line in
                  (custom.results / "video-grounding.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertEqual(saved[0]["contentTextApprovalStatus"], "approved")
         self.assertEqual(saved[0]["contentTextSha256"], hashlib.sha256(CONTENT.encode()).hexdigest())
+        self.assertEqual(saved[0]["approvedBy"], APPROVER)
+        self.assertIn("approvedAt", saved[0])
         provider = SimulatedApiFixture({"quiz": {"normalized": QUIZ, "responseBody": FIXTURE_RAW}})
         row = custom.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
                               source_grounding_run_id=grounding["runId"])
@@ -359,16 +533,16 @@ class PilotRunnerTest(unittest.TestCase):
             custom.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
                             source_grounding_run_id=default_source)
         with self.assertRaisesRegex(ValueError, "human approval"):
-            custom.approve_content(default_source)
+            custom.approve_content(default_source, APPROVER)
         self.assertEqual(snapshot(self.results), default_before)
 
         grounding = custom.run_grounding(VIDEO, "gemini_video", 1,
                                          SimulatedApiFixture({"grounding": {
                                              "normalized": GROUNDING, "responseBody": FIXTURE_RAW}}))
-        custom.approve_content(grounding["runId"])
+        custom.approve_content(grounding["runId"], APPROVER)
         custom_before = snapshot(custom.results)
         with self.assertRaisesRegex(ValueError, "human approval"):
-            self.runner.approve_content(grounding["runId"])
+            self.runner.approve_content(grounding["runId"], APPROVER)
         with self.assertRaisesRegex(ValueError, "approved"):
             self.runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
                                  source_grounding_run_id=grounding["runId"])
@@ -511,14 +685,26 @@ class PilotRunnerTest(unittest.TestCase):
         self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)
         self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
         self.runner.run_end_to_end(VIDEO, "gemini_direct_quiz", 1, provider)
+        self.runner.approve_content(self.approved_source(approval=None), APPROVER)
         schema = json.loads((ROOT / "docs" / "run-result.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["contentTextApprovalStatus"]["enum"],
                          ["approved", None])
         self.assertEqual(schema["oneOf"][0]["then"]["required"], ["contentTextSha256"])
+        self.assertEqual(schema["properties"]["approvedBy"],
+                         {"type": "string", "minLength": 1,
+                          "maxLength": PilotRunner.APPROVED_BY_MAX_LENGTH})
+        self.assertEqual(schema["properties"]["approvedAt"], {"type": "string", "format": "date-time"})
+        self.assertEqual(schema["dependentRequired"],
+                         {"approvedBy": ["approvedAt"], "approvedAt": ["approvedBy"]})
+        grounding_rows = self.rows("video-grounding.jsonl")
+        self.assertTrue(any("approvedBy" in row for row in grounding_rows))
+        self.assertTrue(any(row.get("contentTextApprovalStatus") == "approved"
+                            and "approvedBy" not in row for row in grounding_rows))
         for filename in ("video-grounding.jsonl", "quiz-generation.jsonl", "end-to-end.jsonl"):
             for row in self.rows(filename):
                 self.assertTrue(set(schema["required"]).issubset(row))
                 self.assertTrue(set(row).issubset(schema["properties"]))
+                self.assertEqual("approvedBy" in row, "approvedAt" in row)
                 self.assertIn(row["benchmarkType"], schema["properties"]["benchmarkType"]["enum"])
                 self.assertIn(row["apiStatus"], schema["properties"]["apiStatus"]["enum"])
 
