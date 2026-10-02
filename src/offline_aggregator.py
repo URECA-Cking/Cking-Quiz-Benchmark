@@ -14,7 +14,7 @@ _SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 _RUN_ID = re.compile(r"[A-Za-z0-9_-]+\Z")
 _USAGE_FIELDS = ("inputTokens", "outputTokens", "thinkingTokens")
 _HISTORY_FIELDS = ("runId", "attempt", "apiStatus", "errorCategory", "httpStatus",
-                   "providerErrorCode")
+                   "providerErrorCode", "retryStopReason")
 
 
 def _rows(path):

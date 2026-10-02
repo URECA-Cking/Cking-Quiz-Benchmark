@@ -185,7 +185,10 @@ class ProviderRouter:
                 self.policy.authorize(kind, self.calls, self.reserved_cost, provider)
             except ProviderFailure:
                 if last_http_failure is not None:
-                    raise last_http_failure
+                    # Keep the last observed Provider failure and record why no retry was sent.
+                    raise ProviderFailure(last_http_failure.category, last_http_failure.http_status,
+                                          last_http_failure.provider_error_code,
+                                          retry_stop_reason="live_guard")
                 raise
             self.calls += 1
             self.reserved_cost += estimate

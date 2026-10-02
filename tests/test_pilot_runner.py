@@ -495,6 +495,32 @@ class PilotRunnerTest(unittest.TestCase):
         self.assertIsNone(row["quizRunId"])
         self.assertIsNone(row["questionReviews"][0]["answerAccuracy"])
 
+    def test_fixture_rows_always_record_null_retry_stop_reason(self):
+        success = FixtureProvider({"grounding": {"raw": GROUNDING}, "quiz": {"raw": QUIZ},
+                                   "direct": {"raw": QUIZ}})
+        failing = FixtureProvider({"grounding": {"errorCategory": "rate_limit"},
+                                   "direct": {"errorCategory": "server_error"}})
+        rows = [self.runner.run_grounding(VIDEO, "gemini_video", 1, success),
+                self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, success),
+                self.runner.run_end_to_end(VIDEO, "gemini_direct_quiz", 1, success),
+                self.runner.run_grounding(VIDEO, "gemini_video", 2, failing),
+                self.runner.run_end_to_end(VIDEO, "gemini_direct_quiz", 2, failing)]
+        for row in rows:
+            with self.subTest(benchmarkType=row["benchmarkType"], apiStatus=row["apiStatus"]):
+                self.assertIn("retryStopReason", row)
+                self.assertIsNone(row["retryStopReason"])
+
+    def test_retry_stop_reason_schema_allows_only_null_or_live_guard(self):
+        schema = json.loads((ROOT / "docs" / "run-result.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["retryStopReason"], {"enum": ["live_guard", None]})
+        self.assertNotIn("retryStopReason", schema["required"])
+        self.runner.run_grounding(VIDEO, "gemini_video", 1,
+                                  FixtureProvider({"grounding": {"raw": GROUNDING}}))
+        for row in self.rows("video-grounding.jsonl"):
+            self.assertIn(row["retryStopReason"], schema["properties"]["retryStopReason"]["enum"])
+            legacy = {key: value for key, value in row.items() if key != "retryStopReason"}
+            self.assertTrue(set(schema["required"]).issubset(legacy))
+
     def test_failed_call_and_blocked_two_stage_e2e_are_not_falsely_successful(self):
         provider = FixtureProvider({"grounding": {"errorCategory": "rate_limit"}})
         failed = self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)
