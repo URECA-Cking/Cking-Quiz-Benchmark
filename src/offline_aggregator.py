@@ -9,6 +9,8 @@ import math
 import re
 from pathlib import Path
 
+from src.approval_tracking import require_valid_approval_tracking
+
 
 _SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 _RUN_ID = re.compile(r"[A-Za-z0-9_-]+\Z")
@@ -88,6 +90,7 @@ def aggregate_pipeline(results_dir, grounding_run_id, quiz_run_id):
         raise ValueError("Grounding and Quiz identity mismatch")
     if grounding.get("contentTextApprovalStatus") != "approved":
         raise ValueError("Grounding contentText is not human approved")
+    require_valid_approval_tracking(grounding)
     approved_hash = grounding.get("contentTextSha256")
     if (not isinstance(approved_hash, str) or _SHA256.fullmatch(approved_hash) is None
             or quiz.get("contentTextSha256") != approved_hash):

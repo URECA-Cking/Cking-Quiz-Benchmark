@@ -5,16 +5,15 @@ import hashlib
 import json
 import math
 import os
-import re
 import tempfile
 import time
-import unicodedata
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 
+from src.approval_tracking import normalize_approved_by, require_valid_approval_tracking
 from src.provider_failure import ProviderFailure
 
 
@@ -38,14 +37,6 @@ class FixtureProvider:
 
 
 class PilotRunner:
-    APPROVED_BY_MAX_LENGTH = 100
-    # Control, line/paragraph separator, format (zero-width, bidi) and lone surrogate
-    # characters. Categories follow the running Python's Unicode database.
-    APPROVED_BY_FORBIDDEN_CATEGORIES = frozenset({"Cc", "Zl", "Zp", "Cf", "Cs"})
-    # Canonical datetime.now(timezone.utc).isoformat() output; checked before fromisoformat()
-    # so validity does not depend on the Python version's accepted ISO 8601 variants.
-    APPROVED_AT_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{6})?\+00:00",
-                                     re.ASCII)
     FILES = {
         "video_grounding": "video-grounding.jsonl",
         "quiz_generation": "quiz-generation.jsonl",
@@ -375,7 +366,7 @@ class PilotRunner:
                 or len(approved_hash) != 64
                 or any(char not in "0123456789abcdef" for char in approved_hash)):
             raise ValueError("An approved Grounding result is required")
-        self._check_approval_tracking(source)
+        require_valid_approval_tracking(source)
         evaluation = json.loads(evaluation_file.read_text(encoding="utf-8"))
         original = evaluation.get("contentText") if isinstance(evaluation, dict) else None
         if (not isinstance(original, str) or not original.strip()
@@ -383,45 +374,13 @@ class PilotRunner:
                 or hashlib.sha256(content_text.encode("utf-8")).hexdigest() != approved_hash):
             raise ValueError("Quiz contentText must match approved Grounding contentText")
 
-    @classmethod
-    def _normalize_approved_by(cls, approved_by):
-        if (not isinstance(approved_by, str)
-                or any(unicodedata.category(char) in cls.APPROVED_BY_FORBIDDEN_CATEGORIES
-                       for char in approved_by)):
-            raise ValueError("A valid approved_by is required for human approval")
-        normalized = approved_by.strip()
-        if not normalized or len(normalized) > cls.APPROVED_BY_MAX_LENGTH:
-            raise ValueError("A valid approved_by is required for human approval")
-        return normalized
-
-    @classmethod
-    def _check_approval_tracking(cls, row):
-        """Return True for tracked approval, False for legacy rows without tracking."""
-        has_by, has_at = "approvedBy" in row, "approvedAt" in row
-        if not has_by and not has_at:
-            return False
-        if has_by != has_at or row.get("contentTextApprovalStatus") != "approved":
-            raise ValueError("Grounding approval tracking is invalid")
-        approved_by, approved_at = row["approvedBy"], row["approvedAt"]
-        try:
-            valid_by = cls._normalize_approved_by(approved_by) == approved_by
-            parsed_at = (datetime.fromisoformat(approved_at)
-                         if isinstance(approved_at, str)
-                         and cls.APPROVED_AT_PATTERN.fullmatch(approved_at) else None)
-        except ValueError:
-            valid_by, parsed_at = False, None
-        if (not valid_by or parsed_at is None
-                or parsed_at.utcoffset() != timedelta(0)):
-            raise ValueError("Grounding approval tracking is invalid")
-        return True
-
     def approve_content(self, source_grounding_run_id, approved_by):
         """Explicit human-review action; never called by a benchmark run."""
         if (not isinstance(source_grounding_run_id, str)
                 or len(source_grounding_run_id) != 32
                 or any(char not in "0123456789abcdef" for char in source_grounding_run_id)):
             raise ValueError("A Grounding runId is required for human approval")
-        approved_by = self._normalize_approved_by(approved_by)
+        approved_by = normalize_approved_by(approved_by)
         self._check_storage_integrity()
         result_file = self.results / self.FILES["video_grounding"]
         evaluation_file = (self.results / "evaluation"
@@ -446,7 +405,7 @@ class PilotRunner:
             raise ValueError("Grounding contentText hash does not match evaluation")
         if row.get("contentTextApprovalStatus") not in (None, "approved"):
             raise ValueError("Invalid Grounding human approval status")
-        self._check_approval_tracking(row)
+        require_valid_approval_tracking(row)
         if row.get("contentTextApprovalStatus") == "approved":
             # Tracked and legacy approvals are kept as recorded; never backfill or rewrite.
             return row

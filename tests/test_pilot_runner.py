@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import Barrier
 from unittest import mock
 
+from src import approval_tracking
 from src.pilot_runner import FixtureProvider, PilotRunner
 
 
@@ -180,7 +181,7 @@ class PilotRunnerTest(unittest.TestCase):
         self.assertEqual(approved_at.utcoffset(), timedelta(0))
         self.assertTrue(started <= approved_at <= datetime.now(timezone.utc))
         self.assertEqual(after["approvedAt"][-6:], before["startedAt"][-6:])
-        self.assertIsNotNone(PilotRunner.APPROVED_AT_PATTERN.fullmatch(after["approvedAt"]))
+        self.assertIsNotNone(approval_tracking.APPROVED_AT_PATTERN.fullmatch(after["approvedAt"]))
         for key in before:
             if key != "contentTextApprovalStatus":
                 self.assertEqual(after[key], before[key])
@@ -692,8 +693,9 @@ class PilotRunnerTest(unittest.TestCase):
         self.assertEqual(schema["oneOf"][0]["then"]["required"], ["contentTextSha256"])
         self.assertEqual(schema["properties"]["approvedBy"],
                          {"type": "string", "minLength": 1,
-                          "maxLength": PilotRunner.APPROVED_BY_MAX_LENGTH})
-        self.assertEqual(schema["properties"]["approvedAt"], {"type": "string", "format": "date-time"})
+                          "maxLength": approval_tracking.APPROVED_BY_MAX_LENGTH})
+        self.assertEqual({key: value for key, value in schema["properties"]["approvedAt"].items()
+                          if key != "pattern"}, {"type": "string", "format": "date-time"})
         self.assertEqual(schema["dependentRequired"],
                          {"approvedBy": ["approvedAt"], "approvedAt": ["approvedBy"]})
         grounding_rows = self.rows("video-grounding.jsonl")
