@@ -14,6 +14,6 @@ Quiz 결과의 `promptVersion`이 누락되거나 설정된 Pilot 버전과 다�
 
 Quiz Generation의 독립 비교는 영상·Pilot prompt 버전당 첫 승인된 고정 `contentText`의 SHA-256을 로컬 `data/restricted/fixed-content/`에 기록합니다. 이후 실행은 결과 디렉터리와 무관하게 이 해시와 비교하고 다르면 Provider 호출 전에 거부합니다. 이 파일은 Git-ignore 대상이며 새로운 환경에서는 동일 입력을 다시 준비해야 합니다. `sourceGroundingRunId`와 `contentTextSha256`을 Quiz 결과에 함께 기록합니다. fixture 및 로컬 transcript 경로는 `apiStatus=not_run`이며 API latency·token·cost를 모두 `null`로 둡니다. 실제 API 실패만 `apiStatus=error`로 기록합니다. 사람 품질 판정은 실행 직후 `null`이며 명시적인 사람 검수 후에만 갱신합니다.
 
-`PilotRunner.approve_content(runId)`는 별도 사람 승인 지시가 있을 때만 호출하는 명시적 기록 경계입니다. 성공한 Grounding 행과 원본 evaluation 텍스트를 대조한 후 해당 행의 승인 필드만 갱신하며, Grounding 또는 Quiz 실행 중에는 자동 호출되지 않습니다. 첫 Pilot 영상의 Grounding attempt=5에는 사람 검수 후 이 승인을 기록했으며, Quiz A/B는 같은 승인 Grounding과 `contentTextSha256`을 참조합니다.
+`PilotRunner.approve_content(runId, approved_by)`는 별도 사람 승인 지시가 있을 때만 호출하는 명시적 기록 경계입니다. 성공한 Grounding 행과 원본 evaluation 텍스트를 대조한 후 해당 행의 승인 필드만 갱신하며, Grounding 또는 Quiz 실행 중에는 자동 호출되지 않습니다. 첫 Pilot 영상의 Grounding attempt=5에는 사람 검수 후 이 승인을 기록했으며, Quiz A/B는 같은 승인 Grounding과 `contentTextSha256`을 참조합니다.
 
 `Cking-BE`의 Provider 또는 Core Engine 코드를 복사해 독립 구현체로 발전시키지 않습니다. BE 계약을 참고하지만 실제 BE validator나 production DTO/domain validation을 실행하지 않습니다. 기존 `beCompatibility=pass`는 Benchmark 내부 Quiz 형식/계약 검사 통과만 뜻합니다. Gemini 직접 Quiz는 고정 `contentText`가 없어 동일한 문자열 포함 검사를 할 수 없으므로 `beCompatibility=not_applicable`이며, 이는 품질이나 실제 BE 호환성 통과를 뜻하지 않습니다. 문자열 포함·구조 검사 통과는 영상 사실성이나 사람 검수 통과를 뜻하지 않습니다. 외부 호출과 평가 결과는 운영 Quiz·Mission 데이터에 쓰지 않습니다.

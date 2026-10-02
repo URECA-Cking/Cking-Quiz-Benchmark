@@ -15,6 +15,7 @@ from src.provider_adapters import LivePolicy, ProviderRouter, urllib_transport
 
 
 CONTENT = "NASA measures global rain and snow every 30 minutes."
+APPROVER = "pilot-reviewer"
 VIDEO = {"videoId": "nasa-water-cycle-2019", "youtubeUrl": "https://www.youtube.com/watch?v=mCNcxu8MXzo"}
 QUIZ = {"promptVersion": "pilot-v1", "questions": [
     {"question": f"질문 {i}?", "options": ["가", "나", "다", "라"],
@@ -33,7 +34,7 @@ def approve_test_source(runner, content=CONTENT):
                contentTextSha256=None, contentTextApprovalStatus=None)
     runner._save(row, raw={"source": "fixture"},
                  evaluation={"contentText": content, "facts": []})
-    runner.approve_content(row["runId"])
+    runner.approve_content(row["runId"], APPROVER)
     return row["runId"]
 
 
@@ -417,7 +418,7 @@ class ProviderAdapterTest(unittest.TestCase):
                                  quiz_estimated_input_tokens=100,
                                  total_cost_limit=0.00102)
             grounding = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1, router)
-            runner.approve_content(grounding["runId"])
+            runner.approve_content(grounding["runId"], APPROVER)
             row = runner.run_quiz(VIDEO["videoId"], "gemini-3.8-flash", 1, CONTENT,
                                   router, source_grounding_run_id=grounding["runId"])
             self.assertEqual(row["apiStatus"], "success")
@@ -692,7 +693,7 @@ class ProviderAdapterTest(unittest.TestCase):
             transport = QueueTransport((gemini_response(GROUNDING), gemini_response(QUIZ)))
             router = self.router(transport, call_limit=2)
             grounding = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1, router)
-            runner.approve_content(grounding["runId"])
+            runner.approve_content(grounding["runId"], APPROVER)
             quiz = runner.run_quiz(VIDEO["videoId"], "gemini-3.8-flash", 1,
                                    CONTENT, router, source_grounding_run_id=grounding["runId"])
             self.assertEqual(quiz["sourceGroundingRunId"], grounding["runId"])
