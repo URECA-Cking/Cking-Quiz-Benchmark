@@ -4,6 +4,12 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["benchmarkType", "runId", "videoId", "method", "model", "promptVersion", "repetition", "startedAt", "apiStatus"],
+  "allOf": [
+    {
+      "if": {"required": ["retryStopReason"], "properties": {"retryStopReason": {"const": "live_guard"}}},
+      "then": {"required": ["apiStatus", "httpStatus", "errorCategory"], "properties": {"apiStatus": {"const": "error"}, "httpStatus": {"type": "integer"}, "errorCategory": {"type": "string", "not": {"const": "live_guard"}}}}
+    }
+  ],
   "properties": {
     "benchmarkType": {"enum": ["video_grounding", "quiz_generation", "end_to_end"]},
     "runId": {"type": "string", "minLength": 1},

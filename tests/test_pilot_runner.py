@@ -521,6 +521,57 @@ class PilotRunnerTest(unittest.TestCase):
             legacy = {key: value for key, value in row.items() if key != "retryStopReason"}
             self.assertTrue(set(schema["required"]).issubset(legacy))
 
+    @staticmethod
+    def retry_stop_rule_accepts(rule, row):
+        """Evaluate only the retryStopReason if/then rule; not general JSON Schema validation."""
+        condition = rule["if"]
+        if not (all(key in row for key in condition["required"])
+                and all(row[key] == spec["const"] for key, spec in condition["properties"].items())):
+            return True
+        then = rule["then"]
+        if any(key not in row for key in then["required"]):
+            return False
+        for key, spec in then["properties"].items():
+            value = row[key]
+            if ("const" in spec and value != spec["const"]
+                    or spec.get("type") == "integer" and type(value) is not int
+                    or spec.get("type") == "string" and not isinstance(value, str)
+                    or "not" in spec and value == spec["not"]["const"]):
+                return False
+        return True
+
+    def test_retry_stop_reason_schema_invariant_matches_runtime_contract(self):
+        schema = json.loads((ROOT / "docs" / "run-result.schema.json").read_text(encoding="utf-8"))
+        rule = {"if": {"required": ["retryStopReason"],
+                       "properties": {"retryStopReason": {"const": "live_guard"}}},
+                "then": {"required": ["apiStatus", "httpStatus", "errorCategory"],
+                         "properties": {"apiStatus": {"const": "error"},
+                                        "httpStatus": {"type": "integer"},
+                                        "errorCategory": {"type": "string",
+                                                          "not": {"const": "live_guard"}}}}}
+        self.assertIn(rule, schema["allOf"])
+        self.assertNotIn("providerErrorCode", rule["then"]["required"])
+        blocked = {"apiStatus": "error", "httpStatus": 429, "errorCategory": "rate_limit",
+                   "providerErrorCode": None, "retryStopReason": "live_guard"}
+        valid = ({"apiStatus": "error", "httpStatus": 503, "errorCategory": "server_error"},
+                 {"apiStatus": "success", "errorCategory": None, "httpStatus": None,
+                  "retryStopReason": None},
+                 {"apiStatus": "error", "errorCategory": "live_guard", "httpStatus": None,
+                  "retryStopReason": None},
+                 blocked)
+        invalid = ({**blocked, "apiStatus": "success"},
+                   {key: value for key, value in blocked.items() if key != "apiStatus"},
+                   {key: value for key, value in blocked.items() if key != "httpStatus"},
+                   {**blocked, "httpStatus": None},
+                   {key: value for key, value in blocked.items() if key != "errorCategory"},
+                   {**blocked, "errorCategory": "live_guard"})
+        for row in valid:
+            with self.subTest(valid=row):
+                self.assertTrue(self.retry_stop_rule_accepts(rule, row))
+        for row in invalid:
+            with self.subTest(invalid=row):
+                self.assertFalse(self.retry_stop_rule_accepts(rule, row))
+
     def test_failed_call_and_blocked_two_stage_e2e_are_not_falsely_successful(self):
         provider = FixtureProvider({"grounding": {"errorCategory": "rate_limit"}})
         failed = self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)

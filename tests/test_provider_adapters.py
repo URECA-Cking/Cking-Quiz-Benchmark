@@ -657,6 +657,10 @@ class ProviderAdapterTest(unittest.TestCase):
         self.assertEqual(transport.calls, [])
 
     def test_retry_stop_keeps_last_provider_failure_for_each_runner_path(self):
+        schema_path = Path(__file__).resolve().parents[1] / "docs" / "run-result.schema.json"
+        rules = json.loads(schema_path.read_text(encoding="utf-8"))["allOf"]
+        invariant = next(rule["then"]["properties"] for rule in rules
+                         if "retryStopReason" in rule["if"].get("required", []))
         for status, category, code in ((429, "rate_limit", "rate_limit_exceeded"),
                                        (503, "server_error", "service_unavailable")):
             for path in ("grounding", "quiz", "direct"):
@@ -678,6 +682,10 @@ class ProviderAdapterTest(unittest.TestCase):
                                       row["providerErrorCode"], row["retryStopReason"]),
                                      ("error", category, status, code, "live_guard"))
                     self.assertEqual(len(transport.calls), 1)
+                    # The production row satisfies the schema's retryStopReason invariant.
+                    self.assertEqual(row["apiStatus"], invariant["apiStatus"]["const"])
+                    self.assertIs(type(row["httpStatus"]), int)
+                    self.assertNotEqual(row["errorCategory"], invariant["errorCategory"]["not"]["const"])
 
     def test_cost_guard_stops_retry_after_server_error(self):
         # Each call reserves (10000 + 2000) / 1e6 = 0.012 USD, so the second call exceeds 0.02.
