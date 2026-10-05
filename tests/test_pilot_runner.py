@@ -670,6 +670,44 @@ class PilotRunnerTest(unittest.TestCase):
         self.assertIsNone(row["quizRunId"])
         self.assertIsNone(row["questionReviews"][0]["answerAccuracy"])
 
+    def run_direct(self, normalized):
+        provider = SimulatedApiFixture({"direct": {"normalized": normalized,
+                                                   "responseBody": FIXTURE_RAW}})
+        return self.runner.run_end_to_end(VIDEO, "gemini_direct_quiz", 1, provider)
+
+    def test_direct_quiz_valid_structure_records_validator_not_run(self):
+        row = self.run_direct(QUIZ)
+        self.assertEqual(row["apiStatus"], "success")
+        self.assertEqual(row["parseStatus"], "pass")
+        self.assertEqual(row["validatorStatus"], "not_run")
+        self.assertIsNone(row["errorCategory"])
+        self.assertIsNone(row["evidenceTextContained"])
+        self.assertEqual(row["beCompatibility"], "not_applicable")
+
+    def test_direct_quiz_structure_contract_failure_keeps_validator_fail(self):
+        duplicate_options = [dict(item) for item in QUIZ["questions"]]
+        duplicate_options[0]["options"] = ["A", "a ", "C", "D"]
+        cases = {"question_count": dict(QUIZ, questions=QUIZ["questions"][:2]),
+                 "duplicate_options": dict(QUIZ, questions=duplicate_options),
+                 "prompt_version": dict(QUIZ, promptVersion="other-version")}
+        for case, output in cases.items():
+            with self.subTest(case=case):
+                row = self.run_direct(output)
+                self.assertEqual(row["apiStatus"], "success")
+                self.assertEqual(row["parseStatus"], "pass")
+                self.assertEqual(row["validatorStatus"], "fail")
+                self.assertEqual(row["errorCategory"], "quiz_contract_error")
+                self.assertIsNone(row["evidenceTextContained"])
+                self.assertEqual(row["beCompatibility"], "not_applicable")
+
+    def test_direct_quiz_parse_failure_records_validator_not_run(self):
+        row = self.run_direct("not json")
+        self.assertEqual(row["apiStatus"], "success")
+        self.assertEqual(row["parseStatus"], "fail")
+        self.assertEqual(row["validatorStatus"], "not_run")
+        self.assertEqual(row["errorCategory"], "parse_error")
+        self.assertEqual(row["beCompatibility"], "not_applicable")
+
     def test_fixture_rows_always_record_null_retry_stop_reason(self):
         success = FixtureProvider({"grounding": {"raw": GROUNDING}, "quiz": {"raw": QUIZ},
                                    "direct": {"raw": QUIZ}})
