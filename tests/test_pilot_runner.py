@@ -1,5 +1,6 @@
 import json
 import hashlib
+import math
 import os
 import shutil
 import tempfile
@@ -422,6 +423,93 @@ class PilotRunnerTest(unittest.TestCase):
                     self.assertEqual(row["errorCategory"], "fixture_invalid_grounding_response")
                     self.assertEqual(row["groundingFacts"], [])
                     self.assertNotIn("contentTextSha256", row)
+
+    def run_timestamps(self, video_id, start, end, runner=None):
+        fact = dict(GROUNDING["facts"][0], timestampStartSeconds=start, timestampEndSeconds=end)
+        return (runner or self.runner).run_grounding(
+            video_id, "gemini_video", 1,
+            FixtureProvider({"grounding": {"raw": dict(GROUNDING, facts=[fact])}}))
+
+    def assert_timestamp_rejected(self, row, start, end, runner=None):
+        runner = runner or self.runner
+        self.assertEqual(row["errorCategory"], "fixture_invalid_grounding_response")
+        self.assertEqual(row["groundingFacts"], [])
+        self.assertNotIn("contentTextSha256", row)
+        self.assertEqual(self.rows("video-grounding.jsonl")[-1]["runId"], row["runId"])
+        self.assertTrue((self.results / "raw" / (row["runId"] + ".json")).is_file())
+        # A standard-JSON invalid response keeps its diagnostic payload; NaN/Infinity does not.
+        standard_json = all(value is None or math.isfinite(value) for value in (start, end))
+        self.assertEqual((self.results / "evaluation" / (row["runId"] + ".json")).is_file(),
+                         standard_json)
+        runner._check_storage_integrity()
+
+    def test_grounding_rejects_non_finite_timestamps(self):
+        for video_id in ("kari-microgravity-2024", VIDEO):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                for start, end in ((value, None), (None, value), (value, 50), (10, value)):
+                    with self.subTest(video_id=video_id, start=start, end=end):
+                        self.assert_timestamp_rejected(self.run_timestamps(video_id, start, end),
+                                                       start, end)
+        # The same results directory stays usable after every non-finite rejection.
+        self.assertIsNone(self.run_timestamps(VIDEO, 61, 73)["errorCategory"])
+
+    def test_non_finite_actual_api_response_keeps_error_row_without_evaluation(self):
+        fact = dict(GROUNDING["facts"][0], timestampStartSeconds=float("nan"))
+        provider = SimulatedApiFixture({"grounding": {"normalized": dict(GROUNDING, facts=[fact]),
+                                                      "responseBody": FIXTURE_RAW}})
+        row = self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)
+        self.assertEqual((row["apiStatus"], row["errorCategory"], row["attempt"]),
+                         ("error", "invalid_grounding_response", 1))
+        self.assertTrue((self.results / "raw" / (row["runId"] + ".json")).is_file())
+        self.assertFalse((self.results / "evaluation" / (row["runId"] + ".json")).exists())
+        self.runner._check_storage_integrity()
+        retry = self.runner.run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(
+            {"grounding": {"normalized": GROUNDING, "responseBody": FIXTURE_RAW}}))
+        self.assertEqual((retry["apiStatus"], retry["attempt"]), ("success", 2))
+
+    def test_standard_json_invalid_response_keeps_evaluation_diagnostic(self):
+        fact = dict(GROUNDING["facts"][0], timestampStartSeconds=80, timestampEndSeconds=70)
+        provider = SimulatedApiFixture({"grounding": {"normalized": dict(GROUNDING, facts=[fact]),
+                                                      "responseBody": FIXTURE_RAW}})
+        row = self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)
+        self.assertEqual(row["errorCategory"], "invalid_grounding_response")
+        evaluation = json.loads((self.results / "evaluation" / (row["runId"] + ".json"))
+                                .read_text(encoding="utf-8"))
+        self.assertEqual(evaluation["facts"][0]["timestampStartSeconds"], 80)
+        self.runner._check_storage_integrity()
+
+    def test_recorded_duration_bounds_start_and_end_independently(self):
+        kari = "kari-microgravity-2024"
+        cases = [(228, None, False), (227, None, True), (None, 228, False), (None, 227, True),
+                 (227, 227, True), (228, 228, False), (100, 50, False), (100, 227, True)]
+        for start, end, accepted in cases:
+            with self.subTest(start=start, end=end):
+                row = self.run_timestamps(kari, start, end)
+                if accepted:
+                    self.assertIsNone(row["errorCategory"])
+                    stored = row["groundingFacts"][0]
+                    self.assertEqual((stored["timestampStartSeconds"], stored["timestampEndSeconds"]),
+                                     (start, end))
+                else:
+                    self.assert_timestamp_rejected(row, start, end)
+
+    def test_unrecorded_duration_keeps_finite_and_non_negative_checks(self):
+        kari = "kari-microgravity-2024"
+        for duration in ("absent", None):
+            runner = PilotRunner(self.repository, self.results)
+            if duration == "absent":
+                del runner.videos[kari]["durationSeconds"]
+            else:
+                runner.videos[kari]["durationSeconds"] = None
+            for start, end, accepted in ((None, 999, True), (999, None, True), (-1, None, False),
+                                         (None, -1, False), (float("nan"), None, False),
+                                         (None, float("inf"), False), (20, 10, False)):
+                with self.subTest(duration=duration, start=start, end=end):
+                    row = self.run_timestamps(kari, start, end, runner)
+                    if accepted:
+                        self.assertIsNone(row["errorCategory"])
+                    else:
+                        self.assert_timestamp_rejected(row, start, end, runner)
 
     def test_recorded_duration_is_checked_before_ai_grounding_provider_call(self):
         kari = "kari-microgravity-2024"

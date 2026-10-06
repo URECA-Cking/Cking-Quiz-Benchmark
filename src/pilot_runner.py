@@ -505,10 +505,11 @@ class PilotRunner:
                             or any(not isinstance(fact.get(key), str) or not fact[key].strip()
                                    for key in ("fact", "evidenceType", "evidence"))
                             or fact["evidenceType"] not in ("speech", "visual", "unknown")
-                            or any(value is not None and (type(value) not in (int, float) or value < 0)
+                            or any(value is not None and (type(value) not in (int, float)
+                                                          or not math.isfinite(value) or value < 0
+                                                          or duration is not None and value > duration)
                                    for value in (start, end))
-                            or start is not None and end is not None and start > end
-                            or duration is not None and end is not None and end > duration):
+                            or start is not None and end is not None and start > end):
                         raise ProviderFailure("invalid_grounding_response")
                     row["groundingFacts"].append({
                         "fact": fact["fact"], "evidenceType": fact["evidenceType"],
@@ -523,6 +524,12 @@ class PilotRunner:
             return self._save(row, raw, normalized), content
         except ProviderFailure as exc:
             self._failure(row, provider, exc, started, response)
+            try:
+                json.dumps(normalized, allow_nan=False)
+            except ValueError:
+                # NaN/Infinity is not standard JSON and would fail the next storage integrity
+                # check; keep the error row and raw metadata but skip this diagnostic payload.
+                normalized = None
             return self._save(row, raw, normalized), None
 
     def run_grounding(self, video_id, method, repetition, provider, authorized_transcript=None):
