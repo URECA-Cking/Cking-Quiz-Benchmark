@@ -395,6 +395,118 @@ class PilotRunnerTest(unittest.TestCase):
                     self.assertEqual(row["errorCategory"], "fixture_invalid_grounding_response")
                     self.assertNotIn("contentTextSha256", row)
 
+    def test_grounding_timestamp_order_and_recorded_duration_contract(self):
+        # KARI has durationSeconds=227; the NASA water-cycle video has no recorded duration.
+        cases = [("kari-microgravity-2024", 104.5, 104.5, True),
+                 ("kari-microgravity-2024", 111.3, 104.5, False),
+                 ("kari-microgravity-2024", 200, 227, True),
+                 ("kari-microgravity-2024", 222.8, 229.8, False),
+                 ("kari-microgravity-2024", 200, 227.1, False),
+                 ("kari-microgravity-2024", None, 228, False),
+                 ("kari-microgravity-2024", None, 50, True),
+                 ("kari-microgravity-2024", 50, None, True),
+                 (VIDEO, 100, 999, True),
+                 (VIDEO, 999, None, True)]
+        for video_id, start, end, accepted in cases:
+            with self.subTest(video_id=video_id, start=start, end=end):
+                fact = dict(GROUNDING["facts"][0], timestampStartSeconds=start, timestampEndSeconds=end)
+                row = self.runner.run_grounding(
+                    video_id, "gemini_video", 1,
+                    FixtureProvider({"grounding": {"raw": dict(GROUNDING, facts=[fact])}}))
+                if accepted:
+                    self.assertIsNone(row["errorCategory"])
+                    stored = row["groundingFacts"][0]
+                    self.assertEqual((stored["timestampStartSeconds"], stored["timestampEndSeconds"]),
+                                     (start, end))
+                else:
+                    self.assertEqual(row["errorCategory"], "fixture_invalid_grounding_response")
+                    self.assertEqual(row["groundingFacts"], [])
+                    self.assertNotIn("contentTextSha256", row)
+
+    def test_recorded_duration_is_checked_before_ai_grounding_provider_call(self):
+        kari = "kari-microgravity-2024"
+        cases = [("absent", True), (None, True), (227, True), (227.0, True),
+                 ("227", False), (True, False), (0, False), (-227, False)]
+        for duration, accepted in cases:
+            with self.subTest(duration=duration):
+                runner = PilotRunner(self.repository, self.results)
+                if duration == "absent":
+                    del runner.videos[kari]["durationSeconds"]
+                else:
+                    runner.videos[kari]["durationSeconds"] = duration
+                provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+                if accepted:
+                    row = runner.run_grounding(kari, "gemini_video", 1, provider)
+                    self.assertIsNone(row["errorCategory"])
+                    self.assertEqual(len(provider.calls), 1)
+                else:
+                    with self.assertRaisesRegex(ValueError, "durationSeconds"):
+                        runner.run_grounding(kari, "gemini_video", 1, provider)
+                    self.assertEqual(provider.calls, [])
+                    self.assertFalse((self.results / "video-grounding.jsonl").exists())
+                    # authorized_transcript makes no AI call and does not use durationSeconds.
+                    transcript = runner.run_grounding(kari, "authorized_transcript", 1, provider,
+                                                      authorized_transcript=CONTENT)
+                    self.assertIsNone(transcript["errorCategory"])
+                    self.assertEqual(provider.calls, [])
+                if self.results.exists():
+                    shutil.rmtree(self.results)
+
+    def test_valid_recorded_duration_keeps_strict_end_bound(self):
+        kari = "kari-microgravity-2024"
+        for duration in (227, 227.0):
+            for end, accepted in ((227, True), (227.5, False)):
+                with self.subTest(duration=duration, end=end):
+                    runner = PilotRunner(self.repository, self.results)
+                    runner.videos[kari]["durationSeconds"] = duration
+                    fact = dict(GROUNDING["facts"][0], timestampStartSeconds=200, timestampEndSeconds=end)
+                    row = runner.run_grounding(
+                        kari, "gemini_video", 1,
+                        FixtureProvider({"grounding": {"raw": dict(GROUNDING, facts=[fact])}}))
+                    self.assertEqual(row["errorCategory"],
+                                     None if accepted else "fixture_invalid_grounding_response")
+
+    def test_grounding_prompt_version_is_recorded_only_for_ai_grounding(self):
+        provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+        ai = self.runner.run_grounding(VIDEO, "gemini_video", 1, provider)
+        transcript = self.runner.run_grounding(VIDEO, "authorized_transcript", 1, provider,
+                                               authorized_transcript=CONTENT)
+        self.assertEqual(ai["promptVersion"], "video-grounding-v1")
+        self.assertIsNone(transcript["promptVersion"])
+        self.assertEqual([row["promptVersion"] for row in self.rows("video-grounding.jsonl")],
+                         ["video-grounding-v1", None])
+
+    def test_ai_grounding_without_prompt_version_config_fails_before_provider_call(self):
+        for value in (None, "", "  ", 1):
+            with self.subTest(prompt_version=value):
+                runner = PilotRunner(self.repository, self.results)
+                if value is None:
+                    del runner.config["video_grounding"]["prompt_version"]
+                else:
+                    runner.config["video_grounding"]["prompt_version"] = value
+                provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+                with self.assertRaisesRegex(ValueError, "video_grounding.prompt_version"):
+                    runner.run_grounding(VIDEO, "gemini_video", 1, provider)
+                self.assertEqual(provider.calls, [])
+                self.assertFalse((self.results / "video-grounding.jsonl").exists())
+                transcript = runner.run_grounding(VIDEO, "authorized_transcript", 1, provider,
+                                                  authorized_transcript=CONTENT)
+                self.assertIsNone(transcript["promptVersion"])
+                self.assertEqual(provider.calls, [])
+                shutil.rmtree(self.results)
+
+    def test_grounding_prompt_version_leaves_quiz_and_direct_pilot_version_unchanged(self):
+        self.assertEqual(self.runner.config["prompt_version"], "pilot-v1")
+        self.runner.run_grounding(VIDEO, "gemini_video", 1,
+                                  FixtureProvider({"grounding": {"raw": GROUNDING}}))
+        quiz = self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
+                                      FixtureProvider({"quiz": {"raw": QUIZ}}))
+        direct = self.runner.run_end_to_end(VIDEO, "gemini_direct_quiz", 1,
+                                            FixtureProvider({"direct": {"raw": QUIZ}}))
+        self.assertEqual((quiz["promptVersion"], direct["promptVersion"]), ("pilot-v1", "pilot-v1"))
+        self.assertEqual(quiz["validatorStatus"], "pass")
+        self.assertEqual(direct["validatorStatus"], "not_run")
+
     def test_existing_three_attempts_are_preserved_before_fourth(self):
         self.results.mkdir()
         result_file = self.results / "video-grounding.jsonl"

@@ -7,6 +7,9 @@ pilot:
   prompt_version: pilot-v1
   # 실행 전 공식 모델 ID, 접근 권한, 계정별 제한과 비용 상한을 다시 확인한다.
   video_grounding:
+    # AI Grounding prompt 계약 버전. 전역 prompt_version(Quiz·Direct Quiz)과 별개이며
+    # 이 값 도입 전 Grounding 결과의 promptVersion은 null이다. authorized_transcript에는 적용하지 않는다.
+    prompt_version: video-grounding-v1
     methods:
       - id: gemini_video
         model: gemini-3.8-flash

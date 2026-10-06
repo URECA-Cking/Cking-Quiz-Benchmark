@@ -313,6 +313,20 @@ class ProviderAdapterTest(unittest.TestCase):
         self.assertIn("화면", prompt)
         self.assertIn("신뢰성 있게", prompt)
 
+    def test_grounding_request_defines_timestamps_as_elapsed_seconds(self):
+        transport = FakeTransport(gemini_response(GROUNDING))
+        self.router(transport).invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
+        body = transport.calls[0][2]
+        prompt = body["input"][1]["text"]
+        for text in ("timestampStartSeconds", "timestampEndSeconds", "경과", "MM:SS",
+                     "01:30.5 → 90.5 seconds", "null"):
+            self.assertIn(text, prompt)
+        properties = body["response_format"]["schema"]["properties"]["facts"]["items"]["properties"]
+        for key in ("timestampStartSeconds", "timestampEndSeconds"):
+            self.assertEqual(properties[key]["type"], ["number", "null"])
+            for text in ("경과 초", "MM:SS", "01:30.5 → 90.5", "null"):
+                self.assertIn(text, properties[key]["description"])
+
     def test_configured_model_alias_uses_configured_provider_and_key_name(self):
         config = {"video_grounding": {"methods": [{"id": "gemini_video", "model": "gemini-pilot-alias",
                     "provider": "gemini", "api_key_environment_variable": "PILOT_GEMINI_KEY"}]},
