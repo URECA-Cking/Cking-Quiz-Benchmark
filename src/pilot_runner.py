@@ -626,8 +626,6 @@ class PilotRunner:
                 raw = response.get("responseBody") if self._actual(provider) else {"source": "fixture"}
                 self._success(row, provider, response, elapsed)
                 self._evaluate_quiz(row, normalized, None)
-                # A video-only direct Quiz cannot run the BE contentText validator.
-                row["validatorStatus"] = "not_run"
                 row["totalLatencyMs"] = row["latencyMs"]
                 row["totalEstimatedCostUsd"] = row["estimatedCostUsd"]
                 return self._save(row, raw, normalized)
