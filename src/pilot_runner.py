@@ -394,7 +394,9 @@ class PilotRunner:
         if (result_file.resolve() != result_file or evaluation_file.resolve() != evaluation_file
                 or not result_file.is_file() or not evaluation_file.is_file()):
             raise ValueError("Grounding result and evaluation are required for human approval")
-        lines = result_file.read_text(encoding="utf-8").splitlines(keepends=True)
+        # newline="" keeps each row's own CRLF/LF so untouched rows are rewritten byte-for-byte.
+        with result_file.open(encoding="utf-8", newline="") as stream:
+            lines = stream.readlines()
         matches = [(index, json.loads(line)) for index, line in enumerate(lines) if line.strip()
                    and json.loads(line).get("runId") == source_grounding_run_id]
         if len(matches) != 1:

@@ -190,6 +190,37 @@ class PilotRunnerTest(unittest.TestCase):
                              source_grounding_run_id=source_id)
         self.assertEqual(len(provider.calls), 1)
 
+    def write_grounding_lines(self, lines_and_endings):
+        (self.results / "video-grounding.jsonl").write_bytes(b"".join(
+            line + ending for line, ending in lines_and_endings))
+
+    def grounding_lines(self):
+        return (self.results / "video-grounding.jsonl").read_bytes().splitlines(keepends=True)
+
+    def test_approval_keeps_other_rows_and_target_newlines(self):
+        for other_ending, target_ending in ((b"\r\n", b"\n"), (b"\n", b"\r\n")):
+            with self.subTest(other=other_ending, target=target_ending):
+                shutil.rmtree(self.results, ignore_errors=True)
+                self.approved_source(approval=None)
+                target_id = self.approved_source(approval=None)
+                other, target = (line.rstrip(b"\r\n") for line in self.grounding_lines())
+                self.write_grounding_lines([(other, other_ending), (target, target_ending)])
+                before = json.loads(target)
+                self.runner.approve_content(target_id, APPROVER)
+                after_other, after_target = self.grounding_lines()
+                self.assertEqual(after_other, other + other_ending)
+                self.assertTrue(after_target.endswith(target_ending))
+                self.assertEqual(after_target[-len(target_ending) - 1:-len(target_ending)], b"}")
+                after = json.loads(after_target)
+                self.assertEqual(after["runId"], target_id)
+                self.assertEqual(after["contentTextApprovalStatus"], "approved")
+                self.assertEqual(after["approvedBy"], APPROVER)
+                self.assertEqual({key: after[key] for key in before
+                                  if key != "contentTextApprovalStatus"},
+                                 {key: before[key] for key in before
+                                  if key != "contentTextApprovalStatus"})
+                self.assertEqual(set(after) - set(before), {"approvedBy", "approvedAt"})
+
     def test_approved_by_length_allows_100_code_points_after_strip(self):
         source_id = self.approved_source(approval=None)
         self.runner.approve_content(source_id, "  " + "가" * 100 + "  ")
