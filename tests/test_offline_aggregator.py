@@ -31,7 +31,8 @@ class OfflineAggregatorTest(unittest.TestCase):
                              inputTokens=5, outputTokens=9,
                              estimatedCostUsd=0.003, pricingReference="quiz-price",
                              contentTextSha256=SHA, sourceGroundingRunId="ground-5",
-                             promptVersion="pilot-v1", questionReviews=[{"answerAccuracy": "pass"}])
+                             promptVersion="pilot-v1",
+                             questionReviews=[{"questionIndex": 0, "answerAccuracy": "pass"}])
         self.other_quiz = self.row("quiz_generation", "quiz-b", "fixed_content_text",
                                    "gpt-5.4-mini", 1, contentTextSha256=SHA,
                                    sourceGroundingRunId="ground-5", promptVersion="pilot-v1",
@@ -73,7 +74,8 @@ class OfflineAggregatorTest(unittest.TestCase):
         self.assertNotIn("totalTokens", result)
         self.assertNotIn("overallQuality", result)
         self.assertEqual(result["groundingHumanEvaluation"]["omission"], "fail")
-        self.assertEqual(result["quizHumanEvaluation"], [{"answerAccuracy": "pass"}])
+        self.assertEqual(result["quizHumanEvaluation"],
+                         [{"questionIndex": 0, "answerAccuracy": "pass"}])
         self.assertEqual(result["groundingAttemptHistory"][0]["apiStatus"], "error")
         self.assertEqual(result["groundingAttemptHistory"][0]["httpStatus"], 503)
         self.assertEqual(result["selectedGroundingAttempt"], 5)
@@ -134,6 +136,31 @@ class OfflineAggregatorTest(unittest.TestCase):
                 self.write([{**self.grounding, **fields}], [self.quiz])
                 with self.assertRaisesRegex(ValueError, "approv"):
                     self.aggregate()
+
+    def test_rejects_invalid_human_evaluation_of_selected_runs(self):
+        fact = {"fact": "f", "evidenceType": "speech", "evidence": "e"}
+        review = {"questionIndex": 0}
+        for g_fields, q_fields in (({"omission": "Pass"}, {}),
+                                   ({"hallucination": 1}, {}),
+                                   ({"groundingFacts": None}, {}),
+                                   ({"groundingFacts": [{**fact, "factExists": "pass "}]}, {}),
+                                   ({"groundingFacts": [{**fact, "factExist": "pass"}]}, {}),
+                                   ({}, {"questionReviews": None}),
+                                   ({}, {"questionReviews": [{**review, "answerAccuracy": True}]}),
+                                   ({}, {"questionReviews": [{**review, "answerAccuraccy": "pass"}]}),
+                                   ({}, {"questionReviews": [{"answerAccuracy": "pass"}]}),
+                                   ({}, {"questionReviews": [{**review, "reviewNote": 0}]})):
+            with self.subTest(grounding=g_fields, quiz=q_fields):
+                self.write([{**self.grounding, **g_fields}], [{**self.quiz, **q_fields}])
+                with self.assertRaisesRegex(ValueError, "Human evaluation"):
+                    self.aggregate()
+
+    def test_unselected_invalid_human_evaluation_does_not_block_selected_runs(self):
+        invalid = self.row("video_grounding", "ground-1", "gemini_video", "gemini-3.8-flash", 1,
+                           apiStatus="error", omission="Pass")
+        self.write([invalid, self.grounding],
+                   [self.quiz, {**self.other_quiz, "questionReviews": None}])
+        self.assertEqual(self.aggregate()["quizRunId"], "quiz-a")
 
     def test_rejects_evaluation_content_hash_mismatch(self):
         (self.results / "evaluation" / "ground-5.json").write_text(
