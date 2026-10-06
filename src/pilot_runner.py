@@ -14,6 +14,7 @@ from pathlib import Path
 import yaml
 
 from src.approval_tracking import normalize_approved_by, require_valid_approval_tracking
+from src.human_evaluation import require_valid_human_evaluation
 from src.provider_failure import ProviderFailure
 
 
@@ -137,6 +138,10 @@ class PilotRunner:
                         or ("attempt" in row and
                             (type(row["attempt"]) is not int or row["attempt"] < 1))):
                     raise ValueError(f"Result storage integrity error: invalid {filename} line {line_number}")
+                try:
+                    require_valid_human_evaluation(row)
+                except ValueError as exc:
+                    raise ValueError(f"Result storage integrity error: invalid {filename} line {line_number}") from exc
                 known_ids.add(run_id)
                 rows.append((benchmark_type, row))
 

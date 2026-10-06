@@ -200,6 +200,48 @@ class StorageSafetyTest(unittest.TestCase):
             self.grounding(provider)
         self.assertEqual(provider.calls, [])
 
+    def test_invalid_human_evaluation_blocks_before_provider(self):
+        first = self.grounding(FixtureProvider({"grounding": {"raw": {
+            "contentText": "Water cycle overview",
+            "facts": [{"fact": "Rain falls", "evidenceType": "speech", "evidence": "rain"}]}}}))
+        summary = self.results / "video-grounding.jsonl"
+        valid = summary.read_text(encoding="utf-8")
+        for fields in ({"omission": "Pass"}, {"hallucination": True},
+                       {"groundingFacts": None},
+                       {"groundingFacts": [{**first["groundingFacts"][0], "factExists": "fial"}]},
+                       {"groundingFacts": [{**first["groundingFacts"][0], "factExist": "pass"}]}):
+            with self.subTest(fields=fields):
+                summary.write_text(json.dumps({**first, **fields}) + "\n", encoding="utf-8")
+                provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+                with self.assertRaisesRegex(ValueError,
+                                            "storage integrity error: invalid video-grounding.jsonl line 1"):
+                    self.grounding(provider)
+                self.assertEqual(provider.calls, [])
+                with self.assertRaisesRegex(ValueError, "storage integrity"):
+                    self.runner.approve_content(first["runId"], "reviewer")
+                self.assertEqual(json.loads(summary.read_text(encoding="utf-8"))["runId"],
+                                 first["runId"])
+        summary.write_text(valid, encoding="utf-8")
+        self.assertEqual(self.grounding()["attempt"], 2)
+
+    def test_invalid_question_review_blocks_before_provider(self):
+        self.results.mkdir()
+        row = self.runner._base("end_to_end", VIDEO, "gemini_direct_quiz", "gemini-3.8-flash", 1)
+        row.update(apiStatus="error", errorCategory="server_error", httpStatus=503,
+                   groundingRunId=None, quizRunId=None, beCompatibility="not_applicable",
+                   videoGrounding=None, questionReviews=[])
+        summary = self.results / "end-to-end.jsonl"
+        for fields in ({"videoGrounding": "PASS"}, {"questionReviews": None},
+                       {"questionReviews": [{"questionIndex": True}]},
+                       {"questionReviews": [{"questionIndex": 0, "uniqueAnswer": 1}]}):
+            with self.subTest(fields=fields):
+                summary.write_text(json.dumps({**row, **fields}) + "\n", encoding="utf-8")
+                provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+                with self.assertRaisesRegex(ValueError,
+                                            "storage integrity error: invalid end-to-end.jsonl line 1"):
+                    self.grounding(provider)
+                self.assertEqual(provider.calls, [])
+
     def test_success_keeps_summary_raw_and_evaluation_linked(self):
         row = self.grounding()
         self.assertTrue((self.results / "raw" / (row["runId"] + ".json")).is_file())
