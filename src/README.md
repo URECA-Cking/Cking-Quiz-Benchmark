@@ -23,3 +23,5 @@ Quiz Generation의 독립 비교는 영상·Pilot prompt 버전당 첫 승인된
 `PilotRunner.approve_content(runId, approved_by)`는 별도 사람 승인 지시가 있을 때만 호출하는 명시적 기록 경계입니다. 성공한 Grounding 행과 원본 evaluation 텍스트를 대조한 후 해당 행의 승인 필드만 갱신하며, Grounding 또는 Quiz 실행 중에는 자동 호출되지 않습니다. 첫 Pilot 영상의 Grounding attempt=5에는 사람 검수 후 이 승인을 기록했으며, Quiz A/B는 같은 승인 Grounding과 `contentTextSha256`을 참조합니다.
 
 `Cking-BE`의 Provider 또는 Core Engine 코드를 복사해 독립 구현체로 발전시키지 않습니다. BE 계약을 참고하지만 실제 BE validator나 production DTO/domain validation을 실행하지 않습니다. 기존 `beCompatibility=pass`는 Benchmark 내부 Quiz 형식/계약 검사 통과만 뜻합니다. Gemini 직접 Quiz는 고정 `contentText`가 없어 동일한 문자열 포함 검사를 할 수 없으므로 `beCompatibility=not_applicable`이며, 이는 품질이나 실제 BE 호환성 통과를 뜻하지 않습니다. 문자열 포함·구조 검사 통과는 영상 사실성이나 사람 검수 통과를 뜻하지 않습니다. 외부 호출과 평가 결과는 운영 Quiz·Mission 데이터에 쓰지 않습니다.
+
+`judge_runner.py`는 저장된 A/B Quiz 결과에 대한 사후 LLM-as-a-Judge 보조 평가를 실행합니다(`plan`, `run`, `derive`). Pilot 생성 경로(`ProviderRouter`, `LivePolicy`)와 분리된 `judge_client.py`를 사용하고 결과는 `results/judge/<judgeRunId>/`에만 저장합니다. 실제 Provider 호출(`--live`)은 별도 승인 후에만 실행합니다. 자세한 계약은 [docs/judge-protocol.md](../docs/judge-protocol.md)를 참고하세요.

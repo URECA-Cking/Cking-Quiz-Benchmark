@@ -31,6 +31,10 @@ Pilot 실행은 한 번에 하나씩 순차적으로 수행하며 실행 중에�
 
 Grounding 행의 `omission`은 승인된 ground truth의 핵심 의미가 `contentText` 또는 `groundingFacts`에 충분히 반영됐는지에 대한 영상별 사람 판정입니다. 모두 반영되면 `pass`, 하나라도 양쪽 모두에서 누락되면 `fail`입니다. `hallucination`은 두 출력의 실질적인 주장을 원본 영상과 대조한 사람 판정입니다. 모두 영상에서 확인되면 `pass`, 영상에서 확인되지 않는 주장이 하나라도 있으면 `fail`입니다. Ground truth에 없다는 이유만으로 환각 처리하지 않습니다. 두 필드 모두 검토 후 신뢰성 있게 판단하기 어려우면 `uncertain`, 미검토라면 `null`이며 자동으로 채우지 않습니다. 세부 기준은 [평가 기준](rubric.md)을 따릅니다.
 
+## LLM-as-a-Judge 결과
+
+A/B Quiz에 대한 사후 보조 평가(LLM-as-a-Judge) 결과는 `results/judge/<judgeRunId>/`에만 저장하며 위 세 JSONL과 `results/raw`, `results/evaluation`에는 쓰지 않습니다. 이 하위 디렉터리는 Pilot 저장 무결성 검사 대상이 아닙니다. Judge는 Pilot 결과와 Human Evaluation을 읽기만 합니다. 계약과 파일 구조는 [Judge 프로토콜](judge-protocol.md)을 따릅니다.
+
 ## 집계 CSV
 
 세 평가를 각각 집계합니다. 모든 집계에는 `benchmarkType,method,model,promptVersion,runs,apiSuccessRate,latencyMeanMs,latencyP95Ms,meanInputTokens,meanOutputTokens,meanThinkingTokens,meanEstimatedCostUsd`와 적용 가능한 품질 지표를 포함합니다.
