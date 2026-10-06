@@ -189,7 +189,16 @@ class PilotRunner:
 
     def _base(self, benchmark_type, video_id, method, model, repetition, content_hash=None):
         self._check_storage_integrity()
-        prompt_version = self.config["prompt_version"] if benchmark_type != "video_grounding" else None
+        if benchmark_type != "video_grounding":
+            prompt_version = self.config["prompt_version"]
+        elif method == "authorized_transcript":
+            # No AI Grounding prompt is used, so there is no prompt contract to version.
+            prompt_version = None
+        else:
+            # Legacy Grounding rows keep null; new AI Grounding rows must never be silently unversioned.
+            prompt_version = self.config["video_grounding"].get("prompt_version")
+            if not isinstance(prompt_version, str) or not prompt_version.strip():
+                raise ValueError("pilot.video_grounding.prompt_version is required for AI Grounding")
         return {
             "benchmarkType": benchmark_type, "runId": uuid.uuid4().hex,
             "videoId": video_id, "method": method, "model": model,
@@ -457,6 +466,12 @@ class PilotRunner:
         methods = {item["id"]: item for item in self.config["video_grounding"]["methods"]}
         if method not in methods:
             raise ValueError("Unknown grounding method")
+        duration = None
+        if method != "authorized_transcript":
+            # Integer metadata whose precision is unknown; used as-is with no tolerance.
+            duration = self.videos[video_id].get("durationSeconds")
+            if duration is not None and (type(duration) not in (int, float) or not duration > 0):
+                raise ValueError("durationSeconds must be a positive number when recorded")
         row = self._base("video_grounding", video_id, method, methods[method].get("model"), repetition)
         row.update(groundingFacts=[], omission=None, hallucination=None,
                    contentTextApprovalStatus=None)
@@ -484,13 +499,17 @@ class PilotRunner:
                 if not isinstance(facts, list):
                     raise ProviderFailure("invalid_grounding_response")
                 for fact in facts:
+                    start = fact.get("timestampStartSeconds") if isinstance(fact, dict) else None
+                    end = fact.get("timestampEndSeconds") if isinstance(fact, dict) else None
                     if (not isinstance(fact, dict)
                             or any(not isinstance(fact.get(key), str) or not fact[key].strip()
                                    for key in ("fact", "evidenceType", "evidence"))
                             or fact["evidenceType"] not in ("speech", "visual", "unknown")
-                            or any(value is not None and (type(value) not in (int, float) or value < 0)
-                                   for value in (fact.get("timestampStartSeconds"),
-                                                 fact.get("timestampEndSeconds")))):
+                            or any(value is not None and (type(value) not in (int, float)
+                                                          or not math.isfinite(value) or value < 0
+                                                          or duration is not None and value > duration)
+                                   for value in (start, end))
+                            or start is not None and end is not None and start > end):
                         raise ProviderFailure("invalid_grounding_response")
                     row["groundingFacts"].append({
                         "fact": fact["fact"], "evidenceType": fact["evidenceType"],
@@ -505,6 +524,12 @@ class PilotRunner:
             return self._save(row, raw, normalized), content
         except ProviderFailure as exc:
             self._failure(row, provider, exc, started, response)
+            try:
+                json.dumps(normalized, allow_nan=False)
+            except ValueError:
+                # NaN/Infinity is not standard JSON and would fail the next storage integrity
+                # check; keep the error row and raw metadata but skip this diagnostic payload.
+                normalized = None
             return self._save(row, raw, normalized), None
 
     def run_grounding(self, video_id, method, repetition, provider, authorized_transcript=None):

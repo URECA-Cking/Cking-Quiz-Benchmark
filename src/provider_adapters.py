@@ -34,11 +34,17 @@ def quiz_schema():
             "required": ["promptVersion", "questions"]}
 
 
+def _elapsed_seconds(edge):
+    return {"type": ["number", "null"],
+            "description": (f"근거 구간의 {edge} 시각. 영상 시작(0초)부터의 경과 초이며 MM:SS 표기의 숫자가 아님"
+                            "(예: 01:30.5 → 90.5). 근거 위치를 특정할 수 없으면 null.")}
+
+
 def grounding_schema():
     fact = {"type": "object", "additionalProperties": False,
             "properties": {"fact": _string(), "evidenceType": {"type": "string", "enum": ["speech", "visual", "unknown"]}, "evidence": _string(),
-                           "timestampStartSeconds": {"type": ["number", "null"]},
-                           "timestampEndSeconds": {"type": ["number", "null"]}},
+                           "timestampStartSeconds": _elapsed_seconds("시작"),
+                           "timestampEndSeconds": _elapsed_seconds("끝")},
             "required": ["fact", "evidenceType", "evidence", "timestampStartSeconds", "timestampEndSeconds"]}
     return {"type": "object", "additionalProperties": False,
             "properties": {"contentText": _string(), "facts": {"type": "array", "items": fact}},
@@ -260,7 +266,11 @@ class ProviderRouter:
                       "speech는 주된 근거가 영상의 발화 또는 나레이션인 경우, "
                       "visual은 주된 근거가 화면에서 확인되는 시각 정보인 경우입니다. "
                       "발화와 화면 양쪽에 근거가 있어도 주된 근거에 따라 speech 또는 visual을 선택하세요. "
-                      "주된 근거를 speech 또는 visual 중 하나로 신뢰성 있게 분류할 수 없을 때만 unknown을 사용하세요.")
+                      "주된 근거를 speech 또는 visual 중 하나로 신뢰성 있게 분류할 수 없을 때만 unknown을 사용하세요. "
+                      "timestampStartSeconds와 timestampEndSeconds는 영상 시작(0초)부터의 경과 시간을 초 단위 숫자로 기록하세요. "
+                      "MM:SS 표기에서 콜론만 뺀 숫자를 넣지 마세요. 예: 01:30.5 → 90.5 seconds. "
+                      "timestampStartSeconds는 timestampEndSeconds보다 클 수 없고, timestampEndSeconds는 영상 길이를 넘을 수 없습니다. "
+                      "근거 위치를 특정할 수 없으면 null을 사용하세요.")
             schema = grounding_schema()
         else:
             question_count, option_count = kwargs.get("questionCount"), kwargs.get("optionCount")
