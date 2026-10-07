@@ -1,0 +1,26 @@
+judge:
+  # Post-hoc supplemental LLM-as-a-Judge for A/B Quiz sets (Issue #19). Human Evaluation stays the reference.
+  # Direct Quiz (C) is out of Judge scope: it has no shared approved contentText.
+  conditions:
+    A: gemini-3.8-flash
+    B: gpt-5.4-mini
+  # Same two Judges for Pointwise and Pairwise; neither has priority.
+  judges:
+    - id: openai_judge
+      provider: openai
+      model: gpt-6.1-sol
+      reasoning: medium
+      api_key_environment_variable: OPENAI_API_KEY
+      model_docs_checked_at: "2026-10-06"
+    - id: gemini_judge
+      provider: gemini
+      model: gemini-3.8-flash
+      reasoning: medium
+      api_key_environment_variable: GEMINI_API_KEY
+      model_docs_checked_at: "2026-10-06"
+  service_tier: standard
+  # Part of the measurement identity. Decided after a static prompt-size review, before any live run.
+  max_output_tokens:
+    pointwise: null
+    pairwise: null
+  # 실행 전 공식 문서로 model ID, 요청 필드, usage 필드, retry hint와 가격을 다시 확인한다.
