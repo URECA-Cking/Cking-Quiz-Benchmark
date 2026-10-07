@@ -43,6 +43,17 @@ GROUNDING = {
 }
 
 
+# video-grounding-v3 (configs/pilot-v2.yaml) takes "MM:SS" string timestamps: the same 61-73 s fact.
+GROUNDING_V3 = dict(GROUNDING, facts=[{"fact": "NASA measures rainfall", "evidenceType": "speech",
+                                       "evidence": "global rain and snow", "timestampStart": "01:01",
+                                       "timestampEnd": "01:13"}])
+
+
+def grounding_payload(runner):
+    """The Grounding fixture in the timestamp format of the runner's configured Grounding version."""
+    return GROUNDING_V3 if runner.config["video_grounding"]["prompt_version"] == "video-grounding-v3" else GROUNDING
+
+
 FIXTURE_RAW = {"source": "fixture"}
 
 
@@ -403,7 +414,8 @@ class PilotRunnerTest(unittest.TestCase):
                     self.assertNotIn("contentTextSha256", row)
 
     def test_grounding_timestamp_order_and_recorded_duration_contract(self):
-        # KARI has durationSeconds=227; the NASA water-cycle video has no recorded duration.
+        # KARI has durationSeconds=227 and the NASA water-cycle video 211; the last two cases run with
+        # the water-cycle duration removed, so a video without a recorded duration skips the bound.
         cases = [("kari-microgravity-2024", 104.5, 104.5, True),
                  ("kari-microgravity-2024", 111.3, 104.5, False),
                  ("kari-microgravity-2024", 200, 227, True),
@@ -412,9 +424,13 @@ class PilotRunnerTest(unittest.TestCase):
                  ("kari-microgravity-2024", None, 228, False),
                  ("kari-microgravity-2024", None, 50, True),
                  ("kari-microgravity-2024", 50, None, True),
+                 (VIDEO, 100, 211, True),
+                 (VIDEO, 100, 211.5, False),
                  (VIDEO, 100, 999, True),
                  (VIDEO, 999, None, True)]
-        for video_id, start, end, accepted in cases:
+        for number, (video_id, start, end, accepted) in enumerate(cases):
+            if number == len(cases) - 2:
+                del self.runner.videos[VIDEO]["durationSeconds"]
             with self.subTest(video_id=video_id, start=start, end=end):
                 fact = dict(GROUNDING["facts"][0], timestampStartSeconds=start, timestampEndSeconds=end)
                 row = self.runner.run_grounding(
@@ -729,13 +745,13 @@ class PilotRunnerTest(unittest.TestCase):
         self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
         other_video = "nasa-methane-2020"
         self.run_approved_quiz(other_video, "gpt-5.4-mini", 1, CONTENT + " other", provider)
-        # pilot-v2 Quiz needs a reviewed video-grounding-v2 source; its manifest entry is separate.
+        # pilot-v2 Quiz needs a reviewed video-grounding-v3 source; its manifest entry is separate.
         shutil.copyfile(ROOT / "configs" / "pilot-v2.yaml", self.repository / "configs" / "pilot-v2.yaml")
         next_version = PilotRunner(self.repository, self.repository / "results" / "next",
                                    self.repository / "configs" / "pilot-v2.yaml")
         changed = CONTENT + " changed"
         source = next_version.run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(
-            {"grounding": {"normalized": dict(GROUNDING, contentText=changed), "responseBody": FIXTURE_RAW}}))
+            {"grounding": {"normalized": dict(GROUNDING_V3, contentText=changed), "responseBody": FIXTURE_RAW}}))
         next_version.review_grounding(source["runId"], APPROVER,
                                       {item: "pass" for item in grounding_review.REVIEW_ITEMS})
         next_version.run_quiz(VIDEO, "gpt-5.4-mini", 1, changed, provider, source_grounding_run_id=source["runId"])
@@ -1092,7 +1108,8 @@ class PilotV2QuizControlsTest(unittest.TestCase):
     def approved(self, runner=None, repetition=1, content=CONTENT):
         runner = runner or self.v2
         source = runner.run_grounding(VIDEO, "gemini_video", repetition, SimulatedApiFixture(
-            {"grounding": {"normalized": dict(GROUNDING, contentText=content), "responseBody": FIXTURE_RAW}}))
+            {"grounding": {"normalized": dict(grounding_payload(runner), contentText=content),
+                           "responseBody": FIXTURE_RAW}}))
         if runner is self.v2:
             runner.review_grounding(source["runId"], APPROVER, ALL_PASS)
         else:
@@ -1329,7 +1346,7 @@ class PilotV2QuizControlsTest(unittest.TestCase):
 
 
 class PilotV2GroundingReviewTest(unittest.TestCase):
-    """Pilot v2 (video-grounding-v2) human Grounding checklist and its A/B gate."""
+    """Pilot v2 (video-grounding-v3; v2 for the paused first run) human Grounding checklist and its A/B gate."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1358,8 +1375,10 @@ class PilotV2GroundingReviewTest(unittest.TestCase):
                 if path.is_file() and path.name != PilotRunner.LOCK_FILE}
 
     def grounding(self, runner=None, video_id=VIDEO, repetition=1):
-        provider = SimulatedApiFixture({"grounding": {"normalized": GROUNDING, "responseBody": FIXTURE_RAW}})
-        row = (runner or self.v2).run_grounding(video_id, "gemini_video", repetition, provider)
+        runner = runner or self.v2
+        provider = SimulatedApiFixture({"grounding": {"normalized": grounding_payload(runner),
+                                                      "responseBody": FIXTURE_RAW}})
+        row = runner.run_grounding(video_id, "gemini_video", repetition, provider)
         self.assertEqual(row["apiStatus"], "success")
         return row
 
@@ -1377,7 +1396,7 @@ class PilotV2GroundingReviewTest(unittest.TestCase):
         self.assertEqual((self.v1.config["prompt_version"], self.v1.config["video_grounding"]["prompt_version"]),
                          ("pilot-v1", "video-grounding-v1"))
         self.assertEqual((self.v2.config["prompt_version"], self.v2.config["video_grounding"]["prompt_version"]),
-                         ("pilot-v2", "video-grounding-v2"))
+                         ("pilot-v2", "video-grounding-v3"))
         for config in (self.v1.config, self.v2.config):
             config.pop("prompt_version")
             config["video_grounding"].pop("prompt_version")
@@ -1389,8 +1408,8 @@ class PilotV2GroundingReviewTest(unittest.TestCase):
         self.assertEqual(self.v1.config, self.v2.config)
 
     def test_runner_passes_the_grounding_prompt_version_to_the_provider(self):
-        for runner, version in ((self.v1, "video-grounding-v1"), (self.v2, "video-grounding-v2")):
-            provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+        for runner, version in ((self.v1, "video-grounding-v1"), (self.v2, "video-grounding-v3")):
+            provider = FixtureProvider({"grounding": {"raw": grounding_payload(runner)}})
             row = runner.run_grounding(VIDEO, "gemini_video", 1, provider)
             self.assertEqual((row["promptVersion"], provider.calls[0]["promptVersion"]), (version, version))
 
@@ -1402,9 +1421,10 @@ class PilotV2GroundingReviewTest(unittest.TestCase):
                          for number in (1, 2))
         self.grounding_file().write_text(legacy, encoding="utf-8")
         provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+        v2_provider = FixtureProvider({"grounding": {"raw": GROUNDING_V3}})
         self.assertEqual(self.v1.run_grounding(VIDEO, "gemini_video", 1, provider)["attempt"], 3)
-        self.assertEqual(self.v2.run_grounding(VIDEO, "gemini_video", 1, provider)["attempt"], 1)
-        self.assertEqual(self.v2.run_grounding(VIDEO, "gemini_video", 1, provider)["attempt"], 2)
+        self.assertEqual(self.v2.run_grounding(VIDEO, "gemini_video", 1, v2_provider)["attempt"], 1)
+        self.assertEqual(self.v2.run_grounding(VIDEO, "gemini_video", 1, v2_provider)["attempt"], 2)
         self.assertEqual(self.v1.run_grounding(VIDEO, "gemini_video", 1, provider)["attempt"], 4)
         self.assertTrue(self.grounding_file().read_text(encoding="utf-8").startswith(legacy))
 
@@ -1450,7 +1470,7 @@ class PilotV2GroundingReviewTest(unittest.TestCase):
         v1 = self.grounding(self.v1)
         failed = self.v2.run_grounding(VIDEO, "gemini_video", 2, SimulatedApiFixture(
             {"grounding": {"errorCategory": "server_error"}}))
-        invalid = dict(GROUNDING, facts=[dict(GROUNDING["facts"][0], evidenceType="narration")])
+        invalid = dict(GROUNDING_V3, facts=[dict(GROUNDING_V3["facts"][0], evidenceType="narration")])
         invalid_row = self.v2.run_grounding("kari-microgravity-2024", "gemini_video", 1, SimulatedApiFixture(
             {"grounding": {"normalized": invalid, "responseBody": FIXTURE_RAW}}))
         self.assertEqual(invalid_row["errorCategory"], "invalid_grounding_response")
@@ -1657,7 +1677,7 @@ class PilotV2GroundingReviewTest(unittest.TestCase):
                 self.assertEqual(provider.calls, [])
                 self.assertEqual(self.snapshot(), before)
         # Legacy null and known versions stay valid; the Quiz row keeps its Pilot version (pilot-v1).
-        for value in (None, "video-grounding-v1", "video-grounding-v2"):
+        for value in (None, "video-grounding-v1", "video-grounding-v2", "video-grounding-v3"):
             with self.subTest(value=value):
                 store(value)
                 self.v1._check_storage_integrity()
@@ -1740,6 +1760,140 @@ class PilotV2GroundingReviewTest(unittest.TestCase):
         self.assertEqual((quiz["apiStatus"], len(provider.calls)), ("success", 1))
 
 
+ISSUE_31_MMSS = [("00:57.2", "01:11.4"), ("01:12.5", "01:20.7"), ("01:41.2", "01:53.2"),
+                 ("02:26.7", "02:34.6"), ("02:42.4", "02:53.9"), ("02:55.4", "03:04.5")]
+ISSUE_31_SECONDS = [(57.2, 71.4), (72.5, 80.7), (101.2, 113.2), (146.7, 154.6), (162.4, 173.9), (175.4, 184.5)]
+
+
+class PilotV2GroundingTimestampTest(unittest.TestCase):
+    """video-grounding-v3: the Provider writes "MM:SS" strings, the runner stores elapsed seconds (Issue #31)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.repository = Path(self.temp.name)
+        (self.repository / "configs").mkdir()
+        (self.repository / "data").mkdir()
+        for name in ("pilot.yaml", "pilot-v2.yaml"):
+            shutil.copyfile(ROOT / "configs" / name, self.repository / "configs" / name)
+        shutil.copyfile(ROOT / "data" / "videos.jsonl", self.repository / "data" / "videos.jsonl")
+        self.results = self.repository / "results"
+        self.v2 = PilotRunner(self.repository, self.results, self.repository / "configs" / "pilot-v2.yaml")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def facts(self, pairs):
+        return [dict(GROUNDING_V3["facts"][0], timestampStart=start, timestampEnd=end) for start, end in pairs]
+
+    def run_v3(self, facts, video_id=VIDEO, repetition=1):
+        provider = SimulatedApiFixture({"grounding": {"normalized": dict(GROUNDING_V3, facts=facts),
+                                                      "responseBody": FIXTURE_RAW}})
+        return self.v2.run_grounding(video_id, "gemini_video", repetition, provider)
+
+    def assert_rejected(self, row):
+        self.assertEqual((row["apiStatus"], row["errorCategory"]), ("error", "invalid_grounding_response"))
+        self.assertEqual(row["groundingFacts"], [])
+        self.assertNotIn("contentTextSha256", row)
+
+    def test_issue_31_mmss_strings_are_stored_as_elapsed_seconds(self):
+        row = self.run_v3(self.facts(ISSUE_31_MMSS))
+        self.assertEqual((row["apiStatus"], row["promptVersion"]), ("success", "video-grounding-v3"))
+        stored = [(fact["timestampStartSeconds"], fact["timestampEndSeconds"]) for fact in row["groundingFacts"]]
+        self.assertEqual(stored, ISSUE_31_SECONDS)
+        self.assertTrue(all("timestampStart" not in fact for fact in row["groundingFacts"]))
+        # The evaluation file keeps the stored contract; the Provider's strings do not leak into it.
+        evaluation_path = self.results / "evaluation" / (row["runId"] + ".json")
+        evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+        self.assertEqual(evaluation["contentText"], CONTENT)
+        self.assertEqual([(fact["timestampStartSeconds"], fact["timestampEndSeconds"]) for fact in evaluation["facts"]],
+                         ISSUE_31_SECONDS)
+        self.assertEqual({key for fact in evaluation["facts"] for key in fact},
+                         {"fact", "evidenceType", "evidence", "timestampStartSeconds", "timestampEndSeconds"})
+        self.assertNotIn('"01:41.2"', evaluation_path.read_text(encoding="utf-8"))
+        self.assertEqual(row["contentTextSha256"], hashlib.sha256(CONTENT.encode("utf-8")).hexdigest())
+        # The stored row is a normal Pilot v2 Grounding: it can be reviewed and feed Quiz A.
+        self.v2._check_storage_integrity()
+        self.v2.review_grounding(row["runId"], APPROVER, ALL_PASS)
+        quiz = self.v2.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, SimulatedApiFixture(
+            {"quiz": {"normalized": dict(QUIZ, promptVersion="pilot-v2"), "responseBody": FIXTURE_RAW}}),
+            source_grounding_run_id=row["runId"])
+        self.assertEqual(quiz["apiStatus"], "success")
+
+    def test_malformed_or_numeric_timestamps_fail_closed(self):
+        good = GROUNDING_V3["facts"][0]
+        without = lambda key: {name: value for name, value in good.items() if name != key}
+        cases = {"seconds >= 60": dict(good, timestampStart="01:75.0"),
+                 "negative": dict(good, timestampStart="-01:01"),
+                 "non-numeric": dict(good, timestampEnd="ab:cd"),
+                 "missing separator": dict(good, timestampStart="0101.0"),
+                 "hours": dict(good, timestampEnd="00:01:13"),
+                 "number (the pre-fix form)": dict(good, timestampStart=141.2),
+                 "bool": dict(good, timestampEnd=True),
+                 "missing timestampEnd": without("timestampEnd"),
+                 "seconds fields instead": dict(without("timestampStart"), timestampStartSeconds=61)}
+        for name, fact in cases.items():
+            with self.subTest(case=name):
+                self.assert_rejected(self.run_v3([fact]))
+
+    def test_a_later_malformed_fact_leaves_no_partial_facts(self):
+        good = ("01:01", "01:13")
+        for position in (1, 2):  # the second fact, and the last of three
+            with self.subTest(position=position):
+                pairs = [good, good, good]
+                pairs[position] = ("01:75", "01:80.0" if position == 2 else "01:13")
+                row = self.run_v3(self.facts(pairs))
+                self.assert_rejected(row)  # error, invalid_grounding_response, groundingFacts=[], no hash
+                self.assertIsNone(row["contentTextApprovalStatus"])
+                stored = [json.loads(line) for line in
+                          (self.results / "video-grounding.jsonl").read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(stored[-1]["groundingFacts"], [])
+                self.assertNotIn("contentTextSha256", stored[-1])
+
+    def test_null_timestamps_keep_their_meaning(self):
+        row = self.run_v3(self.facts([(None, None), (None, "01:13"), ("01:01", None)]))
+        self.assertEqual(row["apiStatus"], "success")
+        self.assertEqual([(fact["timestampStartSeconds"], fact["timestampEndSeconds"]) for fact in row["groundingFacts"]],
+                         [(None, None), (None, 73.0), (61.0, None)])
+
+    def test_converted_timestamps_keep_the_order_and_duration_checks(self):
+        # durationSeconds: nasa-water-cycle-2019 211, kari-microgravity-2024 227.
+        self.assert_rejected(self.run_v3(self.facts([("01:13", "01:01")])))  # start > end after conversion
+        self.assert_rejected(self.run_v3(self.facts([("03:00", "03:31.1")])))  # 211.1 > 211
+        self.assert_rejected(self.run_v3(self.facts([("03:00", "03:47.1")]), "kari-microgravity-2024"))
+        self.assertEqual(self.run_v3(self.facts([("01:13", "01:13")]), repetition=2)["apiStatus"], "success")
+        self.assertEqual(self.run_v3(self.facts([("03:00", "03:31.0")]), "kari-microgravity-2024")["apiStatus"],
+                         "success")
+
+    def pre_fix_grounding(self, timestamps):
+        """A video-grounding-v2 Grounding like the paused first Pilot v2 run (numeric MM:SS digits)."""
+        runner = PilotRunner(self.repository, self.results, self.repository / "configs" / "pilot-v2.yaml")
+        runner.config["video_grounding"]["prompt_version"] = "video-grounding-v2"
+        facts = [dict(GROUNDING["facts"][0], timestampStartSeconds=start, timestampEndSeconds=end)
+                 for start, end in timestamps]
+        return runner, runner.run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(
+            {"grounding": {"normalized": dict(GROUNDING, facts=facts), "responseBody": FIXTURE_RAW}}))
+
+    def test_recorded_duration_catches_only_out_of_range_mmss_numbers(self):
+        # The pre-fix v2 values: durationSeconds=211 rejects 226.7-304.5, but 141.2 (01:41.2) still passes.
+        _, row = self.pre_fix_grounding([(226.7, 234.6)])
+        self.assertEqual(row["errorCategory"], "invalid_grounding_response")
+        _, row = self.pre_fix_grounding([(141.2, 153.2)])
+        self.assertEqual((row["apiStatus"], row["groundingFacts"][0]["timestampStartSeconds"]), ("success", 141.2))
+
+    def test_pilot_v2_quiz_refuses_a_pre_fix_video_grounding_v2_source(self):
+        runner, source = self.pre_fix_grounding([(57.2, 111.4)])
+        runner.review_grounding(source["runId"], APPROVER, ALL_PASS)
+        before = {path: path.read_bytes() for path in self.repository.rglob("*")
+                  if path.is_file() and path.name != PilotRunner.LOCK_FILE}
+        provider = SimulatedApiFixture({"quiz": {"normalized": dict(QUIZ, promptVersion="pilot-v2"),
+                                                 "responseBody": FIXTURE_RAW}})
+        with self.assertRaisesRegex(ValueError, "does not belong to this Pilot experiment"):
+            self.v2.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider, source_grounding_run_id=source["runId"])
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(before, {path: path.read_bytes() for path in self.repository.rglob("*")
+                                  if path.is_file() and path.name != PilotRunner.LOCK_FILE})
+
+
 class BlockingProvider(SimulatedApiFixture):
     """Fake API that holds the operation inside its critical section until released."""
 
@@ -1755,7 +1909,7 @@ class BlockingProvider(SimulatedApiFixture):
 
 
 BUSY = "already in progress for this results directory"
-GROUNDED = {"grounding": {"normalized": GROUNDING, "responseBody": FIXTURE_RAW}}
+GROUNDED = {"grounding": {"normalized": GROUNDING_V3, "responseBody": FIXTURE_RAW}}
 
 
 class PilotResultsLockTest(unittest.TestCase):

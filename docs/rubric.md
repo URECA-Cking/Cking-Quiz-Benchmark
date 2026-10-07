@@ -21,9 +21,9 @@ Gemini 영상 분석과 **해당 영상에 사용할 권한이 확인된** trans
 - `omission`: 승인된 ground truth의 각 핵심 의미가 `contentText` 또는 `groundingFacts` 중 하나 이상에 충분히 반영되면 `pass`, 하나 이상의 핵심 의미가 양쪽 모두에서 빠졌으면 `fail`입니다. 검토했지만 의미 포함 여부를 신뢰성 있게 결정하기 어려우면 `uncertain`, 아직 검토하지 않았으면 `null`입니다.
 - `hallucination`: `contentText`와 `groundingFacts`의 실질적인 주장을 원본 영상과 대조합니다. 모두 영상에서 확인되면 `pass`, 영상에서 확인되지 않는 주장이 하나 이상 있으면 `fail`입니다. 검토했지만 영상 근거 여부를 신뢰성 있게 결정하기 어려우면 `uncertain`, 아직 검토하지 않았으면 `null`입니다. Ground truth에 없는 주장도 영상에서 확인되면 그 이유만으로 환각이 아닙니다.
 
-### Pilot v2 Grounding 사람 검수 (`video-grounding-v2`)
+### Pilot v2 Grounding 사람 검수 (`video-grounding-v2`·`video-grounding-v3`)
 
-Pilot v2(`pilot-v2`)는 pilot-v1의 단순 반복이 아니라 개선된 조건의 별도 실험입니다. Grounding prompt `video-grounding-v2`는 v1의 facts 규칙에 다음 `contentText` 계약을 더합니다: (1) 영상의 핵심 정보를 충분히 포함, (2) 영상에 근거하지 않은 사실 금지, (3) 숫자·고유명사·인과관계 등 구체적인 정보 보존, (4) 서로 다른 Quiz 문제를 만들 수 있는 서로 구별되는 정보 보존, (5) 한국어, (6) 같은 Grounding의 facts와 모순 금지, (7) 메타 요약 문장 금지. 고정 최소 길이는 두지 않습니다. A/B Quiz의 공통 입력은 계속 승인된 `contentText`뿐이며 facts는 Quiz 입력에 넣지 않습니다.
+Pilot v2(`pilot-v2`)는 pilot-v1의 단순 반복이 아니라 개선된 조건의 별도 실험입니다. Grounding prompt `video-grounding-v2`는 v1의 facts 규칙에 다음 `contentText` 계약을 더합니다: (1) 영상의 핵심 정보를 충분히 포함, (2) 영상에 근거하지 않은 사실 금지, (3) 숫자·고유명사·인과관계 등 구체적인 정보 보존, (4) 서로 다른 Quiz 문제를 만들 수 있는 서로 구별되는 정보 보존, (5) 한국어, (6) 같은 Grounding의 facts와 모순 금지, (7) 메타 요약 문장 금지. 고정 최소 길이는 두지 않습니다. A/B Quiz의 공통 입력은 계속 승인된 `contentText`뿐이며 facts는 Quiz 입력에 넣지 않습니다. 현재 Pilot v2 설정의 `video-grounding-v3`는 같은 규칙에 timestamp 표현만 바꿉니다. Provider는 `"MM:SS"` 문자열을 쓰고 실행기가 경과 초로 변환해 저장합니다([결과 형식](results-format.md)). 검수 항목과 판정 규칙은 v2와 같습니다.
 
 v2 Grounding은 사람이 아래 다섯 항목을 각각 `pass`, `fail`, `uncertain`으로 판정해야 Quiz에 쓸 수 있습니다. 판정은 사람이 입력하며 코드가 만들지 않습니다.
 
@@ -35,7 +35,7 @@ v2 Grounding은 사람이 아래 다섯 항목을 각각 `pass`, `fail`, `uncert
 | `koreanConsistency` | 한국어로 일관되게 작성됐는가 |
 | `contentTextContractCompliance` | 위 `contentText` 계약(구체성, 서로 구별되는 정보, 메타 요약 금지 등)을 지키는가 |
 
-다섯 항목이 모두 `pass`면 `approved`, 하나라도 `fail` 또는 `uncertain`이면 `rejected`입니다. 이 전체 상태만 판정에서 결정적으로 유도합니다. `rejected`는 품질 판정이며 technical failure가 아니므로 재시도 대상이 아닙니다. rejected Grounding으로는 A/B Quiz를 실행하지 않습니다. 후보 선택 편향을 막기 위해 v2 Grounding 조건(`videoId`·`method`·`model`·`repetition`·`video-grounding-v2`)에는 성공한 Grounding 후보를 하나만 둡니다. 성공이 하나라도 생기면 검수 결과와 관계없이 그 조건은 다시 생성하지 않으며, technical failure 뒤에만 다음 attempt를 실행합니다. 재생성이나 여러 후보 중 선택이 필요하면 별도의 사람 결정으로 다룹니다. 한 Pilot v2 실험의 결과는 하나의 결과 디렉터리에서 관리합니다. 기존 `omission`·`hallucination`과 fact별 판정은 그대로 별도 기록입니다. pilot-v1과 legacy Grounding에는 이 검수를 요구하지 않습니다.
+다섯 항목이 모두 `pass`면 `approved`, 하나라도 `fail` 또는 `uncertain`이면 `rejected`입니다. 이 전체 상태만 판정에서 결정적으로 유도합니다. `rejected`는 품질 판정이며 technical failure가 아니므로 재시도 대상이 아닙니다. rejected Grounding으로는 A/B Quiz를 실행하지 않습니다. 후보 선택 편향을 막기 위해 v2 Grounding 조건(`videoId`·`method`·`model`·`repetition`·Grounding `promptVersion`)에는 성공한 Grounding 후보를 하나만 둡니다. 성공이 하나라도 생기면 검수 결과와 관계없이 그 조건은 다시 생성하지 않으며, technical failure 뒤에만 다음 attempt를 실행합니다. 재생성이나 여러 후보 중 선택이 필요하면 별도의 사람 결정으로 다룹니다. 한 Pilot v2 실험의 결과는 하나의 결과 디렉터리에서 관리합니다. 기존 `omission`·`hallucination`과 fact별 판정은 그대로 별도 기록입니다. pilot-v1과 legacy Grounding에는 이 검수를 요구하지 않습니다.
 
 ## Quiz Generation Benchmark
 
