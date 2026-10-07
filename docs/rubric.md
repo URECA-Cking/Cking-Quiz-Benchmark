@@ -53,6 +53,22 @@ Pilot v2 Quiz A/B·Direct C는 정확히 3문항을 요청하되 schema 배열 �
 | 안정성 | 같은 조건 반복 결과와 실패율 | 품질 변동 확인 |
 | 지연·사용량·비용 | latency, input/output/thinking tokens, 제공된 usage, 공식 가격 기준 추정 | 가격 적용 조건 검토 |
 
+### Pilot v2 Human Quiz 블라인드 평가
+
+Pilot v2의 Quiz A(Gemini Grounding 승인 contentText → Gemini Quiz), B(같은 contentText → OpenAI Quiz), C(YouTube → Gemini Direct Quiz)를 하나의 블라인드 세션에서 같은 기준으로 평가합니다. 생성 과정이 아니라 최종 Quiz Set이 원본 영상 기준으로 얼마나 좋은지를 봅니다. 평가자는 원본 YouTube 영상과 Quiz Set만 보며, A/B에도 contentText를 보여주지 않습니다. 모든 판정은 `pass`, `fail`, `uncertain` 중 하나이며 제출할 때 비워 둘 수 없습니다.
+
+문항별 판정은 기존 6개 항목(`answerAccuracy`, `uniqueAnswer`, `evidenceSupportsAnswer`, `videoGrounding`, `koreanQuality`, `hallucination`)과 `reviewNote`를 그대로 사용합니다. Quiz Set 전체에는 다음 3개 항목과 set-level `reviewNote`를 판정합니다.
+
+| 항목 | pass | fail | uncertain |
+| --- | --- | --- | --- |
+| `coverage` | 3문항이 영상의 서로 다른 핵심 내용을 적절히 다루고 중요한 핵심을 명백히 놓치지 않음 | 한 부분·세부사항에 편중되거나 영상의 명확한 핵심 내용이 빠짐 | 영상만으로 신뢰성 있게 판단하기 어려움 |
+| `redundancy` | 사실상 같은 사실·정답을 묻는 문항 중복이 없음 | 2개 이상의 문항이 사실상 같은 내용을 묻거나, 한 문제의 정답이 다른 문제의 답을 사실상 노출함 | 겹침이 실질적인 중복인지 판단하기 어려움 |
+| `learningValue` | 3문항 전체가 영상의 핵심 내용 이해를 확인하는 학습용 Quiz Set으로 유용함 | 사소한 정보·표현 위주이거나, 영상 없이도 답할 수 있거나, 결함 문항 때문에 학습 확인용 세트로 기능하지 못함 | 신뢰성 있게 판단하기 어려움 |
+
+정상 평가 대상은 `apiStatus=success`, `parseStatus=pass`, `questionCount=3`이고 모든 문항을 정상적으로 표시할 수 있는 Quiz Set입니다. validator 실패(예: `evidence_not_in_content`)만으로는 제외하지 않습니다. 그 밖의 조건은 평가 제외 사유로 기록합니다. `notRun`은 해당 조건에 기록된 실행 시도가 하나도 없다는 뜻이며 Quiz 모델 실패가 아닙니다. Grounding이 rejected되어 A/B Quiz를 의도적으로 실행하지 않은 경우도 여기에 해당합니다. `noApiSuccess`는 실행 시도는 있었지만 `apiStatus=success`가 하나도 없었다는 뜻(technical/API 실패)입니다. 그 밖에 `parseFailed`, `questionCountMismatch`, `invalidQuestionStructure`가 있습니다. `notRun`과 `noApiSuccess`를 같은 신뢰성 실패로 합산하지 않습니다. 평가 제외는 사람 평균에서 빠진다는 뜻일 뿐이며, 생성·검증 실패 자체는 Pilot 결과에 그대로 남아 모델 신뢰성 결과로 함께 보고해야 합니다. Human 세션은 원칙적으로 Pilot v2 생성 절차를 마친 뒤 만듭니다. 세션 생성은 모든 조건의 실행 완료를 요구하지 않으므로, 생성 도중에 만든 세션에서는 아직 실행하지 않은 조건이 `notRun`으로 기록됩니다.
+
+알려진 블라인드 한계: `evidenceSupportsAnswer` 판정을 위해 `sourceEvidence`를 보여주므로, A/B는 같은 contentText를, C는 영상을 인용하는 문체 차이로 조건을 간접 추측할 가능성이 일부 있습니다. 조건, model, provider, method, runId 같은 직접적인 조건 metadata는 내보내지 않습니다.
+
 ## End-to-End Benchmark
 
 Gemini Grounding → Gemini Quiz, Gemini Grounding → OpenAI Quiz, Gemini 직접 Quiz, 권한 있는 transcript → 두 Quiz 모델을 각각 실행합니다. Grounding과 Quiz 결과를 별도 실행 ID로 보존해 실패 계층, 전체 지연·비용, 최종 퀴즈 품질을 함께 기록합니다. `beCompatibility=pass`와 `beCompatibilityRate`는 Benchmark 내부 로컬 검사 통과(율)이며 실제 Cking-BE validator 실행 결과가 아닙니다. Grounding에는 이 필드를 적용하지 않습니다. 직접 Quiz는 고정 `contentText`가 없어 동일한 로컬 evidence/contentText 검사를 할 수 없으므로 `beCompatibility=not_applicable`이며 해당 통과율의 분모에 넣지 않습니다. 이는 직접 Quiz의 품질·정답 정확성·실제 BE 호환성 통과를 뜻하지 않습니다.
