@@ -7,7 +7,8 @@ from pathlib import Path
 from src.judge_client import (JudgeCallFailure, JudgeFixtureClient, JudgeHttpClient, JudgePolicy, estimate_cost,
                               parse_response)
 from src.judge_eligibility import SourceIntegrityError
-from src.judge_runner import JudgeRunner, cost_summary, measurement_states, preflight_live_policy
+from src.judge_runner import (JudgeRunner, cost_summary, measurement_states, preflight_live_policy,
+                              run_expenditure)
 from src.pilot_runner import PilotRunner
 from tests.judge_fixtures import build_synthetic_pilot, default_outcome, pairwise_output, pointwise_output
 
@@ -546,6 +547,153 @@ class CachedCostGuardTest(unittest.TestCase):
             self.runner.start(client)
         self.assertEqual(client.calls, [])
         self.assertFalse((self.results / "judge").exists())
+
+
+def gemini_usage_response(cached=None, present=True, inputs=1000, text="{}"):
+    usage = {"total_input_tokens": inputs, "total_output_tokens": 300, "total_thought_tokens": 100}
+    if present:
+        usage["total_cached_tokens"] = cached
+    return (200, {"status": "completed", "model": "gemini-3.8-flash", "usage": usage,
+                  "steps": [{"type": "model_output", "content": [{"type": "text", "text": text}]}]}, None)
+
+
+class GeminiCachedCostTest(unittest.TestCase):
+    PRICE = {"input": 0.75, "output": 3.75, "cachedInput": 0.075}
+
+    def test_cached_usage_parsing_and_cost(self):
+        normal = (1000 * 0.75 + (300 + 100) * 3.75) / 1e6
+        for present, cached in ((False, None), (True, None), (True, 0)):
+            with self.subTest(present=present, cached=cached):
+                usage = parse_response("gemini", gemini_usage_response(cached, present)[1])["usage"]
+                self.assertNotIn("invalidFields", usage)
+                self.assertAlmostEqual(estimate_cost("gemini", usage, self.PRICE), normal)
+        cached_usage = parse_response("gemini", gemini_usage_response(200)[1])["usage"]
+        self.assertEqual((cached_usage["cachedInputTokens"], cached_usage.get("invalidFields")), (200, None))
+        self.assertIsNone(estimate_cost("gemini", cached_usage, self.PRICE))  # semantics not documented
+        for cached, reason in (("200", "cachedInputTokens"), ([], "cachedInputTokens"), ({}, "cachedInputTokens"),
+                               (True, "cachedInputTokens"), (-1, "cachedInputTokens"),
+                               (1500, "cachedInputTokensExceedInput")):
+            with self.subTest(cached=cached):
+                usage = parse_response("gemini", gemini_usage_response(cached)[1])["usage"]
+                self.assertIn(reason, usage["invalidFields"])
+                self.assertIsNone(estimate_cost("gemini", usage, self.PRICE))
+
+    def test_unknown_cached_cost_keeps_reservation_and_json_is_standard(self):
+        policy = live_policy()
+        policy.prices["gemini"] = dict(self.PRICE, reference="doc", checkedAt="2026-10-07")
+        estimate = policy.estimate("pointwise", "gemini")
+        policy.total_cost_limit = estimate * 1.5
+        client = JudgeHttpClient(policy, {}, transport=FakeTransport(gemini_usage_response(200),
+                                                                     gemini_usage_response(0)),
+                                 sleep=lambda seconds: None, api_keys={"gemini": "k"})
+        result = client.call("gemini", "pointwise", {})
+        self.assertIsNone(result["estimatedCostUsd"])
+        self.assertEqual((result["httpRequests"][0]["reservedUsd"], result["httpRequests"][0]["settledUsd"]),
+                         (estimate, None))
+        self.assertEqual(client.reserved_cost, estimate)
+        strict_json(json.dumps(result, allow_nan=False))
+        with self.assertRaises(JudgeCallFailure) as caught:
+            client.call("gemini", "pointwise", {})
+        self.assertEqual(caught.exception.category, "live_guard")
+
+
+class ResumeRunGuardTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.repository = Path(self.temp.name)
+        self.results = build_synthetic_pilot(self.repository)
+        self.runner = JudgeRunner(self.repository, max_output_tokens=TOKENS, sleep=lambda seconds: None)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    @staticmethod
+    def client(transport, **overrides):
+        return JudgeHttpClient(live_policy(**overrides), {}, transport=transport, sleep=lambda seconds: None,
+                               api_keys={"openai": "k", "gemini": "k"})
+
+    def attempts(self, run_id):
+        path = self.results / "judge" / run_id / "attempts.jsonl"
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def status(self, run_id):
+        return json.loads((self.results / "judge" / run_id / "run.json").read_text(encoding="utf-8"))["status"]
+
+    def stopped_run(self, transport, **overrides):
+        manifest = self.runner.start(self.client(transport, **overrides))
+        self.assertEqual(manifest["status"], "stopped")
+        return manifest["judgeRunId"]
+
+    def assert_refused(self, run_id, client, transport):
+        before = self.attempts(run_id)
+        with self.assertRaises(ValueError):
+            self.runner.resume(run_id, client)
+        self.assertEqual((transport.calls, self.attempts(run_id), self.status(run_id)), ([], before, "stopped"))
+
+    def test_run_expenditure_counts_every_request(self):
+        attempts = [{"httpRequests": [{"reservedUsd": 0.01, "settledUsd": 0.004},
+                                      {"reservedUsd": 0.01, "settledUsd": None}]}, {"httpRequests": []}]
+        requests, spent = run_expenditure(attempts)
+        self.assertEqual(requests, 2)
+        self.assertAlmostEqual(spent, 0.014)
+        for entry in ({"settledUsd": 0.004}, {"reservedUsd": 0.01, "settledUsd": float("nan")},
+                      {"reservedUsd": -1.0}):
+            with self.assertRaises(ValueError):
+                run_expenditure([{"httpRequests": [entry]}])
+
+    def test_resume_continues_from_persisted_requests_and_spend(self):
+        # KARI A succeeds (known cost), KARI B gets a 400 -> stopped after 2 of 4 allowed requests.
+        run_id = self.stopped_run(FakeTransport(openai_usage_response(0, text=pointwise_output([0, 1, 2])),
+                                                (400, {}, None)), http_request_limit=4)
+        requests, spent = run_expenditure(self.attempts(run_id))
+        estimate = live_policy().estimate("pointwise", "openai")
+        self.assertEqual(requests, 2)
+        self.assertAlmostEqual(spent, (1000 * 1.0 + 300 * 2.0) / 1e6 + estimate)
+        transport = FakeTransport(openai_usage_response(0, text=pointwise_output([0, 1, 2])),
+                                  openai_usage_response(0, text=pointwise_output([0, 1, 2])))
+        client = self.client(transport, http_request_limit=4)
+        manifest = self.runner.resume(run_id, client)
+        # Only N - k = 2 more requests were allowed before the run-level request guard stopped the run.
+        self.assertEqual((len(transport.calls), manifest["stopReason"], client.requests_made), (2, "live_guard", 4))
+        self.assertAlmostEqual(client.reserved_cost, run_expenditure(self.attempts(run_id))[1])
+
+    def test_unknown_cost_reservation_survives_resume(self):
+        estimate = live_policy().estimate("pointwise", "openai")
+        malformed = CachedCostGuardTest.details_response("invalid", text=pointwise_output([0, 1, 2]))
+        run_id = self.stopped_run(FakeTransport(malformed), total_cost_limit=estimate * 1.5)
+        self.assertEqual(run_expenditure(self.attempts(run_id)), (1, estimate))
+        transport = FakeTransport()
+        self.assert_refused(run_id, self.client(transport, total_cost_limit=estimate * 1.5), transport)
+
+    def test_exhausted_request_limit_is_refused_before_any_call(self):
+        run_id = self.stopped_run(FakeTransport((400, {}, None)), http_request_limit=1)
+        transport = FakeTransport(openai_usage_response(0))
+        self.assert_refused(run_id, self.client(transport, http_request_limit=1), transport)
+
+    def test_changed_operational_settings_are_refused(self):
+        run_id = self.stopped_run(FakeTransport((400, {}, None)))
+        for overrides in ({"total_cost_limit": 20.0}, {"http_request_limit": 99}, {"per_call_cost_limit": 2.0},
+                          {"timeout_seconds": 60}, {"estimated_input_tokens": {"pointwise": 2000, "pairwise": 1000}}):
+            with self.subTest(overrides=overrides):
+                transport = FakeTransport(openai_usage_response(0))
+                self.assert_refused(run_id, self.client(transport, **overrides), transport)
+        changed_price = live_policy()
+        changed_price.prices["openai"]["checkedAt"] = "2026-12-31"
+        transport = FakeTransport(openai_usage_response(0))
+        self.assert_refused(run_id, JudgeHttpClient(changed_price, {}, transport=transport, sleep=lambda s: None,
+                                                    api_keys={"openai": "k", "gemini": "k"}), transport)
+
+    def test_legacy_live_run_without_reservations_is_refused(self):
+        run_id = self.stopped_run(FakeTransport((400, {}, None)))
+        path = self.results / "judge" / run_id / "attempts.jsonl"
+        rows = self.attempts(run_id)
+        for row in rows:
+            for entry in row["httpRequests"]:
+                entry.pop("reservedUsd")
+                entry.pop("settledUsd")
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        transport = FakeTransport(openai_usage_response(0))
+        self.assert_refused(run_id, self.client(transport), transport)
 
 
 if __name__ == "__main__":

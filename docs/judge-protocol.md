@@ -70,7 +70,7 @@ Pilot repetition 1의 A/B Quiz 결과에 대한 사후(post-hoc) 보조 평가�
 - 다음 attempt 대상: timeout, network, HTTP 재시도 소진, `incomplete`, `refusal`, `parse_error`, `schema_error`, `semantic_error`. `incomplete` 응답에 모델 출력 텍스트가 있으면 진단용으로만 보존하며 결과로 쓰지 않습니다. 검증은 구조만 확인하며 판정 내용 때문에 출력을 거부하지 않습니다. 일부만 담긴 출력은 실패입니다.
 - 실행 전체 중단: `client_error`(4xx), `api_key_missing`, `live_guard`(호출 수·비용 상한), 같은 측정의 3 attempts가 모두 `incomplete`인 경우(`repeatedIncomplete`). 실패 유형이 섞여 소진되면 그 측정만 `INCOMPLETE`로 두고 계속합니다.
 - 재시도는 같은 입력(같은 `inputHash`)으로만 합니다. 첫 번째 유효 결과만 쓰고 성공한 측정은 다시 실행하지 않습니다. 성공이 여러 개면 가장 이른 attempt를 쓰고 나머지는 표시만 합니다.
-- 측정 식별에 영향을 주는 설정(출력 상한, prompt·rubric·schema, 모델·추론 설정)이 바뀌면 새 실행으로 대상 전체를 다시 측정합니다. 같은 실행의 재개(`--run-id`)는 실행 모드(`fixture`/`live`), `configHash`, 원천 스냅샷, 계획된 측정이 모두 같을 때만 허용됩니다. fixture 실행과 live 실행은 서로 재개할 수 없습니다. 이전 실행은 보존하되 새 실행 분석에 섞지 않습니다.
+- 측정 식별에 영향을 주는 설정(출력 상한, prompt·rubric·schema, 모델·추론 설정)이 바뀌면 새 실행으로 대상 전체를 다시 측정합니다. 같은 실행의 재개(`--run-id`)는 실행 모드(`fixture`/`live`), `configHash`, 원천 스냅샷, 계획된 측정이 모두 같을 때만 허용됩니다. fixture 실행과 live 실행은 서로 재개할 수 없습니다. HTTP 요청 상한과 비용 상한은 프로세스가 아니라 Judge 실행 전체에 적용됩니다. live 재개는 manifest에 기록된 운영 설정(요청·비용 상한, timeout, 입력 token 추정값, 출력 상한, 단가·출처·확인일)이 정확히 같아야 하며, `attempts.jsonl`의 모든 HTTP 요청 기록(실패·재시도 포함)에서 요청 수와 지출(비용을 아는 요청은 정산 비용, 모르는 요청은 사전 예약 비용)을 복원한 뒤 남은 한도로만 이어갑니다. 한도가 이미 소진됐거나, 요청 기록에 예약 비용이 없어 복원할 수 없는 실행은 Provider 호출과 상태 변경 전에 재개를 거부합니다. 이전 실행은 보존하되 새 실행 분석에 섞지 않습니다.
 
 ## 저장 구조
 
@@ -85,7 +85,7 @@ Judge 결과는 `results/judge/<judgeRunId>/`에만 저장합니다. `results/ra
 | `outputs/<attemptId>.json` | Judge 출력 원문과 검증된 결과 |
 | `derived/` | 측정 상태, Pointwise verdict, Pairwise call·Judge·pair 결과, Human 비교, `report-counts.json`. 원본에서 `python -m src.judge_runner derive --run-id <id>`로 다시 생성 |
 
-비용은 선택된 측정 기준(`selectedMeasurements`)과 실패 attempt를 포함한 총지출(`allAttempts`)로 나눠 보고합니다. 각각 `usd`(하나라도 비용을 모르면 `null`), `knownUsd`(알려진 비용 합계, 하한), `unknownCostCount`를 둡니다. usage가 없거나 형식이 잘못됐거나(음수, bool, 캐시 token이 입력 token보다 큼, `usage.invalidFields`에 기록) 계산 결과가 유한한 0 이상의 수가 아니면 비용은 `null`이며 0으로 바꾸지 않습니다. 이때 사전 예약한 추정 비용은 정산하지 않고 그대로 남겨 비용 상한 계산에 계속 반영합니다. 캐시 입력 단가는 생략하거나 유한한 0 이상의 수여야 합니다. HTTP 요청 기록은 실제로 보낸 요청마다 남으며 요청 본문과 credential은 저장하지 않습니다.
+비용은 선택된 측정 기준(`selectedMeasurements`)과 실패 attempt를 포함한 총지출(`allAttempts`)로 나눠 보고합니다. 각각 `usd`(하나라도 비용을 모르면 `null`), `knownUsd`(알려진 비용 합계, 하한), `unknownCostCount`를 둡니다. usage가 없거나 형식이 잘못됐거나(음수, bool, 캐시 token이 입력 token보다 큼, `usage.invalidFields`에 기록) 계산 결과가 유한한 0 이상의 수가 아니면 비용은 `null`이며 0으로 바꾸지 않습니다. 이때 사전 예약한 추정 비용은 정산하지 않고 그대로 남겨 비용 상한 계산에 계속 반영합니다. 캐시 입력 단가는 생략하거나 유한한 0 이상의 수여야 합니다. Gemini Interactions API는 `usage.total_cached_tokens`(prompt 중 캐시된 부분)를 보고하지만, 이 값이 `total_input_tokens`에 포함되는지와 implicit 캐시에 캐시 단가가 어떻게 적용되는지는 공식 문서(2026-10-07 확인)에 명시되어 있지 않습니다. 따라서 캐시 token이 0보다 큰 Gemini 호출의 비용은 `null`로 두고 예약을 유지합니다. 정확한 계산식은 공식 문서로 의미가 확인된 뒤 적용합니다. HTTP 요청 기록에는 요청별 사전 예약 비용(`reservedUsd`)과 비용을 알게 된 경우의 정산 비용(`settledUsd`)이 남습니다. HTTP 요청 기록은 실제로 보낸 요청마다 남으며 요청 본문과 credential은 저장하지 않습니다.
 
 ## 실행
 

@@ -9,6 +9,7 @@ Human Evaluation and ground truth are only read.
 import argparse
 import hashlib
 import json
+import math
 import os
 import tempfile
 import time
@@ -151,6 +152,37 @@ def preflight_live_policy(policy, judges):
                 raise ValueError("Invalid live Judge settings for %s/%s" % (kind, judge["provider"])) from failure
 
 
+def operational_contract(policy):
+    """Live guard and pricing settings a run is bound to; a resume must present exactly the same."""
+    return {"mode": "live", "httpRequestLimit": policy.http_request_limit,
+            "perCallCostLimit": policy.per_call_cost_limit, "totalCostLimit": policy.total_cost_limit,
+            "timeoutSeconds": policy.timeout_seconds,
+            "estimatedInputTokens": dict(policy.estimated_input_tokens),
+            "maxOutputTokens": dict(policy.max_output_tokens), "prices": policy.prices}
+
+
+def _non_negative_number(value):
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
+def run_expenditure(attempts):
+    """(HTTP requests sent, spend) for a live run from its persisted request records.
+
+    Every request counts, including failed and retried ones. A request's settled cost is used when
+    known; otherwise its pre-call reservation stays in force. Records without a reservation cannot be
+    restored safely, so the run cannot be resumed.
+    """
+    requests, spent = 0, 0.0
+    for attempt in attempts:
+        for entry in attempt.get("httpRequests") or []:
+            reserved, settled = entry.get("reservedUsd"), entry.get("settledUsd")
+            if not _non_negative_number(reserved) or (settled is not None and not _non_negative_number(settled)):
+                raise ValueError("Live run lacks restorable request reservations: start a new Judge run")
+            requests += 1
+            spent += settled if settled is not None else reserved
+    return requests, spent
+
+
 def cost_summary(attempts, selected_attempt_ids):
     """Unknown costs are never counted as zero: a total is null when any part is unknown."""
     def summarize(costs):
@@ -232,7 +264,9 @@ class JudgeRunner:
             "configHash": self.config_hash, "config": identity_config(self.config),
             "modelDocsCheckedAt": {judge["id"]: judge.get("model_docs_checked_at")
                                    for judge in self.config["judges"]},
-            "operational": operational or {}, "executionMode": execution_mode(client),
+            "operational": (operational_contract(client.policy) if execution_mode(client) == "live"
+                            else operational or {}),
+            "executionMode": execution_mode(client),
             "sourceResults": self.source.relative_to(self.repository).as_posix(),
             "sourceSnapshot": plan["sourceSnapshot"]}))
         _write_jsonl(run_dir / "eligibility.jsonl", eligibility_records(plan))
@@ -251,8 +285,27 @@ class JudgeRunner:
         stored = [item["logicalMeasurementId"] for item in _read_jsonl(run_dir / "measurements.jsonl")]
         if stored != [item["logicalMeasurementId"] for item in measurements]:
             raise ValueError("Planned measurements differ from the stored run: start a new Judge run")
+        if execution_mode(client) == "live":
+            # Run-level guards cover the whole Judge run, not one process: restore and check them
+            # before any status change or Provider call.
+            if manifest.get("operational") != operational_contract(client.policy):
+                raise ValueError("Live limits or prices differ from the stored run: start a new Judge run")
+            attempts = _read_jsonl(run_dir / "attempts.jsonl")
+            requests, spent = run_expenditure(attempts)
+            pending = next((item for item in measurements if self._needs_attempt(item, attempts)), None)
+            if pending is not None:
+                try:
+                    client.policy.authorize(pending["kind"], pending["provider"], requests, spent)
+                except JudgeCallFailure as failure:
+                    raise ValueError("The run's request or cost budget is exhausted") from failure
+            client.restore_usage(requests, spent)
         self._set_status(run_dir, "running", None)
         return self._execute(run_dir, measurements, client)
+
+    @staticmethod
+    def _needs_attempt(measurement, attempts):
+        history = [item for item in attempts if item["logicalMeasurementId"] == measurement["logicalMeasurementId"]]
+        return not any(item["outcome"] == "success" for item in history) and len(history) < MAX_ATTEMPTS
 
     def _set_status(self, run_dir, status, reason):
         manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
@@ -543,9 +596,7 @@ def main():
             parser.error("--live requires decided output limits, guards, token estimates and prices: %s" % error)
         client = JudgeHttpClient(policy, {judge["provider"]: judge["api_key_environment_variable"]
                                           for judge in runner.config["judges"]})
-        operational = {"mode": "live", "httpRequestLimit": args.http_request_limit,
-                       "perCallCostLimit": args.per_call_cost_limit, "totalCostLimit": args.total_cost_limit,
-                       "timeoutSeconds": args.timeout_seconds, "prices": prices}
+        operational = None  # A live run's manifest records operational_contract(policy).
     else:
         parser.error("run requires --fixture or --live")
     manifest = runner.resume(args.run_id, client) if args.run_id else runner.start(client, operational)

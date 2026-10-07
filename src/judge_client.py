@@ -195,8 +195,10 @@ def parse_response(provider, response):
                  "outputTokens": _usage_field(usage_source, "output_tokens", "outputTokens", invalid),
                  "reasoningTokens": _usage_field(details_out, "reasoning_tokens", "reasoningTokens", invalid)}
     else:
+        # Interactions API: total_cached_tokens is "the cached part of the prompt", so it cannot exceed
+        # total_input_tokens (checked below).
         usage = {"inputTokens": _usage_field(usage_source, "total_input_tokens", "inputTokens", invalid),
-                 "cachedInputTokens": None,
+                 "cachedInputTokens": _usage_field(usage_source, "total_cached_tokens", "cachedInputTokens", invalid),
                  "outputTokens": _usage_field(usage_source, "total_output_tokens", "outputTokens", invalid),
                  "reasoningTokens": _usage_field(usage_source, "total_thought_tokens", "reasoningTokens", invalid)}
     if (usage["cachedInputTokens"] is not None and usage["inputTokens"] is not None
@@ -245,6 +247,10 @@ def estimate_cost(provider, usage, price):
             cost = ((usage["inputTokens"] - cached) * price["input"] + cached * (price.get("cachedInput") or 0)
                     + usage["outputTokens"] * price["output"]) / 1000000
         else:
+            # The official docs do not state whether cached tokens are part of total_input_tokens or
+            # how the cached price applies to implicit caching, so a cached call has no known cost.
+            if usage.get("cachedInputTokens"):
+                return None
             # Gemini bills thinking tokens as output in addition to output tokens.
             cost = (usage["inputTokens"] * price["input"]
                     + (usage["outputTokens"] + (usage.get("reasoningTokens") or 0)) * price["output"]) / 1000000
@@ -270,6 +276,13 @@ class JudgeHttpClient:
             return self.api_keys.get(provider)
         return os.getenv(self.api_key_variables.get(provider, ""))
 
+    def restore_usage(self, requests_made, reserved_cost):
+        """Carry a resumed run's persisted usage so run-level guards never restart from zero."""
+        if self.requests_made or self.reserved_cost:
+            raise ValueError("Run usage can only be restored on a client that has not sent requests")
+        self.requests_made = requests_made
+        self.reserved_cost = reserved_cost
+
     def call_measurement(self, measurement, body):
         return self.call(measurement["provider"], measurement["kind"], body)
 
@@ -291,9 +304,11 @@ class JudgeHttpClient:
                 "Bearer " + key if provider == "openai" else key)
             self.requests_made += 1
             self.reserved_cost += estimate
-            # Created before the transport call so every request actually sent is traceable.
+            # Created before the transport call so every request actually sent is traceable. reservedUsd is
+            # this request's pre-call reservation; settledUsd replaces it only once its cost is known.
             entry = {"request": http_try + 1, "isHttpRetry": http_try > 0, "status": None,
-                     "outcome": "sent", "retryAfterSeconds": None, "waitedSeconds": None}
+                     "outcome": "sent", "retryAfterSeconds": None, "waitedSeconds": None,
+                     "reservedUsd": estimate, "settledUsd": None}
             log.append(entry)
             try:
                 status, response, retry_after = self.transport(url, headers, body, self.policy.timeout_seconds)
@@ -331,10 +346,10 @@ class JudgeHttpClient:
                 result = parse_response(provider, response)
             except JudgeCallFailure as failure:
                 failure.http_requests = log
-                failure.estimated_cost_usd = self._settle(provider, failure.usage, estimate)
+                failure.estimated_cost_usd = entry["settledUsd"] = self._settle(provider, failure.usage, estimate)
                 raise
             result["httpRequests"] = log
-            result["estimatedCostUsd"] = self._settle(provider, result["usage"], estimate)
+            result["estimatedCostUsd"] = entry["settledUsd"] = self._settle(provider, result["usage"], estimate)
             return result
         raise JudgeCallFailure("provider_error", http_requests=log)
 
