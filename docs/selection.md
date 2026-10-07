@@ -1,6 +1,6 @@
 # 방식·모델 선택 기록
 
-이 문서는 Cking AI Quiz Pilot에서 영상 분석 방법을 정한 근거와 현재 Pilot의 실행 프로토콜을 기록합니다. 근거의 성격은 다음 표기로 구분합니다.
+이 문서는 Cking AI Quiz Pilot에서 영상 분석 방법을 정한 근거, Pilot v1 실행 기록, 현재 Pilot v2의 실행 프로토콜과 결과 해석 기준을 기록합니다. Pilot v1(2~3장)과 Pilot v2(6~7장)는 별개의 실험입니다. 근거의 성격은 다음 표기로 구분합니다.
 
 - **USER DECISION**: 사람이 정한 요구사항이나 결정입니다. 저장소 코드로 증명된 사실이 아닙니다.
 - **CONFIRMED BY OFFICIAL DOCS**: 2026-10-02에 각 Provider 공식 문서에서 확인한 사실입니다. 문서는 이후 바뀔 수 있습니다.
@@ -57,14 +57,16 @@ Gemini Video Grounding을 현재 영상 분석 방법으로 유지합니다. 근
 | 데이터 정책 | Content Understanding 단계의 입력·중간 데이터는 처리 후 삭제, 결과는 최대 24시간 보관. 연결된 Azure OpenAI 처리에는 Azure OpenAI 데이터 정책이 별도로 적용되며, 그 학습 사용 여부는 이번 조사에서 확인하지 않음 | 계정 설정에서 opt-out하지 않으면 고객 데이터를 학습에 사용 |
 | 권리 | 제출 콘텐츠에 필요한 권리 확보를 이용자에게 요구 | 업로드할 권리 보장을 이용자에게 요구 |
 
-## 2. 현재 Pilot 실행 프로토콜 (CURRENT PILOT POLICY)
+## 2. Pilot v1 실행 프로토콜 (pilot-v1 기록)
+
+이 장은 `pilot-v1`(`configs/pilot.yaml`) repetition 1을 실행할 때 적용한 프로토콜의 기록입니다. 기존 Pilot v1 실행과 결과의 해석 근거로 그대로 유지하며, Pilot v2에는 적용하지 않습니다. Pilot v2 프로토콜은 6장을 따릅니다.
 
 ### 범위
 
 - 현재 Pilot 단계에서는 4개 영상의 repetition 1을 완료합니다.
 - 첫 영상 `nasa-water-cycle-2019`는 기존 결과를 유지합니다(3장 참고).
 - 남은 3개 영상 `nasa-methane-2020`, `nasa-mars-organics-2025`, `kari-microgravity-2024`에 이 프로토콜을 적용합니다.
-- repetition 2는 현재 범위에서 실행하지 않습니다. 고정 입력 manifest(영상·`promptVersion`당 `contentText` 하나)와 aggregator(Grounding·Quiz의 repetition 일치 요구) 계약 때문에, repetition 1 완료 후 의미와 계약을 별도로 결정합니다.
+- repetition 2는 현재 범위에서 실행하지 않습니다. 고정 입력 manifest(영상·`promptVersion`당 `contentText` 하나)와 aggregator(Grounding·Quiz의 repetition 일치 요구) 계약 때문에, repetition 1 완료 후 의미와 계약을 별도로 결정합니다. 이 결정은 Pilot v2에서 내렸으며 6장에 기록합니다.
 
 ### 기준과 조건
 
@@ -222,19 +224,206 @@ Transcript condition was not executed in this Pilot. 권한 있는 transcript를
 
 다음은 현재 Pilot의 blocker가 아닙니다.
 
-결과 해석 시 함께 기록할 caveat:
+Pilot v1 결과 해석 시 함께 기록할 caveat:
 
 - Quiz A와 Direct C의 차이는 분리 방식과 직접 방식의 차이만이 아닙니다. 입력(승인된 텍스트와 영상), 사람 검수·승인 단계, evidence 포함 검사 적용 여부도 다릅니다.
-- Quiz A와 B는 같은 승인 `contentText`를 쓰지만, Gemini thinking 기본값과 OpenAI `reasoning-effort low`, Provider별 구조화 출력 schema 적용 방식이 다릅니다.
+- Quiz A와 B는 같은 승인 `contentText`를 쓰지만, Gemini thinking 기본값과 OpenAI `reasoning-effort low`, Provider별 구조화 출력 schema 적용 방식이 다릅니다. 이 reasoning 설정 비대칭은 Pilot v1의 한계로 남습니다. Pilot v2의 caveat는 7장에 따로 기록합니다.
 
-별도 코드 후속 과제(이번 Pilot 프로토콜에 포함하지 않음):
+별도 코드 후속 과제(이번 Pilot 프로토콜에 포함하지 않음). 6장의 Pilot v2 기준 commit에서 다시 확인한 상태입니다.
 
-- offline aggregator가 선택된 Quiz의 `parseStatus`·`validatorStatus`·`errorCategory` 등을 충분히 노출하지 않음
-- timestamp 시작·끝과 영상 길이 범위 검증의 제한
-- 중복 `runId`의 전역 탐지 제한
-- NaN·Infinity 처리 계약의 경로별 차이
-- 전역 storage preflight의 승인 추적 검증 범위 제한
-- 실행 설정 전체 snapshot 부재
+- offline aggregator가 선택된 Quiz의 `parseStatus`·`validatorStatus`·`errorCategory` 등을 충분히 노출하지 않음: 남아 있음
+- timestamp 시작·끝과 영상 길이 범위 검증의 제한: 시작·끝 정합성 검사는 이후 반영됐습니다(PR #18). 영상 길이 상한 검사는 `data/videos.jsonl`에 `durationSeconds`가 기록된 영상(현재 `kari-microgravity-2024`)에만 적용되므로 이 제한은 남아 있음
+- 중복 `runId`의 전역 탐지 제한: 남아 있음
+- NaN·Infinity 처리 계약의 경로별 차이: 남아 있음
+- 전역 storage preflight의 승인 추적 검증 범위 제한: Pilot v2 Grounding 검수 상태의 일관성 검사는 추가됐지만, 범위 제한은 일부 남아 있음
+- 실행 설정 전체 snapshot 부재: 남아 있음. 그래서 6장의 실행 기록에 실제 명령을 남깁니다.
+
+## 6. Pilot v2 실행 프로토콜 (CURRENT PILOT POLICY)
+
+### 범위
+
+- Pilot v2는 pilot-v1과 별개의 실험입니다. 설정은 `configs/pilot-v2.yaml`이며 `src.pilot_runner`의 모든 Grounding·Quiz·Direct 생성 명령에 `--config configs/pilot-v2.yaml`을 붙입니다. Human blind evaluation과 Judge 같은 평가 도구는 각 도구의 명령과 설정 계약을 따르며, 이 생성 설정을 `--config`로 넘기지 않습니다. 기존 Pilot v1 결과·고정 입력 manifest·설정(`configs/pilot.yaml`)은 바꾸지 않고, Pilot v1 결과를 Pilot v2 집계나 평가에 포함하지 않습니다.
+- 영상 4개(`nasa-water-cycle-2019`, `nasa-methane-2020`, `nasa-mars-organics-2025`, `kari-microgravity-2024`) × repetition 2(`repetitions_per_condition: 2`) × 조건 A/B/C입니다.
+- transcript 조건은 Pilot v2 범위에 포함하지 않으며 실행하지 않습니다.
+
+### 기준 commit
+
+두 commit을 구분해 기록합니다.
+
+- **프로토콜·코드 기준 commit**: `6bedc74706a7d4cbc5d2544a450365c20d6fb330` (main, PR #29 반영). 이 문서의 Pilot v2 계약은 이 commit의 코드로 확인했습니다. Pilot v2 Grounding 검수(PR #22), Quiz·Direct 생성 조건(PR #24), Human blind evaluation(PR #26), repetition별 고정 입력(PR #29)을 포함합니다.
+- **실제 실행 commit**: 실제 Pilot v2를 실행하기 직전에 checkout한 HEAD입니다. 실행 기록에 따로 남깁니다. 기준 commit과 다르면 그 사이에 Pilot 실행 코드가 바뀌지 않았는지 확인합니다(예: `git diff --stat 6bedc74 HEAD -- src configs data/videos.jsonl`). 실행 코드가 바뀐 commit에서는 이 프로토콜과 같은 조건으로 간주하지 않고 사람이 별도로 결정합니다.
+
+### 조건과 모델
+
+| 조건 | 실행 | 모델 | 생성 설정 |
+| --- | --- | --- | --- |
+| Grounding | `grounding --method gemini_video`, Grounding `promptVersion=video-grounding-v2` | `gemini-3.8-flash` | thinking 설정하지 않음 (모델 기본값) |
+| Quiz A | `quiz`, 같은 repetition의 승인 `contentText` | `gemini-3.8-flash` | `thinking_level: medium` (config) |
+| Quiz B | `quiz`, Quiz A와 같은 repetition의 같은 승인 `contentText` | `gpt-5.4-mini` | `reasoning_effort: medium` (config) |
+| Direct C | `end-to-end --method gemini_direct_quiz`, YouTube 영상 직접 입력 | `gemini-3.8-flash` | `thinking_level: medium` (config) |
+
+- Quiz A/B와 Direct C는 `promptVersion=pilot-v2`이며, prompt로 정확히 3문항·문항당 보기 4개를 요청합니다. Quiz A/B 입력은 승인된 `contentText`뿐이며 facts는 넣지 않습니다.
+- 구조화 출력: Gemini는 JSON schema 응답 형식, OpenAI는 strict JSON schema를 사용합니다. schema는 필드 구조만 정하고 문항 수·보기 수(배열 길이)는 강제하지 않습니다. 따라서 3문항은 Provider가 보장하는 값이 아니라 결과로 측정하는 값입니다.
+- temperature·top_p는 설정하지 않습니다.
+- Quiz A/B·Direct C의 thinking/reasoning 값은 config에서 가져옵니다. 실행기는 config가 위 모델·`medium` 설정·3문항·보기 4개·`retry_attempts: 0`과 다르면 실행을 거부합니다. CLI의 `--thinking-level`·`--reasoning-effort`는 Pilot v2에서 사용하지 않습니다. config와 다른 값을 넘기면 Provider 호출 전에 거부됩니다.
+- Gemini의 `medium`과 OpenAI의 `medium`은 각 Provider가 정한 단계 이름입니다. 두 설정이 같은 추론량이나 같은 계산량을 뜻한다고 간주하지 않습니다.
+
+### CLI 값
+
+| 옵션 | 값 | 적용 조건 |
+| --- | --- | --- |
+| `--config` | `configs/pilot-v2.yaml` | 모든 조건 |
+| `--results-dir` | `results/pilot-v2` | 모든 조건 (아래 "결과 디렉터리" 참고) |
+| `--video-processing` | `static` | Grounding, Direct C |
+| media resolution | 설정하지 않음 (API 기본값) | Grounding, Direct C |
+| `--max-output-tokens` | `8192` | 모든 조건 |
+| `--timeout-seconds` | `120` | 모든 조건 |
+| `--retry-attempts` | Grounding `1`, Quiz A/B·Direct C `0` | 조건별 |
+| `--call-limit` | Grounding `2`, Quiz A/B·Direct C `1` | 조건별 |
+| `--per-call-cost-limit` | `0.10` (USD) | 모든 조건 |
+| `--total-cost-limit` | `0.20` (USD) | 모든 조건 |
+| `--video-estimated-input-tokens` | `nasa-methane-2020`: `16000`<br>`nasa-mars-organics-2025`: `13000`<br>`kari-microgravity-2024`: `31000`<br>`nasa-water-cycle-2019`: `29000` | Grounding, Direct C |
+| `--quiz-estimated-input-tokens` | `2000` | Quiz A, Quiz B |
+| `--thinking-level`, `--reasoning-effort` | 사용하지 않음 (config 값 사용) | Quiz A/B, Direct C |
+| `--input-price-per-million`, `--output-price-per-million`, `--pricing-reference` | 실행 직전에 확인한 해당 Provider 단가와 출처·확인 날짜 | 모든 조건 |
+
+- Pilot v2 Quiz A/B·Direct C는 `--retry-attempts 0`일 때만 실행됩니다. 다른 값이나 생략은 Provider 호출 전에 거부됩니다. Grounding의 HTTP retry 정책은 Pilot v1과 같습니다.
+- `--call-limit`은 CLI 실행 한 번의 HTTP 요청 수(retry 포함) 상한입니다. Grounding은 technical attempt 하나에 HTTP 요청이 최대 2회, Quiz A/B·Direct C는 1회입니다.
+- 각 조건의 CLI 실행은 Provider 하나만 호출하므로 해당 Provider 단가를 일반 가격 옵션으로 넘깁니다.
+
+### 비용 guard와 가격 재확인
+
+- `--per-call-cost-limit`·`--total-cost-limit`은 CLI 실행 한 번(그 실행의 Provider router)에만 적용되는 추정 비용 guard입니다. 실제 청구액 상한이 아니며, Pilot v2 실험 전체나 여러 실행에 걸친 누적 비용 상한도 아닙니다.
+- 실행기는 HTTP 요청마다 `입력 token 추정치 × 입력 단가 + --max-output-tokens × 출력 단가`로 비용을 추정하고, 한도를 넘으면 Provider 호출 전에 거부합니다.
+- `0.10`·`0.20` USD와 입력 token 추정치는 영구히 안전한 값이 아닙니다. Provider 가격은 바뀔 수 있으므로 실제 Pilot v2 실행 직전에 Gemini와 OpenAI 공식 가격을 다시 확인합니다. 그 단가로 Grounding(HTTP 요청 최대 2회)·Quiz·Direct의 추정 비용이 `--per-call-cost-limit`과 `--total-cost-limit` 안에 드는지, 입력 token 추정치가 충분한지 확인합니다.
+- 확인한 단가·출처·확인 날짜를 `--pricing-reference`와 실행 기록에 남깁니다. 값을 바꿔야 하면 실행 전에 사람이 정하고 이 문서에 기록합니다. 2장의 가격 출처는 Pilot v1 실행 당시의 기록입니다.
+
+### 결과 디렉터리와 고정 입력 manifest
+
+- Pilot v2의 모든 명령은 같은 `--results-dir results/pilot-v2`를 사용합니다. Grounding·Quiz·Direct 실행, Grounding 검수, Human blind evaluation, Judge가 모두 이 디렉터리를 읽거나 씁니다.
+- Pilot v1 결과(`results/`)와 분리하는 이유는 다음과 같습니다.
+  - Judge는 성공한 A/B Quiz를 `videoId`·`repetition`·모델로 찾고 `promptVersion`으로 나누지 않습니다. 같은 디렉터리에 Pilot v1·v2 성공 행이 함께 있으면 같은 조건의 성공 Quiz가 둘이 되어 Judge가 계획 단계에서 중단합니다.
+  - 조건당 성공 후보 규칙, attempt 번호, storage integrity 검사는 결과 디렉터리 단위로 적용됩니다.
+- 같은 결과 디렉터리에서는 Pilot 작업이 한 번에 하나만 실행됩니다. 실행기는 결과 디렉터리마다 OS 잠금(`.pilot.lock`)을 잡고, 이미 실행 중이면 기다리지 않고 바로 실패합니다. Human blind evaluation의 `create`·`import`도 같은 잠금을 사용합니다. 그래서 `results/pilot-v2`에 대한 명령을 동시에 실행하지 않습니다.
+- 고정 입력 manifest는 결과 디렉터리와 별개입니다. `--results-dir`과 무관하게 `data/restricted/fixed-content/`에 기록되며 모든 결과 디렉터리가 공유합니다.
+  - Pilot v1: 영상·`promptVersion`마다 하나의 고정 `contentText`입니다(2장). 이 의미와 기존 항목은 바뀌지 않았습니다.
+  - Pilot v2: 영상·`promptVersion`·repetition마다 하나의 고정 `contentText`입니다.
+  - 기존 manifest 항목은 Pilot v1뿐이었으므로 migration은 하지 않았습니다.
+- fixture·scratch·검증 실행은 `results/pilot-v2`에 만들지 않고 별도의 scratch `--results-dir`(`results/` 하위)을 사용합니다. 다만 manifest는 공유되므로, 실제 Pilot v2 영상의 `videoId`로 `pilot-v2` Quiz fixture·검증 실행을 하면 그 영상·repetition의 고정 입력이 먼저 등록됩니다. 따라서 Pilot v2 완료 전에는 실제 영상 ID로 `pilot-v2` Quiz fixture·검증 실행을 하지 않습니다. 자동 테스트는 임시 저장소를 사용하므로 이 manifest를 쓰지 않습니다.
+
+### repetition 계약
+
+각 repetition은 Grounding부터 독립적으로 실행합니다(USER DECISION).
+
+```
+repetition r: Grounding(r) → Grounding 검수(r) → 승인 contentText(r) → Quiz A(r), Quiz B(r)
+```
+
+- 각 repetition은 자기 Grounding을 실행하고 검수합니다. 그 repetition에서 승인된 `contentText`가 그 repetition의 고정 입력이 됩니다.
+- 같은 repetition의 Quiz A와 B는 같은 승인 `contentText`를 사용합니다. 같은 repetition에서 다른 `contentText`로 Quiz를 실행하려 하면 Provider 호출 전에 거부됩니다.
+- 서로 다른 repetition은 서로 다른 승인 `contentText`를 가질 수 있습니다. repetition 간 Grounding 결과의 차이는 실험 변동의 일부로 봅니다.
+- Quiz는 반드시 자기 repetition의 승인 Grounding을 원천으로 사용합니다. 다른 repetition의 Grounding을 `--source-grounding-run-id`로 지정하면 실행기가 Provider 호출 전에 거부하며, Quiz 결과 행도 고정 입력 manifest 항목도 만들지 않습니다.
+- Direct C는 Grounding 없이 repetition마다 따로 실행합니다.
+- offline 집계, Judge, Human blind evaluation은 Grounding과 Quiz의 repetition이 같을 것을 요구합니다.
+
+### 완료와 재실행 규칙
+
+Grounding:
+
+- 조건(`videoId`·method·model·repetition·`video-grounding-v2`)당 성공한 Grounding 후보는 하나입니다. 성공한 Grounding이 하나라도 있으면 검수 상태(미검수·approved·rejected)와 관계없이 그 조건의 새 Grounding 생성은 Provider 호출 전에 거부됩니다.
+- 다음 technical attempt는 `apiStatus=error`(구조적으로 사용할 수 없는 응답의 `invalid_grounding_response` 포함) 뒤에만 실행할 수 있습니다.
+- rejected는 품질 판정이지 technical failure가 아닙니다. rejected Grounding으로는 Quiz A/B를 실행하지 않고, Grounding을 자동으로 다시 생성하지도 않습니다. 재생성이나 후보 선택은 별도의 사람 결정 사항입니다. 이 경우 그 영상·repetition의 Quiz A/B는 실행되지 않은 상태로 남습니다.
+
+Quiz A/B·Direct C:
+
+- 조건에 `apiStatus=success`가 한 번 기록되면 그 조건은 끝납니다. 이후 parsing 실패, 공통 구조 실패, `questionCount != 3`, evidence 검사 실패가 있어도 다시 생성하지 않습니다. 3문항 요구는 재생성 조건이 아니라 신뢰성 측정 대상입니다.
+- `apiStatus=error`(technical failure)인 경우에만 다음 technical attempt를 실행할 수 있습니다. 한 technical attempt 안의 HTTP retry는 없습니다(`--retry-attempts 0`).
+
+공통:
+
+- 결과 행이 생성되지 않은 실행(승인·repetition·SHA-256·고정 입력·terminal 검사 거부, CLI 인자 오류)은 technical attempt가 아닙니다.
+- 조건(같은 영상·repetition·조건)당 technical attempt는 최대 3회입니다(USER DECISION). technical attempt는 별도의 CLI 실행 한 번이며, 한 실행 안의 HTTP retry(`--retry-attempts`, `--call-limit`)와는 다른 단위입니다. 2·3번째 attempt는 앞선 attempt가 모두 `apiStatus=error`일 때만 실행하고, 첫 `apiStatus=success`가 나오면 3회 미만이어도 그 조건은 끝납니다. 따라서 parsing·구조·문항 수 실패를 3번까지 다시 생성한다는 뜻이 아닙니다. 3회 모두 `apiStatus=error`이면 "3 technical attempts incomplete"로 기록하고 중단하며, 이는 품질 실패가 아닙니다.
+- 이 상한은 실행기가 자동으로 막지 않습니다. 실행 절차상 사람이 지켜야 하는 상한이므로, 다음 attempt 전에 그 조건의 기존 attempt 수를 결과 행에서 확인합니다.
+
+### 영상·repetition별 실행 순서
+
+영상 하나와 repetition 하나(`--repetition 1` 또는 `2`)마다 다음 순서로 실행합니다. 아래 명령은 공통 옵션(`--config configs/pilot-v2.yaml --results-dir results/pilot-v2 --live`, 위 CLI 값, 가격 옵션)을 생략한 형태입니다.
+
+1. Grounding: `python -m src.pilot_runner grounding --video-id <videoId> --repetition <r> --method gemini_video ...`
+2. Grounding 검수: 사람이 영상과 `results/pilot-v2/evaluation/<runId>.json`의 `contentText`·facts를 확인하고 다섯 항목(`factualAccuracy`, `keyInformationCoverage`, `factsConsistency`, `koreanConsistency`, `contentTextContractCompliance`)을 각각 `pass`·`fail`·`uncertain`으로 판정합니다. 판정의 의미는 [평가 기준](rubric.md)을 따릅니다. 판정은 전용 CLI가 없으므로 Python에서 기록합니다.
+
+   ```python
+   from src.pilot_runner import PilotRunner
+   runner = PilotRunner(".", "results/pilot-v2", "configs/pilot-v2.yaml")
+   runner.review_grounding("<Grounding runId>", "taeyeonon",
+                           {"factualAccuracy": "pass", "keyInformationCoverage": "pass",
+                            "factsConsistency": "pass", "koreanConsistency": "pass",
+                            "contentTextContractCompliance": "pass", "reviewNote": None})
+   ```
+
+   다섯 항목이 모두 `pass`면 approved, 하나라도 `fail`·`uncertain`이면 rejected입니다. 저장된 검수는 덮어쓰지 않습니다. `video-grounding-v2` Grounding은 `approve_content`로 승인할 수 없습니다. rejected면 그 영상·repetition의 3~6단계를 건너뛰고 7단계 Direct C로 갑니다.
+3. approved면 그 Grounding의 evaluation `contentText`를 내용 변경 없이 Git-ignore된 로컬 content file(`data/restricted/` 아래, 영상·repetition마다 별도 파일)로 준비합니다. 끝 줄바꿈을 포함해 어떤 문자도 추가하거나 빼지 않습니다.
+4. 첫 Quiz 실행 직전 고정 입력 재확인(아래 목록)
+5. Quiz A: `python -m src.pilot_runner quiz --video-id <videoId> --repetition <r> --model gemini-3.8-flash --content-file <file> --source-grounding-run-id <Grounding runId> ...`
+6. Quiz B: 5단계와 같은 `--repetition`, `--content-file`, `--source-grounding-run-id`로 `--model gpt-5.4-mini` 실행
+7. Direct C: `python -m src.pilot_runner end-to-end --video-id <videoId> --repetition <r> --method gemini_direct_quiz ...`. Direct C는 Grounding 결과와 관계없이 실행합니다.
+
+모든 영상·repetition의 생성이 끝난 뒤:
+
+8. 자동 검사: parsing, 공통 구조, 문항 수, evidence 포함 여부는 실행 시 결과 행에 기록됩니다. Judge는 선택 사항인 보조 평가이며, 실행한다면 [Judge 평가 프로토콜](judge-protocol.md)에 따라 `--results-dir results/pilot-v2`로 실행합니다.
+9. Human blind evaluation(아래 "Human Evaluation" 참고)
+
+첫 Quiz 실행 직전 고정 입력 재확인(각 영상·repetition의 첫 Quiz A 또는 B 전에 사람이 확인):
+
+- `videoId`와 `--repetition`
+- 명령의 `--source-grounding-run-id`가 이번 repetition에서 승인한 Grounding `runId`이고, 그 Grounding 행의 `repetition`이 명령의 `--repetition`과 같음
+- 그 Grounding 행이 `promptVersion=video-grounding-v2`, `contentTextApprovalStatus=approved`이고 `groundingReview` 다섯 항목이 모두 `pass`이며 `approvedBy`·`approvedAt`이 기록됨
+- evaluation `contentText`의 SHA-256이 Grounding 행의 `contentTextSha256`과 같음
+- 명령의 `--content-file`이 이번 영상·repetition의 파일이고, 그 내용의 SHA-256이 같은 승인 해시와 같음
+- `--config configs/pilot-v2.yaml`, `--results-dir results/pilot-v2`, `--retry-attempts 0`
+
+source `runId`나 content file이 잘못됐다면 Provider 호출 전에 바로잡고 다시 확인합니다. 첫 Quiz 실행 이후에는 A/B 결과를 보고 `contentText`를 바꾸지 않습니다.
+
+### Human Evaluation
+
+Pilot v1과 Pilot v2의 사람 평가 절차는 다릅니다.
+
+- Pilot v1: 2장의 summary JSONL 수동 기록 절차와 `approve_content`입니다. Pilot v1 결과의 기록으로 유지합니다.
+- Pilot v2 Grounding: 위 2단계의 `review_grounding` 체크리스트로만 승인·거부를 기록합니다. 결과는 Grounding 행의 `groundingReview`와 `contentTextApprovalStatus`에 남습니다.
+- Pilot v2 Quiz A/B·Direct C: `src.human_quiz_evaluation`으로 blind evaluation을 합니다. 결과의 기준은 `results/pilot-v2/human/<sessionId>/evaluation.json`이며, Pilot v2 Quiz 결과 행의 `questionReviews`에는 사람 판정을 기록하지 않습니다.
+
+blind evaluation 절차:
+
+1. 세션 생성: `python -m src.human_quiz_evaluation --results-dir results/pilot-v2 create [--seed <seed>]`. 출력의 `sessionId`와 `blindExport` 경로를 기록합니다. seed를 생략하면 생성해 저장합니다.
+2. `results/pilot-v2/human/<sessionId>/blind-export.json`만 평가자에게 전달합니다. 여기에는 YouTube URL과 문항만 있고 조건·모델·runId·`contentText`·repetition은 없습니다. 같은 폴더의 `session.json`은 blindId와 원래 실행의 대응표이므로 평가자에게 주지 않습니다.
+3. 평가자는 세트마다 `coverage`·`redundancy`·`learningValue`, 문항마다 여섯 항목을 `pass`·`fail`·`uncertain`으로 모두 채웁니다. `reviewNote`는 선택입니다. 판정 기준은 [평가 기준](rubric.md)을 따릅니다.
+4. 가져오기: `python -m src.human_quiz_evaluation --results-dir results/pilot-v2 import --session-id <sessionId> --evaluation-file <작성한 파일> --reviewed-by taeyeonon`
+5. 세션마다 한 번만 가져올 수 있으며 저장된 `evaluation.json`은 덮어쓰지 않습니다. 다시 평가하려면 새 세션을 만듭니다.
+
+세션은 설정된 영상 4개 × repetition 2 × A/B/C의 모든 조건을 다룹니다. 평가할 수 없는 조건은 `session.json`의 `notEligible`에 이유와 함께 남습니다.
+
+- `notRun`: 기록된 실행이 없습니다. Grounding이 rejected되어 실행하지 않은 Quiz A/B나 아직 실행하지 않은 조건이 여기에 해당합니다. 모델의 생성 실패가 아니므로 Quiz 생성 신뢰성 실패로 해석하지 않습니다.
+- `noApiSuccess`: 실행이 하나 이상 기록됐지만 `apiStatus=success`가 없습니다(technical failure만 있음).
+- `parseFailed`, `questionCountMismatch`, `invalidQuestionStructure`: API 응답은 받았지만 평가자에게 보여줄 수 없는 출력입니다. 출력 신뢰성 결과로 집계합니다. evidence 검사 실패(`validatorStatus=fail`)만으로는 평가에서 제외하지 않습니다.
+
+`reviewed_by`의 `taeyeonon`은 사람이 제공한 review tracking identifier이며 인증 정보가 아닙니다. 현재 검증 규칙(앞뒤 공백 제거 후 1~100자, 제어·서식 문자 없음)에 맞습니다. 실제 실행 전에 사용할 identifier를 다시 확인합니다.
+
+### 실행 기록
+
+각 실행의 실제 명령(API key 등 비밀값 제외), 실행 시각, 실제 실행 commit(checkout한 HEAD)을 남깁니다. 가격 확인 결과와 Human blind evaluation의 `sessionId`도 함께 기록합니다.
+
+## 7. Pilot v2 결과 해석 기준
+
+Pilot v2는 아직 실행하지 않았습니다. 이 장은 결과를 해석할 기준만 정하며, 실제 집계 결과는 실행을 마친 뒤 별도로 기록합니다.
+
+- **표본 크기**: 영상 4개 × repetition 2입니다. 이 결과만으로 모델 전체의 성능을 일반화하지 않습니다.
+- **Quiz A와 B**: 같은 repetition 안에서 같은 승인 `contentText`를 쓰므로 생성 모델 비교에 가장 가깝습니다. 다만 두 Provider의 `medium`은 같은 추론량을 뜻하지 않고, 구조화 출력 schema 적용 방식도 Provider마다 다릅니다. A/B 차이는 모델과 Provider별 설정을 합친 차이로 해석합니다.
+- **Quiz A와 Direct C**: 차이를 Grounding 유무만의 인과 효과로 해석하지 않습니다. 입력(사람이 승인한 텍스트와 영상), Grounding 단계와 사람 검수, evidence 포함 검사 적용 여부가 모두 다른 pipeline 간 비교입니다.
+- **repetition 간 차이**: Quiz A/B의 repetition 차이에는 Grounding 결과의 차이와 Quiz 생성의 차이가 함께 들어 있습니다. Direct C의 repetition 차이는 생성 자체의 차이입니다.
+- **신뢰성 지표**: API 성공, parsing, 3문항 여부, 구조 검사를 사람 품질 판정과 구분해 기록합니다. `notRun`은 생성 실패로 세지 않고 실행하지 않은 조건으로 따로 보고합니다. Grounding rejection으로 Quiz A/B가 `notRun`이 된 경우는 Grounding 단계의 결과로 기록합니다.
+- **sourceEvidence와 blind 평가**: blind export는 조건·모델·runId·`contentText`·repetition을 숨기지만, 문항의 `sourceEvidence`는 `evidenceSupportsAnswer` 판정에 필요해 그대로 보여줍니다. Quiz A/B의 `sourceEvidence`는 한국어 `contentText`를 인용하고 Direct C는 영상 내용을 직접 인용하므로, 문체로 A/B와 C가 구별될 수 있습니다. 평가자는 `contentText`를 보지 않으므로 근거 판정은 영상을 기준으로 합니다. 이 한계를 결과와 함께 기록합니다.
+- **Judge**: 보조 평가이며 Human Evaluation이 기준입니다. Judge는 Pilot v2의 `evaluation.json`을 읽지 않으므로, Judge와 Pilot v2 Human 판정의 비교는 자동으로 계산되지 않습니다.
+- **Pilot v1과의 비교**: prompt 버전, 생성 설정, 사람 평가 절차가 다르므로 Pilot v1 결과와 같은 조건의 결과로 합치지 않습니다.
 
 ## 공식 문서 출처 (2026-10-02 확인)
 
