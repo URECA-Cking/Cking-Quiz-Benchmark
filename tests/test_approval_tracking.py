@@ -54,12 +54,16 @@ def schema_accepts_tracking(schema, row):
         if key in row and any(dependency not in row for dependency in dependencies):
             return False
     for rule in schema["allOf"]:
-        if all(key in row for key in rule["if"]["required"]):
+        condition = rule["if"]
+        if (all(key in row for key in condition["required"])
+                and all(row[key] == spec["const"] for key, spec in condition.get("properties", {}).items()
+                        if "const" in spec)):
             then = rule["then"]
             if any(key not in row for key in then["required"]):
                 return False
-            if any(key in row and row[key] != spec["const"]
-                   for key, spec in then["properties"].items()):
+            if any(key in row and ("const" in spec and row[key] != spec["const"]
+                                   or "enum" in spec and row[key] not in spec["enum"])
+                   for key, spec in then.get("properties", {}).items()):
                 return False
     for field in ("approvedBy", "approvedAt"):
         if field not in row:
@@ -101,6 +105,23 @@ class ApprovalTrackingSchemaTest(unittest.TestCase):
         for row in cases:
             with self.subTest(row=row):
                 self.assertFalse(schema_accepts_tracking(self.schema, row))
+
+    def test_schema_ties_rejected_status_to_the_v2_grounding_review(self):
+        review = {"factualAccuracy": "fail"}
+        v2 = {"benchmarkType": "video_grounding", "promptVersion": "video-grounding-v2", "apiStatus": "success",
+              "contentTextSha256": "0" * 64}
+        self.assertTrue(schema_accepts_tracking(self.schema, dict(
+            v2, contentTextApprovalStatus="rejected", groundingReview=review)))
+        for row in (dict(v2, contentTextApprovalStatus="rejected"),
+                    dict(v2, promptVersion="video-grounding-v1", contentTextApprovalStatus="rejected",
+                         groundingReview=review),
+                    dict(v2, benchmarkType="quiz_generation", contentTextApprovalStatus="rejected",
+                         groundingReview=review),
+                    dict(v2, contentTextApprovalStatus=None, groundingReview=review)):
+            with self.subTest(row=row):
+                self.assertFalse(schema_accepts_tracking(self.schema, row))
+        self.assertEqual(self.schema["$defs"]["groundingReview"]["properties"]["reviewedAt"]["pattern"],
+                         self.schema["properties"]["approvedAt"]["pattern"])
 
 
 if __name__ == "__main__":

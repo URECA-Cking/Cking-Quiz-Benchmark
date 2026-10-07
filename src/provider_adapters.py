@@ -51,6 +51,33 @@ def grounding_schema():
             "required": ["contentText", "facts"]}
 
 
+# video-grounding-v1 text is frozen: Pilot v1 results were produced with it.
+_GROUNDING_PROMPT_V1 = ("영상에서 확인 가능한 사실과 발화/화면 근거, 제시된 timestamp를 추출하세요. 추측은 제외하세요. "
+                        "evidenceType은 speech, visual, unknown 중 하나만 사용하세요. "
+                        "speech는 주된 근거가 영상의 발화 또는 나레이션인 경우, "
+                        "visual은 주된 근거가 화면에서 확인되는 시각 정보인 경우입니다. "
+                        "발화와 화면 양쪽에 근거가 있어도 주된 근거에 따라 speech 또는 visual을 선택하세요. "
+                        "주된 근거를 speech 또는 visual 중 하나로 신뢰성 있게 분류할 수 없을 때만 unknown을 사용하세요. "
+                        "timestampStartSeconds와 timestampEndSeconds는 영상 시작(0초)부터의 경과 시간을 초 단위 숫자로 기록하세요. "
+                        "MM:SS 표기에서 콜론만 뺀 숫자를 넣지 마세요. 예: 01:30.5 → 90.5 seconds. "
+                        "timestampStartSeconds는 timestampEndSeconds보다 클 수 없고, timestampEndSeconds는 영상 길이를 넘을 수 없습니다. "
+                        "근거 위치를 특정할 수 없으면 null을 사용하세요.")
+# Pilot v2 keeps the v1 facts rules and adds the contentText contract. No minimum length.
+_GROUNDING_CONTENT_TEXT_CONTRACT_V2 = (
+    " contentText 작성 규칙: contentText는 서로 다른 퀴즈 문제 여러 개의 유일한 입력 자료로 쓰입니다. "
+    "1) 영상의 핵심 정보를 빠뜨리지 말고 충분히 포함하세요. "
+    "2) 영상에서 확인되지 않는 사실이나 외부 지식으로 보충한 내용을 추가하지 마세요. "
+    "3) 숫자와 단위, 고유명사, 인과관계 같은 구체적인 정보를 일반적인 표현으로 바꾸지 말고 보존하세요. "
+    "4) 서로 다른 퀴즈 문제의 근거가 될 수 있도록 서로 구별되는 정보를 각각 담으세요. "
+    "5) contentText는 한국어로 작성하세요. "
+    "6) 같은 응답의 facts와 모순되는 내용을 쓰지 마세요. "
+    "7) '이 영상은 ~에 대해 설명합니다'처럼 내용을 요약하거나 소개만 하는 메타 문장을 넣지 마세요.")
+GROUNDING_PROMPTS = {
+    "video-grounding-v1": _GROUNDING_PROMPT_V1,
+    "video-grounding-v2": _GROUNDING_PROMPT_V1 + _GROUNDING_CONTENT_TEXT_CONTRACT_V2,
+}
+
+
 @dataclass
 class LivePolicy:
     enabled: bool = False
@@ -261,16 +288,11 @@ class ProviderRouter:
                 raise ProviderFailure("invalid_input")
             source = video["youtubeUrl"]
         if kind == "grounding":
-            prompt = ("영상에서 확인 가능한 사실과 발화/화면 근거, 제시된 timestamp를 추출하세요. 추측은 제외하세요. "
-                      "evidenceType은 speech, visual, unknown 중 하나만 사용하세요. "
-                      "speech는 주된 근거가 영상의 발화 또는 나레이션인 경우, "
-                      "visual은 주된 근거가 화면에서 확인되는 시각 정보인 경우입니다. "
-                      "발화와 화면 양쪽에 근거가 있어도 주된 근거에 따라 speech 또는 visual을 선택하세요. "
-                      "주된 근거를 speech 또는 visual 중 하나로 신뢰성 있게 분류할 수 없을 때만 unknown을 사용하세요. "
-                      "timestampStartSeconds와 timestampEndSeconds는 영상 시작(0초)부터의 경과 시간을 초 단위 숫자로 기록하세요. "
-                      "MM:SS 표기에서 콜론만 뺀 숫자를 넣지 마세요. 예: 01:30.5 → 90.5 seconds. "
-                      "timestampStartSeconds는 timestampEndSeconds보다 클 수 없고, timestampEndSeconds는 영상 길이를 넘을 수 없습니다. "
-                      "근거 위치를 특정할 수 없으면 null을 사용하세요.")
+            # The recorded Grounding promptVersion selects the prompt; never fall back to a default.
+            version = kwargs.get("promptVersion")
+            prompt = GROUNDING_PROMPTS.get(version) if isinstance(version, str) else None
+            if prompt is None:
+                raise ProviderFailure("invalid_input")
             schema = grounding_schema()
         else:
             question_count, option_count = kwargs.get("questionCount"), kwargs.get("optionCount")

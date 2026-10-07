@@ -1,0 +1,55 @@
+pilot:
+  video_count_min: 3
+  video_count_max: 5
+  repetitions_per_condition: 2
+  questions_per_video: 3
+  options_per_question: 4
+  # Pilot v2: a separate experiment from pilot-v1 (configs/pilot.yaml stays unchanged).
+  # Quiz A/B input is still the approved contentText only; facts are not added.
+  prompt_version: pilot-v2
+  # 실행 전 공식 모델 ID, 접근 권한, 계정별 제한과 비용 상한을 다시 확인한다.
+  video_grounding:
+    # AI Grounding prompt 계약 버전. 전역 prompt_version(Quiz·Direct Quiz)과 별개이며
+    # 이 값 도입 전 Grounding 결과의 promptVersion은 null이다. authorized_transcript에는 적용하지 않는다.
+    # video-grounding-v2 adds the contentText contract and requires the human Grounding
+    # checklist (PilotRunner.review_grounding) before its contentText can feed A/B Quiz.
+    prompt_version: video-grounding-v2
+    methods:
+      - id: gemini_video
+        model: gemini-3.8-flash
+        provider: gemini
+        api_key_environment_variable: GEMINI_API_KEY
+      - id: authorized_transcript
+        # 영상별 사용 권한이 확인된 transcript/caption이 있을 때만 실행한다.
+        requires_authorized_transcript: true
+  quiz_generation:
+    # 모델 간 비교 시 영상별로 확정한 동일 contentText와 promptVersion을 사용한다.
+    fixed_content_text_required: true
+    models:
+      - id: gemini-3.8-flash
+        provider: gemini
+        api_key_environment_variable: GEMINI_API_KEY
+      - id: gpt-5.4-mini
+        provider: openai
+        api_key_environment_variable: OPENAI_API_KEY
+  end_to_end:
+    methods:
+      - id: gemini_grounding_gemini_quiz
+        grounding: gemini_video
+        quiz_model: gemini-3.8-flash
+      - id: gemini_grounding_openai_quiz
+        grounding: gemini_video
+        quiz_model: gpt-5.4-mini
+      - id: gemini_direct_quiz
+        grounding: direct_video
+        quiz_model: gemini-3.8-flash
+        be_compatibility: not_applicable
+      - id: transcript_gemini_quiz
+        grounding: authorized_transcript
+        quiz_model: gemini-3.8-flash
+        requires_authorized_transcript: true
+      - id: transcript_openai_quiz
+        grounding: authorized_transcript
+        quiz_model: gpt-5.4-mini
+        requires_authorized_transcript: true
+  # 호출 및 비용 상한은 실행 전에 별도로 결정한다. 이 파일은 실행 코드가 아니다.

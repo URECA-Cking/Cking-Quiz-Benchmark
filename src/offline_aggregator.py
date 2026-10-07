@@ -10,6 +10,8 @@ import re
 from pathlib import Path
 
 from src.approval_tracking import require_valid_approval_tracking
+from src.grounding_review import (grounding_condition, grounding_version_matches_quiz_version,
+                                  require_single_successful_candidate, require_valid_grounding_review)
 from src.human_evaluation import require_valid_human_evaluation
 
 
@@ -45,11 +47,16 @@ def _attempt(row):
     return value
 
 
-def _history(rows, selected, condition_fields):
+def _quiz_condition(row):
+    return tuple(row.get(field) for field in ("videoId", "method", "model", "promptVersion",
+                                               "contentTextSha256", "repetition"))
+
+
+def _history(rows, selected, condition):
     selected_attempt = _attempt(selected)
     matches = []
     for row in rows:
-        if all(row.get(field) == selected.get(field) for field in condition_fields):
+        if condition(row) == condition(selected):
             attempt = _attempt(row)
             if attempt <= selected_attempt:
                 item = {key: row[key] for key in _HISTORY_FIELDS if key in row}
@@ -92,6 +99,7 @@ def aggregate_pipeline(results_dir, grounding_run_id, quiz_run_id):
     if grounding.get("contentTextApprovalStatus") != "approved":
         raise ValueError("Grounding contentText is not human approved")
     require_valid_approval_tracking(grounding)
+    require_valid_grounding_review(grounding)
     require_valid_human_evaluation(grounding)
     require_valid_human_evaluation(quiz)
     approved_hash = grounding.get("contentTextSha256")
@@ -100,6 +108,10 @@ def aggregate_pipeline(results_dir, grounding_run_id, quiz_run_id):
         raise ValueError("Approved contentText SHA-256 mismatch")
     if not isinstance(quiz.get("promptVersion"), str) or not quiz["promptVersion"].strip():
         raise ValueError("Quiz promptVersion is required")
+    # The same experiment-integrity rules as the Pilot runner's Quiz gate and storage integrity.
+    if not grounding_version_matches_quiz_version(quiz["promptVersion"], grounding.get("promptVersion")):
+        raise ValueError("Quiz and source Grounding belong to different Pilot experiments")
+    require_single_successful_candidate(grounding_rows, grounding)
 
     evaluation_path = results / "evaluation" / (grounding_run_id + ".json")
     try:
@@ -125,11 +137,8 @@ def aggregate_pipeline(results_dir, grounding_run_id, quiz_run_id):
         "pipelineApiStatus": "success",
         "selectedGroundingAttempt": _attempt(grounding),
         "selectedQuizAttempt": _attempt(quiz),
-        "groundingAttemptHistory": _history(
-            grounding_rows, grounding, ("videoId", "method", "model", "repetition")),
-        "quizAttemptHistory": _history(
-            quiz_rows, quiz, ("videoId", "method", "model", "promptVersion",
-                              "contentTextSha256", "repetition")),
+        "groundingAttemptHistory": _history(grounding_rows, grounding, grounding_condition),
+        "quizAttemptHistory": _history(quiz_rows, quiz, _quiz_condition),
         "groundingLatencyMs": grounding_latency, "quizLatencyMs": quiz_latency,
         "apiLatencySumMs": (grounding_latency + quiz_latency
                             if grounding_latency is not None and quiz_latency is not None else None),
