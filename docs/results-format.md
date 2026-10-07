@@ -48,6 +48,18 @@ Pilot 실행은 한 번에 하나씩 순차적으로 수행합니다. 같은 res
 
 Grounding 행의 `omission`은 승인된 ground truth의 핵심 의미가 `contentText` 또는 `groundingFacts`에 충분히 반영됐는지에 대한 영상별 사람 판정입니다. 모두 반영되면 `pass`, 하나라도 양쪽 모두에서 누락되면 `fail`입니다. `hallucination`은 두 출력의 실질적인 주장을 원본 영상과 대조한 사람 판정입니다. 모두 영상에서 확인되면 `pass`, 영상에서 확인되지 않는 주장이 하나라도 있으면 `fail`입니다. Ground truth에 없다는 이유만으로 환각 처리하지 않습니다. 두 필드 모두 검토 후 신뢰성 있게 판단하기 어려우면 `uncertain`, 미검토라면 `null`이며 자동으로 채우지 않습니다. 세부 기준은 [평가 기준](rubric.md)을 따릅니다.
 
+## Pilot v2 Human Quiz 평가 결과
+
+Pilot v2 Quiz A/B/C의 블라인드 Human Evaluation은 `results/human/<sessionId>/`에만 저장하며 Pilot summary 행과 [`run-result.schema.json`](run-result.schema.json)은 바꾸지 않습니다. 이 하위 디렉터리는 Pilot 저장 무결성 검사 대상이 아닙니다. 세션 생성과 import는 같은 results 디렉터리의 결과 변경 작업과 같은 `.pilot.lock` 잠금을 사용합니다.
+
+- `session.json`(비공개): seed, 순서 방식(`sha256-rank-v1`), blindId·videoRef와 원본 run의 대응(`benchmarkType`, `runId`, 조건 A/B/C, `videoId`, `repetition`, `promptVersion`, `evaluationSha256`, A/B는 `sourceGroundingRunId`·`contentTextSha256`), `blindExportSha256`, 평가 제외 기록(`notEligible`: 조건, 사유(`notRun`은 기록된 시도 없음, `noApiSuccess`는 시도는 있으나 API 성공 없음, `parseFailed`, `questionCountMismatch`, `invalidQuestionStructure`), 시도별 `runId`·`attempt`·`apiStatus`·`errorCategory`·`httpStatus`·`parseStatus`·`validatorStatus`·`questionCount`). 세션 생성 시 마지막에 쓰므로 이 파일이 없는 디렉터리는 불완전한 세션으로 거부합니다.
+- `blind-export.json`(평가자에게 전달): `format`, `sessionId`, `rubricVersion`, 영상별 `videoRef`·`youtubeUrl`과 세트별 `blindId`, 문항(`questionIndex`, `question`, `options`, `correctOptionIndex`, `explanation`, `sourceEvidence`), 비어 있는 `setReview`·`questionReviews`. 허용 목록에 있는 필드만 포함하며 조건·model·runId·contentText·promptVersion·repetition·attempt·사용량·validator 정보·파일 경로는 넣지 않습니다.
+- `evaluation.json`(import 결과): `reviewedBy`, `reviewedAt`(import 시각, UTC), 세트별 원본 run 대응과 `setReview`·`questionReviews`. 한 번만 만들며 덮어쓰지 않습니다. 다시 평가하려면 새 세션을 만듭니다.
+
+순서는 seed로 재현합니다. 영상은 `sha256(seed|video|videoId)`, 영상 안의 세트는 `sha256(seed|set|runId)` 순으로 정렬하고 그 순서대로 `V01…`, `S001…`을 붙이며, 실제 순서와 대응은 `session.json`에 저장합니다. Human 세션은 원칙적으로 Pilot v2 생성 절차를 마친 뒤 만들며, 세션 생성은 모든 조건의 실행 완료를 요구하지 않습니다. 세션 생성 뒤 Pilot v2 결과가 바뀌어 평가 대상 배정이 달라지면 import를 거부하므로 새 세션을 만듭니다. import는 세션·blind export SHA, videoRef와 영상별 blindId 구성의 정확한 일치(누락·추가·중복·이동 거부), 문항·YouTube URL 일치, `questionIndex` 0·1·2, 판정 허용값과 null 금지, 허용되지 않은 필드, `reviewedBy`, 원본 Pilot 행의 method·model·videoId·repetition·promptVersion·`questionCount=3`(A/B는 원천 Grounding과 contentText SHA 포함)과 `evaluation/<runId>.json` SHA, 각 blindId에 표시된 문항과 대응된 원본 run 문항의 일치, 저장된 seed와 현재 Pilot v2 결과로 다시 계산한 (blindId, videoRef, 원본 run) 배정이 `session.json`과 같은지(같은 문항을 가진 run끼리 배정이 바뀐 경우도 거부)를 모두 확인한 뒤에만 `evaluation.json`을 만듭니다.
+
+Pilot v2의 Human 판정 기준 자료는 `evaluation.json`입니다. Pilot v2 summary의 `questionReviews`는 실행 시 만든 빈 값 그대로 두며 Human 판정을 쓰지 않습니다. Pilot v1은 기존처럼 summary의 `questionReviews`가 기준입니다. Judge와 offline 집계는 아직 이 결과를 읽지 않습니다.
+
 ## LLM-as-a-Judge 결과
 
 A/B Quiz에 대한 사후 보조 평가(LLM-as-a-Judge) 결과는 `results/judge/<judgeRunId>/`에만 저장하며 위 세 JSONL과 `results/raw`, `results/evaluation`에는 쓰지 않습니다. 이 하위 디렉터리는 Pilot 저장 무결성 검사 대상이 아닙니다. Judge는 Pilot 결과와 Human Evaluation을 읽기만 합니다. 계약과 파일 구조는 [Judge 프로토콜](judge-protocol.md)을 따릅니다.

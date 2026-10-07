@@ -20,6 +20,17 @@ A/B는 같은 승인 contentText만 사용하며 facts는 입력하지 않습니
 - 입력 token 추정치: Video Grounding과 Direct Quiz에는 `--video-estimated-input-tokens`, fixed contentText Quiz Generation에는 `--quiz-estimated-input-tokens`를 사용합니다. 영상 길이·처리 방식의 실제 입력 토큰을 사전에 확정할 수 없으므로 영상마다 별도 추정치를 지정합니다.
 - retry: 429/5xx에 즉시 재시도하며 timeout/네트워크 오류와 일반 4xx는 재시도하지 않습니다. 429/5xx 뒤 다음 retry가 실행 제한으로 차단되면 마지막 실제 Provider 오류를 유지하고 `retryStopReason=live_guard`로 구분합니다.
 
+## Pilot v2 Human Quiz 블라인드 평가
+
+`human_quiz_evaluation.py`는 저장된 Pilot v2 결과만 읽는 로컬 도구이며 Provider API를 호출하지 않습니다. `configs/pilot-v2.yaml`을 사용하며, 기본값이 아닌 결과 디렉터리는 하위 명령 앞에 `--results-dir <경로>`로 지정합니다(예: `python -m src.human_quiz_evaluation --results-dir results/pilot-v2 create`).
+
+1. 세션 생성: Pilot v2 생성 절차를 마친 뒤 `python -m src.human_quiz_evaluation create --seed <seed>`를 실행합니다. 실행 시도가 없는 조건은 `notRun`(Quiz 모델 실패가 아님, Grounding rejected로 A/B를 실행하지 않은 경우 포함), 시도는 있었지만 API 성공이 없는 조건은 `noApiSuccess`로 `session.json`에 기록됩니다. `--seed`를 생략하면 한 번 생성해 `session.json`에 저장합니다. 출력의 `sessionId`와 `blindExport` 경로를 확인합니다.
+2. 평가자에게는 `results/human/<sessionId>/blind-export.json`만 전달합니다. `session.json`에는 조건 대응이 있으므로 공유하지 않습니다. 평가자는 원본 YouTube 영상을 보고 각 세트의 `setReview`와 `questionReviews`를 채웁니다. 다른 필드는 바꾸지 않습니다.
+3. import: `python -m src.human_quiz_evaluation import --session-id <sessionId> --evaluation-file <채운 파일> --reviewed-by <평가자>`. 검증에 실패하면 아무것도 저장하지 않습니다.
+4. import된 세션은 다시 import할 수 없습니다. 다시 평가하려면 새 세션을 만듭니다(같은 seed를 주면 같은 순서가 됩니다).
+
+평가 기준과 블라인드 한계는 [평가 기준](../docs/rubric.md), 저장 형식은 [결과 형식](../docs/results-format.md)을 따릅니다.
+
 ## API 계약 근거와 검증 범위
 
 2026-09-30 기준 요청 구조는 [Gemini Video understanding](https://ai.google.dev/gemini-api/docs/video-understanding), [Gemini Interactions API](https://ai.google.dev/api/interactions-api), [Gemini thinking](https://ai.google.dev/gemini-api/docs/thinking), [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing), [OpenAI GPT-5.4 mini](https://developers.openai.com/api/docs/models/gpt-5.4-mini), [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs), [OpenAI reasoning](https://developers.openai.com/api/docs/guides/reasoning)을 참고했습니다. Gemini의 `max_output_tokens`에는 thought token도 포함됩니다. Gemini 비용 추정은 반환된 output token과 thought token을 함께 출력 단가로 계산하고, OpenAI의 `output_tokens`에는 reasoning token이 이미 포함되므로 중복 합산하지 않습니다. Adapter 계약은 mock으로 검증했고, 첫 Pilot 영상에서는 실제 Grounding 및 Gemini/OpenAI Quiz 호출과 사람 평가를 수행했습니다. 다른 영상이나 설정에서의 API 호환성·Quiz 품질 및 실제 청구액은 검증하지 않았습니다.
