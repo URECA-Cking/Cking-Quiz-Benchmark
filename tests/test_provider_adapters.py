@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import runpy
@@ -11,7 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 from src.pilot_runner import PilotRunner, ProviderFailure
-from src.provider_adapters import LivePolicy, ProviderRouter, urllib_transport
+from src.provider_adapters import (GROUNDING_PROMPTS, LivePolicy, ProviderRouter, grounding_schema,
+                                   urllib_transport)
 
 
 CONTENT = "NASA measures global rain and snow every 30 minutes."
@@ -21,6 +23,7 @@ QUIZ = {"promptVersion": "pilot-v1", "questions": [
     {"question": f"질문 {i}?", "options": ["가", "나", "다", "라"],
      "correctOptionIndex": 0, "explanation": "자료 기준", "sourceEvidence": "global rain and snow"}
     for i in range(3)]}
+GROUNDING_V1 = "video-grounding-v1"
 GROUNDING = {"contentText": CONTENT, "facts": [{
     "fact": "NASA measures rainfall", "evidenceType": "speech", "evidence": "global rain and snow",
     "timestampStartSeconds": 61, "timestampEndSeconds": 73}]}
@@ -289,7 +292,7 @@ class ProviderAdapterTest(unittest.TestCase):
 
     def test_gemini_grounding_uses_youtube_and_extracts_normalized_result(self):
         transport = FakeTransport(gemini_response(GROUNDING))
-        result = self.router(transport).invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
+        result = self.router(transport).invoke("grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         url, headers, body, _ = transport.calls[0]
         self.assertEqual(url, "https://generativelanguage.googleapis.com/v1beta/interactions")
         self.assertEqual(body["input"][0], {"type": "video", "uri": VIDEO["youtubeUrl"], "processing": "static"})
@@ -300,7 +303,7 @@ class ProviderAdapterTest(unittest.TestCase):
 
     def test_grounding_request_limits_and_defines_evidence_types(self):
         transport = FakeTransport(gemini_response(GROUNDING))
-        self.router(transport).invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
+        self.router(transport).invoke("grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         body = transport.calls[0][2]
         evidence_type = body["response_format"]["schema"]["properties"]["facts"]["items"]["properties"]["evidenceType"]
         self.assertEqual(evidence_type, {"type": "string", "enum": ["speech", "visual", "unknown"]})
@@ -315,7 +318,7 @@ class ProviderAdapterTest(unittest.TestCase):
 
     def test_grounding_request_defines_timestamps_as_elapsed_seconds(self):
         transport = FakeTransport(gemini_response(GROUNDING))
-        self.router(transport).invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
+        self.router(transport).invoke("grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         body = transport.calls[0][2]
         prompt = body["input"][1]["text"]
         for text in ("timestampStartSeconds", "timestampEndSeconds", "경과", "MM:SS",
@@ -327,6 +330,62 @@ class ProviderAdapterTest(unittest.TestCase):
             for text in ("경과 초", "MM:SS", "01:30.5 → 90.5", "null"):
                 self.assertIn(text, properties[key]["description"])
 
+    def grounding_request(self, version):
+        transport = FakeTransport(gemini_response(GROUNDING))
+        self.router(transport).invoke("grounding", video=VIDEO, promptVersion=version, model="gemini-3.8-flash")
+        return transport.calls[0][2]
+
+    def test_v1_grounding_prompt_is_unchanged(self):
+        # SHA-256 of the Grounding prompt text sent before Grounding prompts were versioned.
+        body = self.grounding_request(GROUNDING_V1)
+        prompt = body["input"][1]["text"]
+        self.assertEqual(hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                         "717c36f5762f20824728e6ce41a276a2c53faa68a41d10fb0a019f21bc9a5fab")
+        self.assertEqual(body["response_format"]["schema"], grounding_schema())
+
+    def test_v2_grounding_prompt_adds_the_content_text_contract(self):
+        v1, v2 = self.grounding_request(GROUNDING_V1), self.grounding_request("video-grounding-v2")
+        prompt = v2["input"][1]["text"]
+        self.assertTrue(prompt.startswith(v1["input"][1]["text"]))  # facts rules are kept as in v1
+        for text in ("핵심 정보", "외부 지식", "숫자", "고유명사", "인과관계", "서로 구별되는",
+                     "한국어", "facts와 모순", "메타 문장"):
+            self.assertIn(text, prompt)
+        self.assertNotIn("최소", prompt)  # no fixed minimum length
+        self.assertEqual((v2["input"][0], v2["response_format"]), (v1["input"][0], v1["response_format"]))
+        self.assertEqual(GROUNDING_PROMPTS["video-grounding-v2"], prompt)
+
+    def test_unknown_or_missing_grounding_prompt_version_is_rejected_before_http(self):
+        for arguments in ({}, {"promptVersion": None}, {"promptVersion": "video-grounding-v3"},
+                          {"promptVersion": "pilot-v2"}, {"promptVersion": [GROUNDING_V1]}):
+            transport = FakeTransport(gemini_response(GROUNDING))
+            with self.subTest(arguments=arguments), self.assertRaises(ProviderFailure) as failure:
+                self.router(transport).invoke("grounding", video=VIDEO, model="gemini-3.8-flash", **arguments)
+            self.assertEqual(failure.exception.category, "invalid_input")
+            self.assertEqual(transport.calls, [])
+
+    def test_runner_sends_the_configured_grounding_prompt_version(self):
+        root = Path(__file__).resolve().parents[1]
+        for config, version in (("pilot.yaml", GROUNDING_V1), ("pilot-v2.yaml", "video-grounding-v2")):
+            with self.subTest(config=config), tempfile.TemporaryDirectory() as folder:
+                runner = self.temporary_runner(folder)
+                if config != "pilot.yaml":
+                    shutil.copyfile(root / "configs" / config, runner.repository / "configs" / config)
+                    runner = PilotRunner(runner.repository, runner.results, runner.repository / "configs" / config)
+                transport = FakeTransport(gemini_response(GROUNDING))
+                row = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1, self.router(transport))
+                self.assertEqual((row["apiStatus"], row["promptVersion"]), ("success", version))
+                self.assertEqual(transport.calls[0][2]["input"][1]["text"], GROUNDING_PROMPTS[version])
+
+    def test_unknown_configured_grounding_version_never_reaches_the_transport(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = self.temporary_runner(folder)
+            runner.config["video_grounding"]["prompt_version"] = "video-grounding-v9"
+            transport = FakeTransport(gemini_response(GROUNDING))
+            with self.assertRaisesRegex(ValueError, "not a known Grounding prompt version"):
+                runner.run_grounding(VIDEO["videoId"], "gemini_video", 1, self.router(transport))
+            self.assertEqual(transport.calls, [])
+            self.assertFalse((runner.results / "video-grounding.jsonl").exists())
+
     def test_configured_model_alias_uses_configured_provider_and_key_name(self):
         config = {"video_grounding": {"methods": [{"id": "gemini_video", "model": "gemini-pilot-alias",
                     "provider": "gemini", "api_key_environment_variable": "PILOT_GEMINI_KEY"}]},
@@ -337,7 +396,7 @@ class ProviderAdapterTest(unittest.TestCase):
         transport = FakeTransport(gemini_response(GROUNDING))
         with mock.patch.dict("os.environ", {"PILOT_GEMINI_KEY": "alias-secret"}):
             router = ProviderRouter(policy(reasoning_effort=None), transport=transport, pilot_config=config)
-            result = router.invoke("grounding", video=VIDEO, model="gemini-pilot-alias")
+            result = router.invoke("grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-pilot-alias")
         self.assertEqual(result["normalized"], GROUNDING)
         self.assertEqual(transport.calls[0][1]["x-goog-api-key"], "alias-secret")
         self.assertEqual(transport.calls[0][2]["model"], "gemini-pilot-alias")
@@ -345,7 +404,7 @@ class ProviderAdapterTest(unittest.TestCase):
     def test_actual_usage_produces_cost_with_reference_and_gemini_thinking(self):
         result = self.router(FakeTransport(gemini_response(GROUNDING)),
                              input_price_per_million=2.0, output_price_per_million=3.0).invoke(
-                                 "grounding", video=VIDEO, model="gemini-3.8-flash")
+                                 "grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         self.assertAlmostEqual(result["estimatedCostUsd"], (10 * 2 + (20 + 3) * 3) / 1000000)
         self.assertEqual(result["pricingReference"], "operator-test-pricing")
 
@@ -353,7 +412,7 @@ class ProviderAdapterTest(unittest.TestCase):
         prices = {"gemini": (2.0, 3.0, "gemini-price-source"),
                   "openai": (5.0, 7.0, "openai-price-source")}
         gemini = self.router(FakeTransport(gemini_response(GROUNDING)),
-                             provider_prices=prices).invoke("grounding", video=VIDEO,
+                             provider_prices=prices).invoke("grounding", video=VIDEO, promptVersion=GROUNDING_V1,
                                                              model="gemini-3.8-flash")
         response = {"status": "completed", "output": [{"type": "message", "content": [
                     {"type": "output_text", "text": json.dumps(QUIZ)}]}],
@@ -370,9 +429,9 @@ class ProviderAdapterTest(unittest.TestCase):
         transport = FakeTransport(gemini_response(GROUNDING))
         router = self.router(transport, call_limit=2, video_estimated_input_tokens=1,
                              max_output_tokens=1, total_cost_limit=0.000034)
-        router.invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
+        router.invoke("grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         with self.assertRaises(ProviderFailure) as failure:
-            router.invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
+            router.invoke("grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         self.assertEqual(failure.exception.category, "live_guard")
         self.assertEqual(len(transport.calls), 1)
 
@@ -386,7 +445,7 @@ class ProviderAdapterTest(unittest.TestCase):
     def test_each_kind_requires_only_its_own_estimate_before_http(self):
         grounding = FakeTransport(gemini_response(GROUNDING))
         self.router(grounding, quiz_estimated_input_tokens=None).invoke(
-            "grounding", video=VIDEO, model="gemini-3.8-flash")
+            "grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         self.assertEqual(len(grounding.calls), 1)
 
         quiz = FakeTransport(gemini_response(QUIZ))
@@ -403,7 +462,7 @@ class ProviderAdapterTest(unittest.TestCase):
 
         for kind, missing, arguments in (
                 ("grounding", {"video_estimated_input_tokens": None},
-                 {"video": VIDEO}),
+                 {"video": VIDEO, "promptVersion": GROUNDING_V1}),
                 ("quiz", {"quiz_estimated_input_tokens": None},
                  {"contentText": CONTENT, "promptVersion": "pilot-v1",
                   "questionCount": 3, "optionCount": 4}),
@@ -441,7 +500,7 @@ class ProviderAdapterTest(unittest.TestCase):
 
     def test_openai_requires_reasoning_but_gemini_does_not(self):
         gemini = self.router(FakeTransport(gemini_response(GROUNDING)), reasoning_effort=None)
-        self.assertEqual(gemini.invoke("grounding", video=VIDEO,
+        self.assertEqual(gemini.invoke("grounding", video=VIDEO, promptVersion=GROUNDING_V1,
                                       model="gemini-3.8-flash")["normalized"], GROUNDING)
         transport = FakeTransport({})
         with self.assertRaises(ProviderFailure) as failure:
@@ -494,7 +553,7 @@ class ProviderAdapterTest(unittest.TestCase):
     def test_bad_status_and_http_errors_are_classified(self):
         for status, category in ((429, "rate_limit"), (400, "client_error"), (500, "server_error")):
             with self.subTest(status=status), self.assertRaises(ProviderFailure) as failure:
-                self.router(FakeTransport({}, status)).invoke("grounding", video=VIDEO,
+                self.router(FakeTransport({}, status)).invoke("grounding", video=VIDEO, promptVersion=GROUNDING_V1,
                                                               model="gemini-3.8-flash")
             self.assertEqual(failure.exception.category, category)
         with self.assertRaises(ProviderFailure) as failure:
@@ -541,7 +600,7 @@ class ProviderAdapterTest(unittest.TestCase):
         transport = FakeTransport({"providerErrorCode": "service_unavailable"}, 503)
         with self.assertRaises(ProviderFailure) as failure:
             self.router(transport, retry_attempts=2, call_limit=1).invoke(
-                "grounding", video=VIDEO, model="gemini-3.8-flash")
+                "grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         self.assertEqual((failure.exception.category, failure.exception.http_status,
                           failure.exception.provider_error_code),
                          ("server_error", 503, "service_unavailable"))
@@ -550,7 +609,7 @@ class ProviderAdapterTest(unittest.TestCase):
     def test_gemini_client_error_keeps_code_and_success_has_null_code(self):
         transport = FakeTransport({"providerErrorCode": "invalid_request"}, 400)
         with self.assertRaises(ProviderFailure) as failure:
-            self.router(transport).invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
+            self.router(transport).invoke("grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         self.assertEqual((failure.exception.category, failure.exception.http_status,
                           failure.exception.provider_error_code),
                          ("client_error", 400, "invalid_request"))
@@ -585,12 +644,12 @@ class ProviderAdapterTest(unittest.TestCase):
     def test_malformed_envelope_and_network_error_are_classified(self):
         with self.assertRaises(ProviderFailure) as failure:
             self.router(FakeTransport({"status": "completed", "steps": []})).invoke(
-                "grounding", video=VIDEO, model="gemini-3.8-flash")
+                "grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         self.assertEqual(failure.exception.category, "invalid_provider_response")
         def broken(*args):
             raise OSError("secret in exception must not escape")
         with self.assertRaises(ProviderFailure) as failure:
-            self.router(broken).invoke("grounding", video=VIDEO, model="gemini-3.8-flash")
+            self.router(broken).invoke("grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         self.assertEqual(failure.exception.category, "network_error")
 
     def test_mock_live_router_integrates_with_runner_and_keeps_human_reviews_null(self):
@@ -632,7 +691,7 @@ class ProviderAdapterTest(unittest.TestCase):
                 transport = FakeTransport({"error": "Bearer unrelated-secret"}, status)
                 with self.assertRaises(ProviderFailure) as failure:
                     self.router(transport, retry_attempts=2, call_limit=1).invoke(
-                        "grounding", video=VIDEO, model="gemini-3.8-flash")
+                        "grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
                 self.assertEqual((failure.exception.category, failure.exception.http_status),
                                  (category, status))
                 self.assertEqual(failure.exception.retry_stop_reason, "live_guard")
@@ -658,7 +717,7 @@ class ProviderAdapterTest(unittest.TestCase):
         transport = FakeTransport({}, 429)
         with self.assertRaises(ProviderFailure) as failure:
             self.router(transport, retry_attempts=2, call_limit=0).invoke(
-                "grounding", video=VIDEO, model="gemini-3.8-flash")
+                "grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         self.assertEqual((failure.exception.category, failure.exception.http_status),
                          ("live_guard", None))
         self.assertIsNone(failure.exception.retry_stop_reason)
@@ -707,7 +766,7 @@ class ProviderAdapterTest(unittest.TestCase):
         transport = FakeTransport({"providerErrorCode": "service_unavailable"}, 503)
         with self.assertRaises(ProviderFailure) as failure:
             self.router(transport, retry_attempts=2, call_limit=5, total_cost_limit=0.02).invoke(
-                "grounding", video=VIDEO, model="gemini-3.8-flash")
+                "grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         self.assertEqual((failure.exception.category, failure.exception.http_status,
                           failure.exception.provider_error_code, failure.exception.retry_stop_reason),
                          ("server_error", 503, "service_unavailable", "live_guard"))
@@ -818,19 +877,19 @@ class ProviderAdapterTest(unittest.TestCase):
             with self.subTest(first_status=first_status):
                 transport = RecoveringTransport(None)
                 result = self.router(transport, call_limit=2, retry_attempts=1).invoke(
-                    "grounding", video=VIDEO, model="gemini-3.8-flash")
+                    "grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
                 self.assertEqual(result["normalized"], GROUNDING)
                 self.assertEqual(len(transport.calls), 2)
         client_error = FakeTransport({}, 400)
         with self.assertRaises(ProviderFailure):
             self.router(client_error, call_limit=2, retry_attempts=1).invoke(
-                "grounding", video=VIDEO, model="gemini-3.8-flash")
+                "grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         self.assertEqual(len(client_error.calls), 1)
         def timeout(*args):
             raise TimeoutError()
         with self.assertRaises(ProviderFailure) as failure:
             self.router(timeout, call_limit=2, retry_attempts=1).invoke(
-                "grounding", video=VIDEO, model="gemini-3.8-flash")
+                "grounding", video=VIDEO, promptVersion=GROUNDING_V1, model="gemini-3.8-flash")
         self.assertEqual(failure.exception.category, "timeout")
 
     def test_model_cannot_override_fixed_prompt_version(self):

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from src.grounding_review import REVIEW_ITEMS
 from src.offline_aggregator import aggregate_pipeline, compare_pair
 
 
@@ -83,6 +84,106 @@ class OfflineAggregatorTest(unittest.TestCase):
         self.assertEqual(result["quizPricingReference"], "quiz-price")
         self.assertEqual(result["contentTextApprovalStatus"], "approved")
         self.assertEqual(before, {p: p.read_bytes() for p in self.results.rglob("*") if p.is_file()})
+
+    def test_grounding_history_is_scoped_to_the_grounding_prompt_version(self):
+        reviewed_at = "2026-10-07T00:00:00+00:00"
+        review = dict({item: "pass" for item in REVIEW_ITEMS}, reviewNote=None, reviewedBy="r",
+                      reviewedAt=reviewed_at)
+        v2 = dict(self.grounding, runId="ground-v2", attempt=2, promptVersion="video-grounding-v2",
+                  groundingReview=review, approvedBy="r", approvedAt=reviewed_at)
+        version_rows = [
+            self.row("video_grounding", "ground-v1-3", "gemini_video", "gemini-3.8-flash", 3,
+                     apiStatus="error", promptVersion="video-grounding-v1"),
+            self.row("video_grounding", "ground-v2-1", "gemini_video", "gemini-3.8-flash", 1,
+                     apiStatus="error", promptVersion="video-grounding-v2")]
+        legacy = self.row("video_grounding", "ground-1", "gemini_video", "gemini-3.8-flash", 1,
+                          apiStatus="error", errorCategory="server_error", httpStatus=503)
+        quiz = dict(self.quiz, runId="quiz-v2", sourceGroundingRunId="ground-v2", promptVersion="pilot-v2")
+        self.write([legacy, version_rows[0], self.grounding, version_rows[1], v2], [self.quiz, quiz])
+        (self.results / "evaluation" / "ground-v2.json").write_text(
+            json.dumps({"contentText": CONTENT}), encoding="utf-8")
+        history = aggregate_pipeline(self.results, "ground-v2", "quiz-v2")["groundingAttemptHistory"]
+        self.assertEqual([item["runId"] for item in history], ["ground-v2-1", "ground-v2"])
+        # Legacy null rows stay in the video-grounding-v1 history, as before versioning.
+        self.assertEqual([item["runId"] for item in self.aggregate()["groundingAttemptHistory"]],
+                         ["ground-1", "ground-v1-3", "ground-5"])
+        unreviewed = {key: value for key, value in v2.items() if key != "groundingReview"}
+        self.write([legacy, unreviewed], [quiz])
+        with self.assertRaisesRegex(ValueError, "human review"):
+            aggregate_pipeline(self.results, "ground-v2", "quiz-v2")
+
+    def v2_grounding(self, run_id, attempt, status="approved", api_status="success"):
+        reviewed_at = "2026-10-07T00:00:00+00:00"
+        verdict = "fail" if status == "rejected" else "pass"
+        row = self.row("video_grounding", run_id, "gemini_video", "gemini-3.8-flash", attempt,
+                       apiStatus=api_status, promptVersion="video-grounding-v2", groundingFacts=[],
+                       contentTextSha256=SHA, contentTextApprovalStatus=None)
+        if api_status == "success" and status in ("approved", "rejected"):
+            row.update(contentTextApprovalStatus=status, groundingReview=dict(
+                {item: verdict for item in REVIEW_ITEMS}, reviewNote=None, reviewedBy="r", reviewedAt=reviewed_at))
+            if status == "approved":
+                row.update(approvedBy="r", approvedAt=reviewed_at)
+        return row
+
+    def link_v2(self, grounding_rows, selected="ground-v2-1"):
+        quizzes = [dict(self.quiz, runId="quiz-v2-a", sourceGroundingRunId=selected, promptVersion="pilot-v2"),
+                   dict(self.other_quiz, runId="quiz-v2-b", sourceGroundingRunId=selected, promptVersion="pilot-v2")]
+        self.write(grounding_rows, quizzes)
+        for row in grounding_rows:
+            (self.results / "evaluation" / (row["runId"] + ".json")).write_text(
+                json.dumps({"contentText": CONTENT}), encoding="utf-8")
+
+    def test_multiple_successful_v2_candidates_are_never_aggregated(self):
+        selected = self.v2_grounding("ground-v2-1", 1)
+        for second_status in (None, "approved", "rejected"):
+            with self.subTest(second=second_status):
+                self.link_v2([selected, self.v2_grounding("ground-v2-2", 2, second_status)])
+                before = {p: p.read_bytes() for p in self.results.rglob("*") if p.is_file()}
+                with self.assertRaisesRegex(ValueError, "more than one successful Grounding"):
+                    aggregate_pipeline(self.results, "ground-v2-1", "quiz-v2-a")
+                with self.assertRaisesRegex(ValueError, "more than one successful Grounding"):
+                    compare_pair(self.results, "quiz-v2-a", "quiz-v2-b")
+                self.assertEqual(before, {p: p.read_bytes() for p in self.results.rglob("*") if p.is_file()})
+
+    def test_technical_failures_before_one_v2_success_are_aggregated(self):
+        failures = [self.v2_grounding("ground-v2-f%d" % number, number, None, "error") for number in (1, 2)]
+        self.link_v2(failures + [self.v2_grounding("ground-v2-1", 3)])
+        result = aggregate_pipeline(self.results, "ground-v2-1", "quiz-v2-a")
+        self.assertEqual([item["runId"] for item in result["groundingAttemptHistory"]],
+                         ["ground-v2-f1", "ground-v2-f2", "ground-v2-1"])
+        self.assertEqual(compare_pair(self.results, "quiz-v2-a", "quiz-v2-b")["b"]["quizRunId"], "quiz-v2-b")
+
+    def test_multiple_v1_or_legacy_successes_keep_the_previous_semantics(self):
+        another = dict(self.grounding, runId="ground-6", attempt=6, contentTextApprovalStatus=None)
+        explicit_v1 = dict(self.grounding, runId="ground-7", attempt=7, promptVersion="video-grounding-v1")
+        self.write([self.grounding, another, explicit_v1], [self.quiz, self.other_quiz])
+        self.assertEqual(self.aggregate()["groundingRunId"], "ground-5")
+        self.assertEqual(compare_pair(self.results, "quiz-a", "quiz-b")["a"]["groundingRunId"], "ground-5")
+
+    def test_quiz_and_source_grounding_must_belong_to_the_same_experiment(self):
+        sources = {"legacy": dict(self.grounding, runId="ground-x"),
+                   "v1": dict(self.grounding, runId="ground-x", promptVersion="video-grounding-v1"),
+                   "v2": self.v2_grounding("ground-x", 1)}
+        cases = (("pilot-v1", "legacy", True), ("pilot-v1", "v1", True), ("pilot-v1", "v2", False),
+                 ("pilot-v2", "legacy", False), ("pilot-v2", "v1", False), ("pilot-v2", "v2", True))
+        for quiz_version, source, allowed in cases:
+            with self.subTest(quiz=quiz_version, source=source):
+                quizzes = [dict(self.quiz, sourceGroundingRunId="ground-x", promptVersion=quiz_version),
+                           dict(self.other_quiz, sourceGroundingRunId="ground-x", promptVersion=quiz_version)]
+                self.write([sources[source]], quizzes)
+                (self.results / "evaluation" / "ground-x.json").write_text(
+                    json.dumps({"contentText": CONTENT}), encoding="utf-8")
+                if allowed:
+                    self.assertEqual(aggregate_pipeline(self.results, "ground-x", "quiz-a")["promptVersion"],
+                                     quiz_version)
+                    self.assertEqual(compare_pair(self.results, "quiz-a", "quiz-b")["a"]["groundingRunId"],
+                                     "ground-x")
+                else:
+                    # Both Quiz runs share one Quiz version; the Grounding version still decides.
+                    for check in (lambda: aggregate_pipeline(self.results, "ground-x", "quiz-a"),
+                                  lambda: compare_pair(self.results, "quiz-a", "quiz-b")):
+                        with self.assertRaisesRegex(ValueError, "different Pilot experiments"):
+                            check()
 
     def test_rejects_ambiguous_or_missing_run_ids_and_wrong_types(self):
         with self.assertRaisesRegex(ValueError, "Quiz runId"):

@@ -1,6 +1,9 @@
 """One-condition Pilot runner. Live HTTP requires explicit safety options."""
 
 import argparse
+import contextlib
+import errno
+import functools
 import hashlib
 import json
 import math
@@ -14,7 +17,13 @@ from pathlib import Path
 import yaml
 
 from src.approval_tracking import normalize_approved_by, require_valid_approval_tracking
+from src.grounding_review import (build_review, derive_approval_status, grounding_attempt_version,
+                                  grounding_condition, grounding_version_matches_quiz_version,
+                                  is_known_grounding_version, require_single_successful_candidate,
+                                  require_valid_grounding_review, requires_review,
+                                  successful_review_candidates)
 from src.human_evaluation import require_valid_human_evaluation
+from src.provider_adapters import GROUNDING_PROMPTS
 from src.provider_failure import ProviderFailure
 
 
@@ -37,7 +46,23 @@ class FixtureProvider:
         return response
 
 
+# errno of an already held results lock: msvcrt.locking(LK_NBLCK) reports EACCES; flock(LOCK_NB)
+# reports EWOULDBLOCK (EAGAIN on Linux). Any other lock error is a real failure, not a busy lock.
+_LOCK_BUSY_ERRNOS = frozenset({errno.EACCES} if os.name == "nt" else {errno.EAGAIN, errno.EWOULDBLOCK})
+
+
+def _exclusive(method):
+    """Run a result mutation while holding the results-directory lock (see PilotRunner._results_lock)."""
+    @functools.wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._results_lock():
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class PilotRunner:
+    # Results-directory lock file; not a result artifact and never read as one.
+    LOCK_FILE = ".pilot.lock"
     FILES = {
         "video_grounding": "video-grounding.jsonl",
         "quiz_generation": "quiz-generation.jsonl",
@@ -60,6 +85,42 @@ class PilotRunner:
         if resolved != safe_root and safe_root not in resolved.parents:
             raise ValueError("The results directory must be inside repository/results")
         return resolved
+
+    @contextlib.contextmanager
+    def _results_lock(self):
+        """Exclusive, non-blocking OS lock for one results directory.
+
+        Only one Pilot mutation (integrity check, Provider call, artifact and summary writes) runs
+        per results directory; a concurrent one fails at once instead of waiting. The operating
+        system releases the lock when the process ends, so the lock file existing means nothing.
+        This serializes mutations only: a crash mid-operation is still caught by the integrity check.
+        """
+        self._safe_results_path(self.results)
+        self.results.mkdir(parents=True, exist_ok=True)
+        path = self.results / self.LOCK_FILE
+        if path.is_symlink():
+            raise ValueError("The results lock file must not be a link")
+        with open(path, "a+b") as handle:
+            handle.seek(0)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno not in _LOCK_BUSY_ERRNOS:
+                    raise
+                raise ValueError("Another Pilot operation is already in progress for this results directory") from exc
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
     def _jsonl(path):
@@ -87,7 +148,10 @@ class PilotRunner:
                     and existing.get("model") == model and existing.get("repetition") == repetition
                     and (benchmark_type != "quiz_generation"
                          or (existing.get("promptVersion") == prompt_version
-                             and existing.get("contentTextSha256") == content_hash))):
+                             and existing.get("contentTextSha256") == content_hash))
+                    and (benchmark_type != "video_grounding"
+                         or grounding_attempt_version(existing.get("promptVersion"))
+                         == grounding_attempt_version(prompt_version))):
                 attempt = existing.get("attempt", 1)
                 if type(attempt) is not int or attempt < 1:
                     raise ValueError("Invalid attempt in existing result")
@@ -140,10 +204,26 @@ class PilotRunner:
                     raise ValueError(f"Result storage integrity error: invalid {filename} line {line_number}")
                 try:
                     require_valid_human_evaluation(row)
+                    if (benchmark_type == "video_grounding"
+                            and not is_known_grounding_version(row.get("promptVersion"))):
+                        # Legacy null and versions with a Grounding prompt only; Quiz rows carry
+                        # Pilot (pilot-v1/pilot-v2) versions and are not checked here.
+                        raise ValueError("Unknown Grounding promptVersion")
+                    require_valid_grounding_review(row)
                 except ValueError as exc:
                     raise ValueError(f"Result storage integrity error: invalid {filename} line {line_number}") from exc
                 known_ids.add(run_id)
                 rows.append((benchmark_type, row))
+
+        grounding_rows = [row for benchmark_type, row in rows if benchmark_type == "video_grounding"]
+        for row in grounding_rows:
+            if row.get("apiStatus") == "success":
+                # Pilot v2 has one successful candidate per condition; legacy/v1 rows are not affected.
+                try:
+                    require_single_successful_candidate(grounding_rows, row)
+                except ValueError as exc:
+                    raise ValueError("Result storage integrity error: more than one successful Grounding "
+                                     "for a Pilot v2 condition") from exc
 
         for benchmark_type, row in rows:
             run_id = row["runId"]
@@ -199,6 +279,9 @@ class PilotRunner:
             prompt_version = self.config["video_grounding"].get("prompt_version")
             if not isinstance(prompt_version, str) or not prompt_version.strip():
                 raise ValueError("pilot.video_grounding.prompt_version is required for AI Grounding")
+            if prompt_version not in GROUNDING_PROMPTS:
+                # Checked here so no attempt or error row is recorded for a prompt that does not exist.
+                raise ValueError("pilot.video_grounding.prompt_version is not a known Grounding prompt version")
         return {
             "benchmarkType": benchmark_type, "runId": uuid.uuid4().hex,
             "videoId": video_id, "method": method, "model": model,
@@ -381,7 +464,13 @@ class PilotRunner:
                 or len(approved_hash) != 64
                 or any(char not in "0123456789abcdef" for char in approved_hash)):
             raise ValueError("An approved Grounding result is required")
+        # Pilot v1 Quiz takes only legacy/video-grounding-v1 sources and Pilot v2 Quiz only
+        # video-grounding-v2 sources; the fixed-content manifest is not relied on for this.
+        if not grounding_version_matches_quiz_version(self.config["prompt_version"], source.get("promptVersion")):
+            raise ValueError("The source Grounding prompt version does not belong to this Pilot experiment")
         require_valid_approval_tracking(source)
+        # A Grounding version that needs the human checklist is usable only when every item passed.
+        require_valid_grounding_review(source)
         evaluation = json.loads(evaluation_file.read_text(encoding="utf-8"))
         original = evaluation.get("contentText") if isinstance(evaluation, dict) else None
         if (not isinstance(original, str) or not original.strip()
@@ -389,6 +478,7 @@ class PilotRunner:
                 or hashlib.sha256(content_text.encode("utf-8")).hexdigest() != approved_hash):
             raise ValueError("Quiz contentText must match approved Grounding contentText")
 
+    @_exclusive
     def approve_content(self, source_grounding_run_id, approved_by):
         """Explicit human-review action; never called by a benchmark run."""
         if (not isinstance(source_grounding_run_id, str)
@@ -413,6 +503,8 @@ class PilotRunner:
         index, row = matches[0]
         if row.get("benchmarkType") != "video_grounding" or row.get("apiStatus") != "success":
             raise ValueError("Only a successful Grounding result can receive human approval")
+        if requires_review(row):
+            raise ValueError("This Grounding version is approved only through review_grounding with the human checklist")
         evaluation = json.loads(evaluation_file.read_text(encoding="utf-8"))
         content = evaluation.get("contentText") if isinstance(evaluation, dict) else None
         if not isinstance(content, str) or not content.strip():
@@ -430,6 +522,59 @@ class PilotRunner:
         row["contentTextApprovalStatus"] = "approved"
         row["approvedBy"] = approved_by
         row["approvedAt"] = datetime.now(timezone.utc).isoformat()
+        self._rewrite_grounding_row(result_file, lines, index, row)
+        return row
+
+    @_exclusive
+    def review_grounding(self, source_grounding_run_id, reviewed_by, checklist):
+        """Explicit human Grounding review; never called by a benchmark run.
+
+        ``checklist`` holds the person's five pass/fail/uncertain verdicts (and an optional
+        reviewNote). Only the overall approved/rejected status is derived. A stored review is
+        final: it is never overwritten, and a rejection is not a technical failure to retry.
+        """
+        if (not isinstance(source_grounding_run_id, str)
+                or len(source_grounding_run_id) != 32
+                or any(char not in "0123456789abcdef" for char in source_grounding_run_id)):
+            raise ValueError("A Grounding runId is required for human review")
+        review = build_review(checklist, reviewed_by, datetime.now(timezone.utc).isoformat())
+        self._check_storage_integrity()
+        result_file = self.results / self.FILES["video_grounding"]
+        evaluation_file = self.results / "evaluation" / (source_grounding_run_id + ".json")
+        if (result_file.resolve() != result_file or evaluation_file.resolve() != evaluation_file
+                or not result_file.is_file() or not evaluation_file.is_file()):
+            raise ValueError("Grounding result and evaluation are required for human review")
+        with result_file.open(encoding="utf-8", newline="") as stream:
+            lines = stream.readlines()
+        matches = [(index, json.loads(line)) for index, line in enumerate(lines) if line.strip()
+                   and json.loads(line).get("runId") == source_grounding_run_id]
+        if len(matches) != 1:
+            raise ValueError("Exactly one Grounding result is required for human review")
+        index, row = matches[0]
+        if row.get("benchmarkType") != "video_grounding" or row.get("apiStatus") != "success":
+            raise ValueError("Only a successful Grounding result can receive human review")
+        if not requires_review(row):
+            raise ValueError("This Grounding version does not use the human Grounding checklist")
+        if "groundingReview" in row or row.get("contentTextApprovalStatus") is not None:
+            raise ValueError("This Grounding already has a human review; it is never overwritten")
+        # Never pick one of several candidates of the same condition; that needs a human decision.
+        require_single_successful_candidate([json.loads(line) for line in lines if line.strip()], row)
+        evaluation = json.loads(evaluation_file.read_text(encoding="utf-8"))
+        content = evaluation.get("contentText") if isinstance(evaluation, dict) else None
+        if (not isinstance(content, str) or not content.strip()
+                or hashlib.sha256(content.encode("utf-8")).hexdigest() != row.get("contentTextSha256")):
+            raise ValueError("Grounding contentText hash does not match evaluation")
+        row["groundingReview"] = review
+        row["contentTextApprovalStatus"] = derive_approval_status(review)
+        if row["contentTextApprovalStatus"] == "approved":
+            # Keeps the existing approval tracking contract that the Quiz gate already checks.
+            row["approvedBy"], row["approvedAt"] = review["reviewedBy"], review["reviewedAt"]
+        require_valid_grounding_review(row)
+        self._rewrite_grounding_row(result_file, lines, index, row)
+        return row
+
+    @staticmethod
+    def _rewrite_grounding_row(result_file, lines, index, row):
         newline = "\r\n" if lines[index].endswith("\r\n") else "\n" if lines[index].endswith("\n") else ""
         lines[index] = json.dumps(row, ensure_ascii=False) + newline
         temp_path = None
@@ -445,7 +590,6 @@ class PilotRunner:
         finally:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
-        return row
 
     @staticmethod
     def _call(provider, kind, **kwargs):
@@ -473,6 +617,11 @@ class PilotRunner:
             if duration is not None and (type(duration) not in (int, float) or not duration > 0):
                 raise ValueError("durationSeconds must be a positive number when recorded")
         row = self._base("video_grounding", video_id, method, methods[method].get("model"), repetition)
+        if requires_review(row) and self._successful_candidates(row):
+            # A Pilot v2 condition is terminal once it has a successful Grounding, whatever its review
+            # state: only technical failures get another attempt, and a human rejection is the final
+            # outcome. Regeneration needs a separate human decision. Nothing is written.
+            raise ValueError("A successful Grounding already exists for this Pilot v2 condition; it is not regenerated")
         row.update(groundingFacts=[], omission=None, hallucination=None,
                    contentTextApprovalStatus=None)
         if method == "authorized_transcript" and not authorized_transcript:
@@ -489,7 +638,8 @@ class PilotRunner:
                 raw = None
             else:
                 response, elapsed = self._call(
-                    provider, "grounding", video=self.videos[video_id], model=row["model"])
+                    provider, "grounding", video=self.videos[video_id], model=row["model"],
+                    promptVersion=row["promptVersion"])
                 normalized = response.get("normalized") if self._actual(provider) else response.get("raw")
                 raw = response.get("responseBody") if self._actual(provider) else {"source": "fixture"}
                 if not isinstance(normalized, dict) or not isinstance(normalized.get("contentText"), str) or not normalized["contentText"].strip():
@@ -532,6 +682,13 @@ class PilotRunner:
                 normalized = None
             return self._save(row, raw, normalized), None
 
+    def _successful_candidates(self, row):
+        result_file = self.results / self.FILES["video_grounding"]
+        if not result_file.exists():
+            return []
+        return successful_review_candidates(self._jsonl(result_file), grounding_condition(row))
+
+    @_exclusive
     def run_grounding(self, video_id, method, repetition, provider, authorized_transcript=None):
         return self._run_grounding(video_id, method, repetition, provider, authorized_transcript)[0]
 
@@ -600,7 +757,11 @@ class PilotRunner:
             row["validatorStatus"] = "fail"
             row["errorCategory"] = "quiz_contract_error"
 
+    @_exclusive
     def run_quiz(self, video_id, model, repetition, content_text, provider, source_grounding_run_id=None):
+        return self._run_quiz(video_id, model, repetition, content_text, provider, source_grounding_run_id)
+
+    def _run_quiz(self, video_id, model, repetition, content_text, provider, source_grounding_run_id=None):
         self._check(video_id, repetition)
         models = {item["id"] for item in self.config["quiz_generation"]["models"]}
         if model not in models or not isinstance(content_text, str) or not content_text.strip():
@@ -631,6 +792,7 @@ class PilotRunner:
             self._failure(row, provider, exc, started, response)
             return self._save(row)
 
+    @_exclusive
     def run_end_to_end(self, video_id, method, repetition, provider, authorized_transcript=None):
         self._check(video_id, repetition)
         methods = {item["id"]: item for item in self.config["end_to_end"]["methods"]}
@@ -672,8 +834,8 @@ class PilotRunner:
             row["totalLatencyMs"] = grounding["latencyMs"]
             row["totalEstimatedCostUsd"] = grounding["estimatedCostUsd"]
             return self._save(row)
-        quiz = self.run_quiz(video_id, row["model"], repetition, content, provider,
-                             source_grounding_run_id=grounding["runId"])
+        quiz = self._run_quiz(video_id, row["model"], repetition, content, provider,
+                              source_grounding_run_id=grounding["runId"])
         row["quizRunId"] = quiz["runId"]
         row["apiStatus"] = quiz["apiStatus"]
         row["errorCategory"] = quiz["errorCategory"]
@@ -720,8 +882,10 @@ def main():
     parser.add_argument("--source-grounding-run-id")
     parser.add_argument("--authorized-transcript-file", type=Path)
     parser.add_argument("--results-dir", type=Path, default=Path("results"))
+    parser.add_argument("--config", type=Path,
+                        help="Pilot config file (default configs/pilot.yaml, Pilot v1; configs/pilot-v2.yaml for Pilot v2)")
     args = parser.parse_args()
-    runner = PilotRunner(Path(__file__).resolve().parents[1], args.results_dir)
+    runner = PilotRunner(Path(__file__).resolve().parents[1], args.results_dir, args.config)
     if args.live:
         from src.provider_adapters import LivePolicy, ProviderRouter
         provider_prices = {}

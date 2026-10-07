@@ -1,9 +1,15 @@
+import errno
 import json
 import hashlib
 import math
 import os
+import queue
 import shutil
+import subprocess
+import sys
 import tempfile
+import textwrap
+import threading
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -12,7 +18,7 @@ from pathlib import Path
 from threading import Barrier
 from unittest import mock
 
-from src import approval_tracking
+from src import approval_tracking, grounding_review
 from src.pilot_runner import FixtureProvider, PilotRunner
 
 
@@ -723,11 +729,16 @@ class PilotRunnerTest(unittest.TestCase):
         self.run_approved_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider)
         other_video = "nasa-methane-2020"
         self.run_approved_quiz(other_video, "gpt-5.4-mini", 1, CONTENT + " other", provider)
-        config = self.repository / "configs" / "pilot.yaml"
-        config.write_text(config.read_text(encoding="utf-8").replace("pilot-v1", "pilot-v2"), encoding="utf-8")
-        next_version = PilotRunner(self.repository, self.repository / "results" / "next")
-        self.run_approved_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT + " changed",
-                               provider, runner=next_version)
+        # pilot-v2 Quiz needs a reviewed video-grounding-v2 source; its manifest entry is separate.
+        shutil.copyfile(ROOT / "configs" / "pilot-v2.yaml", self.repository / "configs" / "pilot-v2.yaml")
+        next_version = PilotRunner(self.repository, self.repository / "results" / "next",
+                                   self.repository / "configs" / "pilot-v2.yaml")
+        changed = CONTENT + " changed"
+        source = next_version.run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(
+            {"grounding": {"normalized": dict(GROUNDING, contentText=changed), "responseBody": FIXTURE_RAW}}))
+        next_version.review_grounding(source["runId"], APPROVER,
+                                      {item: "pass" for item in grounding_review.REVIEW_ITEMS})
+        next_version.run_quiz(VIDEO, "gpt-5.4-mini", 1, changed, provider, source_grounding_run_id=source["runId"])
         self.assertEqual(len(provider.calls), 3)
 
     def test_custom_results_directory_links_grounding_approval_and_quiz(self):
@@ -755,7 +766,9 @@ class PilotRunnerTest(unittest.TestCase):
 
     def test_grounding_from_another_results_directory_is_rejected(self):
         def snapshot(directory):
-            return {path: path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+            # The results lock file is not a result; a refused operation may still create it.
+            return {path: path.read_bytes() for path in directory.rglob("*")
+                    if path.is_file() and path.name != PilotRunner.LOCK_FILE}
 
         custom = PilotRunner(self.repository, self.results / "custom")
         default_source = self.approved_source()
@@ -1035,7 +1048,7 @@ class PilotRunnerTest(unittest.TestCase):
         self.runner.approve_content(self.approved_source(approval=None), APPROVER)
         schema = json.loads((ROOT / "docs" / "run-result.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["contentTextApprovalStatus"]["enum"],
-                         ["approved", None])
+                         ["approved", "rejected", None])  # rejected only via the Pilot v2 review
         self.assertEqual(schema["oneOf"][0]["then"]["required"], ["contentTextSha256"])
         self.assertEqual(schema["properties"]["approvedBy"],
                          {"type": "string", "minLength": 1,
@@ -1055,6 +1068,643 @@ class PilotRunnerTest(unittest.TestCase):
                 self.assertEqual("approvedBy" in row, "approvedAt" in row)
                 self.assertIn(row["benchmarkType"], schema["properties"]["benchmarkType"]["enum"])
                 self.assertIn(row["apiStatus"], schema["properties"]["apiStatus"]["enum"])
+
+
+ALL_PASS = {item: "pass" for item in grounding_review.REVIEW_ITEMS}
+
+
+class PilotV2GroundingReviewTest(unittest.TestCase):
+    """Pilot v2 (video-grounding-v2) human Grounding checklist and its A/B gate."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.repository = Path(self.temp.name)
+        (self.repository / "configs").mkdir()
+        (self.repository / "data").mkdir()
+        for name in ("pilot.yaml", "pilot-v2.yaml"):
+            shutil.copyfile(ROOT / "configs" / name, self.repository / "configs" / name)
+        shutil.copyfile(ROOT / "data" / "videos.jsonl", self.repository / "data" / "videos.jsonl")
+        self.results = self.repository / "results"
+        self.v1 = PilotRunner(self.repository, self.results)
+        self.v2 = PilotRunner(self.repository, self.results, self.repository / "configs" / "pilot-v2.yaml")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def grounding_file(self):
+        return self.results / "video-grounding.jsonl"
+
+    def rows(self):
+        return [json.loads(line) for line in self.grounding_file().read_text(encoding="utf-8").splitlines()]
+
+    def snapshot(self):
+        # The results lock file is not a result; a refused operation may still create it.
+        return {path: path.read_bytes() for path in self.repository.rglob("*")
+                if path.is_file() and path.name != PilotRunner.LOCK_FILE}
+
+    def grounding(self, runner=None, video_id=VIDEO, repetition=1):
+        provider = SimulatedApiFixture({"grounding": {"normalized": GROUNDING, "responseBody": FIXTURE_RAW}})
+        row = (runner or self.v2).run_grounding(video_id, "gemini_video", repetition, provider)
+        self.assertEqual(row["apiStatus"], "success")
+        return row
+
+    def reviewed(self, checklist=ALL_PASS):
+        row = self.grounding()
+        return self.v2.review_grounding(row["runId"], APPROVER, checklist)
+
+    def quiz(self, model, source_id, runner=None, quiz=None):
+        provider = SimulatedApiFixture({"quiz": {"normalized": quiz or dict(QUIZ, promptVersion="pilot-v2"),
+                                                 "responseBody": FIXTURE_RAW}})
+        return (runner or self.v2).run_quiz(VIDEO, model, 1, CONTENT, provider,
+                                            source_grounding_run_id=source_id), provider
+
+    def test_v2_config_changes_only_the_two_versions(self):
+        self.assertEqual((self.v1.config["prompt_version"], self.v1.config["video_grounding"]["prompt_version"]),
+                         ("pilot-v1", "video-grounding-v1"))
+        self.assertEqual((self.v2.config["prompt_version"], self.v2.config["video_grounding"]["prompt_version"]),
+                         ("pilot-v2", "video-grounding-v2"))
+        for config in (self.v1.config, self.v2.config):
+            config.pop("prompt_version")
+            config["video_grounding"].pop("prompt_version")
+        self.assertEqual(self.v1.config, self.v2.config)
+
+    def test_runner_passes_the_grounding_prompt_version_to_the_provider(self):
+        for runner, version in ((self.v1, "video-grounding-v1"), (self.v2, "video-grounding-v2")):
+            provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+            row = runner.run_grounding(VIDEO, "gemini_video", 1, provider)
+            self.assertEqual((row["promptVersion"], provider.calls[0]["promptVersion"]), (version, version))
+
+    def test_legacy_and_v1_grounding_attempts_keep_their_sequence_and_v2_starts_at_one(self):
+        self.results.mkdir()
+        legacy = "".join(json.dumps({"videoId": VIDEO, "method": "gemini_video", "model": "gemini-3.8-flash",
+                                     "repetition": 1, "runId": "legacy-%d" % number, "apiStatus": "error",
+                                     "promptVersion": None, **({} if number == 1 else {"attempt": number})}) + "\n"
+                         for number in (1, 2))
+        self.grounding_file().write_text(legacy, encoding="utf-8")
+        provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+        self.assertEqual(self.v1.run_grounding(VIDEO, "gemini_video", 1, provider)["attempt"], 3)
+        self.assertEqual(self.v2.run_grounding(VIDEO, "gemini_video", 1, provider)["attempt"], 1)
+        self.assertEqual(self.v2.run_grounding(VIDEO, "gemini_video", 1, provider)["attempt"], 2)
+        self.assertEqual(self.v1.run_grounding(VIDEO, "gemini_video", 1, provider)["attempt"], 4)
+        self.assertTrue(self.grounding_file().read_text(encoding="utf-8").startswith(legacy))
+
+    def test_all_pass_checklist_approves_and_keeps_approval_tracking_consistent(self):
+        row = self.reviewed(dict(ALL_PASS, reviewNote="검토 메모"))
+        stored = self.rows()[0]
+        self.assertEqual(stored, row)
+        self.assertEqual(stored["contentTextApprovalStatus"], "approved")
+        review = stored["groundingReview"]
+        self.assertEqual({key: review[key] for key in grounding_review.REVIEW_ITEMS}, ALL_PASS)
+        self.assertEqual((review["reviewNote"], review["reviewedBy"]), ("검토 메모", APPROVER))
+        self.assertEqual((stored["approvedBy"], stored["approvedAt"]), (APPROVER, review["reviewedAt"]))
+        without_note = self.grounding(repetition=2)
+        self.assertIsNone(self.v2.review_grounding(without_note["runId"], APPROVER, ALL_PASS)
+                          ["groundingReview"]["reviewNote"])  # reviewNote is optional
+
+    def test_any_fail_or_uncertain_rejects(self):
+        for item in grounding_review.REVIEW_ITEMS:
+            for verdict in ("fail", "uncertain"):
+                with self.subTest(item=item, verdict=verdict):
+                    row = self.reviewed(dict(ALL_PASS, **{item: verdict}))
+                    self.assertEqual(row["contentTextApprovalStatus"], "rejected")
+                    self.assertEqual(row["groundingReview"][item], verdict)
+                    self.assertNotIn("approvedBy", row)
+                    self.assertNotIn("approvedAt", row)
+                    shutil.rmtree(self.results)
+
+    def test_malformed_or_incomplete_checklist_is_rejected_without_writing(self):
+        row = self.grounding()
+        missing = {key: value for key, value in ALL_PASS.items() if key != "factsConsistency"}
+        cases = [(missing, APPROVER), (dict(ALL_PASS, extra="pass"), APPROVER),
+                 (dict(ALL_PASS, factualAccuracy=None), APPROVER), (dict(ALL_PASS, factualAccuracy="PASS"), APPROVER),
+                 (dict(ALL_PASS, factualAccuracy=True), APPROVER), (dict(ALL_PASS, reviewNote=1), APPROVER),
+                 (dict(ALL_PASS, reviewedBy="someone"), APPROVER), (list(ALL_PASS), APPROVER), (None, APPROVER),
+                 (ALL_PASS, ""), (ALL_PASS, "  "), (ALL_PASS, "line\nbreak"), (ALL_PASS, None)]
+        before = self.snapshot()
+        for checklist, reviewer in cases:
+            with self.subTest(checklist=checklist, reviewer=reviewer), self.assertRaises(ValueError):
+                self.v2.review_grounding(row["runId"], reviewer, checklist)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_review_targets_only_unreviewed_successful_v2_grounding(self):
+        v1 = self.grounding(self.v1)
+        failed = self.v2.run_grounding(VIDEO, "gemini_video", 2, SimulatedApiFixture(
+            {"grounding": {"errorCategory": "server_error"}}))
+        invalid = dict(GROUNDING, facts=[dict(GROUNDING["facts"][0], evidenceType="narration")])
+        invalid_row = self.v2.run_grounding("kari-microgravity-2024", "gemini_video", 1, SimulatedApiFixture(
+            {"grounding": {"normalized": invalid, "responseBody": FIXTURE_RAW}}))
+        self.assertEqual(invalid_row["errorCategory"], "invalid_grounding_response")
+        tampered = self.grounding(video_id="nasa-methane-2020")
+        (self.results / "evaluation" / (tampered["runId"] + ".json")).write_text(
+            json.dumps({"contentText": CONTENT + " changed", "facts": []}), encoding="utf-8")
+        reviewed = self.reviewed()
+        before = self.snapshot()
+        # Failed and unknown runs have no evaluation output to review.
+        for run_id, message in ((v1["runId"], "does not use"), (failed["runId"], "evaluation are required"),
+                                (invalid_row["runId"], "successful"),
+                                (tampered["runId"], "hash"), (reviewed["runId"], "never overwritten"),
+                                (uuid.uuid4().hex, "evaluation are required")):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                self.v2.review_grounding(run_id, APPROVER, dict(ALL_PASS, factualAccuracy="fail"))
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.rows()[-1], reviewed)
+
+    def test_v2_grounding_cannot_bypass_the_checklist_through_approve_content(self):
+        row = self.grounding()
+        before = self.snapshot()
+        with self.assertRaisesRegex(ValueError, "review_grounding"):
+            self.v2.approve_content(row["runId"], APPROVER)
+        with self.assertRaisesRegex(ValueError, "review_grounding"):
+            self.v1.approve_content(row["runId"], APPROVER)  # The row's version decides, not the config.
+        self.assertEqual(self.snapshot(), before)
+
+    def test_v1_approve_content_is_unchanged(self):
+        row = self.grounding(self.v1)
+        approved = self.v1.approve_content(row["runId"], APPROVER)
+        self.assertEqual((approved["contentTextApprovalStatus"], approved["approvedBy"]), ("approved", APPROVER))
+        self.assertNotIn("groundingReview", approved)
+        quiz, provider = self.quiz("gemini-3.8-flash", row["runId"], runner=self.v1, quiz=QUIZ)
+        self.assertEqual((quiz["apiStatus"], quiz["promptVersion"], len(provider.calls)), ("success", "pilot-v1", 1))
+
+    def test_rejected_grounding_never_reaches_ab_quiz(self):
+        rejected = self.reviewed(dict(ALL_PASS, keyInformationCoverage="uncertain"))
+        before = self.snapshot()
+        for model in ("gemini-3.8-flash", "gpt-5.4-mini"):
+            provider = SimulatedApiFixture({"quiz": {"normalized": dict(QUIZ, promptVersion="pilot-v2"),
+                                                     "responseBody": FIXTURE_RAW}})
+            with self.subTest(model=model), self.assertRaisesRegex(ValueError, "approved"):
+                self.v2.run_quiz(VIDEO, model, 1, CONTENT, provider, source_grounding_run_id=rejected["runId"])
+            self.assertEqual(provider.calls, [])
+        self.assertFalse((self.results / "quiz-generation.jsonl").exists())
+        self.assertEqual(self.snapshot(), before)  # rejected state kept; no manifest or Quiz row
+        self.assertEqual(self.rows(), [rejected])  # no Grounding was regenerated
+
+    def assert_generation_refused(self, runner=None):
+        before = self.snapshot()
+        for provider in (FixtureProvider({"grounding": {"raw": GROUNDING}}),
+                         SimulatedApiFixture({"grounding": {"normalized": GROUNDING, "responseBody": FIXTURE_RAW}})):
+            with self.assertRaisesRegex(ValueError, "successful Grounding already exists"):
+                (runner or self.v2).run_grounding(VIDEO, "gemini_video", 1, provider)
+            self.assertEqual(provider.calls, [])
+        self.assertEqual(self.snapshot(), before)  # no row, evaluation or raw file; nothing changed
+
+    def test_rejected_condition_refuses_manual_grounding_rerun_before_provider_call(self):
+        rejected = self.reviewed(dict(ALL_PASS, factsConsistency="fail"))
+        self.assert_generation_refused()
+        self.assert_generation_refused(PilotRunner(self.repository, self.results,
+                                                   self.repository / "configs" / "pilot-v2.yaml"))
+        self.assertEqual(self.rows(), [rejected])
+
+    def test_technical_failure_then_success_then_rejection_is_terminal(self):
+        failed = self.v2.run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(
+            {"grounding": {"errorCategory": "server_error"}}))
+        self.assertEqual((failed["apiStatus"], failed["attempt"]), ("error", 1))
+        success = self.grounding()  # A technical failure allows the next attempt.
+        self.assertEqual(success["attempt"], 2)
+        rejected = self.v2.review_grounding(success["runId"], APPROVER, dict(ALL_PASS, koreanConsistency="fail"))
+        self.assert_generation_refused()
+        self.assertEqual(self.rows(), [failed, rejected])
+
+    def test_unreviewed_or_approved_success_is_terminal_for_its_condition(self):
+        success = self.grounding()
+        self.assert_generation_refused()  # Unreviewed: no second successful candidate.
+        self.assertEqual(self.rows(), [success])
+        approved = self.v2.review_grounding(success["runId"], APPROVER, ALL_PASS)
+        self.assert_generation_refused()
+        self.assertEqual(self.rows(), [approved])
+
+    def test_other_conditions_stay_independent_of_a_terminal_condition(self):
+        self.reviewed(dict(ALL_PASS, factsConsistency="fail"))
+        self.assertEqual(self.grounding(repetition=2)["attempt"], 1)
+        self.assertEqual(self.grounding(video_id="nasa-methane-2020")["attempt"], 1)
+        self.assertEqual(self.grounding(self.v1)["promptVersion"], "video-grounding-v1")
+        other_model = dict(self.rows()[0], model="another-video-model")
+        condition = grounding_review.grounding_condition(self.rows()[0])
+        self.assertEqual(grounding_review.successful_review_candidates([other_model], condition), [])
+
+    def test_pilot_v1_keeps_its_retry_semantics_after_success(self):
+        first = self.grounding(self.v1)
+        second = self.grounding(self.v1)  # The terminal-success rule is Pilot v2 only.
+        self.assertEqual((first["attempt"], second["attempt"]), (1, 2))
+        self.v1.approve_content(second["runId"], APPROVER)
+        self.v1._check_storage_integrity()
+
+    def two_successful_candidates(self):
+        """Historical/tampered storage: two successful candidates of one Pilot v2 condition."""
+        first = self.grounding()
+        second = dict(first, runId=uuid.uuid4().hex, attempt=2)
+        with self.grounding_file().open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(second) + "\n")
+        for directory in ("raw", "evaluation"):
+            shutil.copyfile(self.results / directory / (first["runId"] + ".json"),
+                            self.results / directory / (second["runId"] + ".json"))
+        return first, second
+
+    def test_multiple_successful_candidates_block_every_action_without_choosing_one(self):
+        first, second = self.two_successful_candidates()
+        before = self.snapshot()
+        for action in (lambda: self.v2.review_grounding(first["runId"], APPROVER, dict(ALL_PASS, factualAccuracy="fail")),
+                       lambda: self.v2.review_grounding(second["runId"], APPROVER, ALL_PASS),
+                       lambda: self.quiz("gemini-3.8-flash", second["runId"]),
+                       lambda: self.v2.run_grounding(VIDEO, "gemini_video", 1,
+                                                     FixtureProvider({"grounding": {"raw": GROUNDING}}))):
+            with self.assertRaisesRegex(ValueError, "more than one successful Grounding"):
+                action()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_review_refuses_a_condition_with_another_candidate_even_if_integrity_is_bypassed(self):
+        first, second = self.two_successful_candidates()
+        before = self.snapshot()
+        with mock.patch.object(self.v2, "_check_storage_integrity"):
+            for run_id, checklist in ((first["runId"], dict(ALL_PASS, factualAccuracy="fail")),
+                                      (second["runId"], ALL_PASS)):
+                with self.assertRaisesRegex(ValueError, "more than one successful Grounding candidate"):
+                    self.v2.review_grounding(run_id, APPROVER, checklist)
+        self.assertEqual(self.snapshot(), before)
+
+    def approved_v1_source(self, legacy=False):
+        row = self.grounding(self.v1)
+        self.v1.approve_content(row["runId"], APPROVER)
+        if legacy:
+            rows = self.rows()
+            rows[-1]["promptVersion"] = None  # Like the stored pre-versioning Pilot v1 results.
+            self.grounding_file().write_text("".join(json.dumps(item) + "\n" for item in rows), encoding="utf-8")
+        return row["runId"]
+
+    def test_quiz_source_must_belong_to_the_configured_grounding_version(self):
+        sources = {"legacy": self.approved_v1_source(legacy=True)}
+        v2_source = self.reviewed()["runId"]
+        sources["v1"] = self.approved_v1_source()
+        refused = (("pilot-v2 + legacy", self.v2, sources["legacy"], "pilot-v2"),
+                   ("pilot-v2 + v1", self.v2, sources["v1"], "pilot-v2"),
+                   ("pilot-v1 + v2", self.v1, v2_source, "pilot-v1"))
+        for name, runner, source, quiz_version in refused:
+            with self.subTest(name=name):
+                before = self.snapshot()
+                provider = SimulatedApiFixture({"quiz": {"normalized": dict(QUIZ, promptVersion=quiz_version),
+                                                         "responseBody": FIXTURE_RAW}})
+                with self.assertRaisesRegex(ValueError, "does not belong to this Pilot experiment"):
+                    runner.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider, source_grounding_run_id=source)
+                self.assertEqual(provider.calls, [])
+                self.assertFalse((self.results / "quiz-generation.jsonl").exists())
+                self.assertFalse((self.repository / "data" / "restricted").exists())  # no manifest
+                self.assertEqual(self.snapshot(), before)
+        for name, runner, source, quiz_version in (("pilot-v1 + legacy", self.v1, sources["legacy"], "pilot-v1"),
+                                                   ("pilot-v1 + v1", self.v1, sources["v1"], "pilot-v1"),
+                                                   ("pilot-v2 + v2", self.v2, v2_source, "pilot-v2")):
+            with self.subTest(name=name):
+                row, provider = self.quiz("gpt-5.4-mini", source, runner=runner,
+                                          quiz=dict(QUIZ, promptVersion=quiz_version))
+                self.assertEqual((row["apiStatus"], row["promptVersion"], len(provider.calls)),
+                                 ("success", quiz_version, 1))
+
+    def test_unknown_grounding_prompt_version_is_refused_before_any_record(self):
+        for value in ("video-grounding-v9", "pilot-v2"):
+            with self.subTest(value=value):
+                runner = PilotRunner(self.repository, self.results, self.repository / "configs" / "pilot-v2.yaml")
+                runner.config["video_grounding"]["prompt_version"] = value
+                for provider in (FixtureProvider({"grounding": {"raw": GROUNDING}}),
+                                 SimulatedApiFixture({"grounding": {"normalized": GROUNDING,
+                                                                    "responseBody": FIXTURE_RAW}})):
+                    with self.assertRaisesRegex(ValueError, "not a known Grounding prompt version"):
+                        runner.run_grounding(VIDEO, "gemini_video", 1, provider)
+                    self.assertEqual(provider.calls, [])
+                self.assertEqual([path.name for path in self.results.rglob("*")], [PilotRunner.LOCK_FILE])
+
+    def test_stored_grounding_prompt_version_must_be_legacy_null_or_known(self):
+        stored = self.grounding(self.v1, video_id="nasa-methane-2020")  # rows[0], the row edited below
+        quiz_source = self.grounding(self.v1)
+        self.v1.approve_content(quiz_source["runId"], APPROVER)
+        self.quiz("gemini-3.8-flash", quiz_source["runId"], runner=self.v1, quiz=QUIZ)  # a pilot-v1 Quiz row
+
+        def store(value):
+            rows = self.rows()
+            rows[0]["promptVersion"] = value
+            self.grounding_file().write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+        for value in ([], {}, 1, True, "", "unknown-grounding-version", "pilot-v1"):
+            with self.subTest(value=value):
+                store(value)
+                before = self.snapshot()
+                with self.assertRaisesRegex(ValueError, "integrity error: invalid video-grounding.jsonl line 1"):
+                    self.v1._check_storage_integrity()
+                provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+                for action in (lambda: self.v1.run_grounding("kari-microgravity-2024", "gemini_video", 1, provider),
+                               lambda: self.v2.review_grounding(stored["runId"], APPROVER, ALL_PASS),
+                               lambda: self.v1.approve_content(stored["runId"], APPROVER)):
+                    with self.assertRaisesRegex(ValueError, "integrity error"):
+                        action()
+                self.assertEqual(provider.calls, [])
+                self.assertEqual(self.snapshot(), before)
+        # Legacy null and known versions stay valid; the Quiz row keeps its Pilot version (pilot-v1).
+        for value in (None, "video-grounding-v1", "video-grounding-v2"):
+            with self.subTest(value=value):
+                store(value)
+                self.v1._check_storage_integrity()
+        self.assertEqual(json.loads((self.results / "quiz-generation.jsonl").read_text(encoding="utf-8"))
+                         ["promptVersion"], "pilot-v1")
+
+    def test_cli_selects_pilot_v1_by_default_and_pilot_v2_with_config(self):
+        import src.pilot_runner as pilot_runner
+
+        class Stop(Exception):
+            pass
+
+        base = ["src.pilot_runner", "grounding", "--video-id", VIDEO, "--repetition", "1",
+                "--fixture", "unused.json"]
+        for extra, expected in (([], None), (["--config", "configs/pilot-v2.yaml"], Path("configs/pilot-v2.yaml"))):
+            with self.subTest(extra=extra), mock.patch.object(sys, "argv", base + extra), \
+                    mock.patch.object(pilot_runner, "PilotRunner", side_effect=Stop) as runner:
+                with self.assertRaises(Stop):
+                    pilot_runner.main()
+                self.assertEqual(runner.call_args[0], (ROOT, Path("results"), expected))
+        # PilotRunner without a config keeps reading configs/pilot.yaml (pilot-v1).
+        self.assertEqual(PilotRunner(self.repository, self.results, None).config["prompt_version"], "pilot-v1")
+
+    def test_approved_v2_grounding_runs_ab_quiz_and_coexists_with_pilot_v1(self):
+        v1_source = self.grounding(self.v1)
+        self.v1.approve_content(v1_source["runId"], APPROVER)
+        self.quiz("gemini-3.8-flash", v1_source["runId"], runner=self.v1, quiz=QUIZ)
+        approved = self.reviewed()
+        rows = [self.quiz(model, approved["runId"]) for model in ("gemini-3.8-flash", "gpt-5.4-mini")]
+        for row, provider in rows:
+            self.assertEqual((row["apiStatus"], row["validatorStatus"], row["promptVersion"]),
+                             ("success", "pass", "pilot-v2"))
+            self.assertEqual((row["sourceGroundingRunId"], row["contentTextSha256"]),
+                             (approved["runId"], approved["contentTextSha256"]))
+            self.assertEqual(provider.calls[0]["contentText"], CONTENT)  # contentText only, no facts
+        manifests = [json.loads(path.read_text(encoding="utf-8")) for path in
+                     (self.repository / "data" / "restricted" / "fixed-content").glob("*.json")]
+        self.assertEqual(sorted(item["promptVersion"] for item in manifests), ["pilot-v1", "pilot-v2"])
+
+    def test_tampered_approval_or_review_fails_closed(self):
+        def tamper(row):
+            self.grounding_file().write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+        approved = self.reviewed()
+        rejected_review = dict(approved["groundingReview"], factualAccuracy="fail")
+        cases = {
+            "approved without review": {k: v for k, v in approved.items() if k != "groundingReview"},
+            "approved with a fail item": dict(approved, groundingReview=rejected_review),
+            "rejected with all pass": {k: v for k, v in dict(approved, contentTextApprovalStatus="rejected").items()
+                                       if k not in ("approvedBy", "approvedAt")},
+            "rejected without review": dict(
+                {k: v for k, v in approved.items() if k not in ("groundingReview", "approvedBy", "approvedAt")},
+                contentTextApprovalStatus="rejected"),
+            "review on a v1 row": dict(approved, promptVersion="video-grounding-v1"),
+            "approver differs from reviewer": dict(approved, approvedBy="someone-else"),
+            "review with an extra key": dict(approved, groundingReview=dict(approved["groundingReview"], x=1)),
+        }
+        for name, row in cases.items():
+            with self.subTest(name=name):
+                tamper(row)
+                provider = SimulatedApiFixture({"quiz": {"normalized": dict(QUIZ, promptVersion="pilot-v2"),
+                                                         "responseBody": FIXTURE_RAW}})
+                with self.assertRaisesRegex(ValueError, "integrity|approved|review"):
+                    self.v2.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, provider,
+                                     source_grounding_run_id=approved["runId"])
+                self.assertEqual(provider.calls, [])
+                with self.assertRaisesRegex(ValueError, "integrity"):
+                    self.v2._check_storage_integrity()
+
+    def test_pilot_v1_rows_need_no_review(self):
+        legacy = self.grounding(self.v1)
+        self.v1.approve_content(legacy["runId"], APPROVER)
+        rows = self.rows()
+        rows[0].pop("approvedBy")
+        rows[0].pop("approvedAt")
+        rows[0]["promptVersion"] = None  # Pre-versioning approved row, like the stored Pilot v1 results.
+        self.grounding_file().write_text(json.dumps(rows[0]) + "\n", encoding="utf-8")
+        self.v1._check_storage_integrity()
+        quiz, provider = self.quiz("gpt-5.4-mini", legacy["runId"], runner=self.v1, quiz=QUIZ)
+        self.assertEqual((quiz["apiStatus"], len(provider.calls)), ("success", 1))
+
+
+class BlockingProvider(SimulatedApiFixture):
+    """Fake API that holds the operation inside its critical section until released."""
+
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def invoke(self, kind, **kwargs):
+        self.entered.set()
+        if not self.release.wait(timeout=10):
+            raise AssertionError("BlockingProvider was never released")
+        return super().invoke(kind, **kwargs)
+
+
+BUSY = "already in progress for this results directory"
+GROUNDED = {"grounding": {"normalized": GROUNDING, "responseBody": FIXTURE_RAW}}
+
+
+class PilotResultsLockTest(unittest.TestCase):
+    """One Pilot mutation per results directory; a concurrent one fails fast (fake Providers only)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.repository = Path(self.temp.name)
+        (self.repository / "configs").mkdir()
+        (self.repository / "data").mkdir()
+        for name in ("pilot.yaml", "pilot-v2.yaml"):
+            shutil.copyfile(ROOT / "configs" / name, self.repository / "configs" / name)
+        shutil.copyfile(ROOT / "data" / "videos.jsonl", self.repository / "data" / "videos.jsonl")
+        self.results = self.repository / "results"
+        self.pool = ThreadPoolExecutor(max_workers=2)
+
+    def tearDown(self):
+        self.pool.shutdown(wait=True)
+        self.temp.cleanup()
+
+    def runner(self, results=None):
+        # A separate instance per caller, like a separate CLI process using the same directory.
+        return PilotRunner(self.repository, results or self.results, self.repository / "configs" / "pilot-v2.yaml")
+
+    def grounding_rows(self, results=None):
+        path = (results or self.results) / "video-grounding.jsonl"
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def artifacts(self, results=None):
+        results = results or self.results
+        return {name: sorted(path.stem for path in (results / name).glob("*.json")) for name in ("raw", "evaluation")}
+
+    def hold(self, call, provider):
+        """Start ``call`` in another thread and wait until it is inside the locked operation."""
+        future = self.pool.submit(call)
+        self.assertTrue(provider.entered.wait(timeout=10))
+        return future
+
+    def test_concurrent_same_condition_grounding_runs_only_once(self):
+        first, second = BlockingProvider(GROUNDED), SimulatedApiFixture(GROUNDED)
+        future = self.hold(lambda: self.runner().run_grounding(VIDEO, "gemini_video", 1, first), first)
+        with self.assertRaisesRegex(ValueError, BUSY):
+            self.runner().run_grounding(VIDEO, "gemini_video", 1, second)
+        first.release.set()
+        row = future.result(timeout=10)
+        self.assertEqual((len(first.calls), second.calls), (1, []))
+        rows = self.grounding_rows()
+        self.assertEqual([(item["runId"], item["apiStatus"], item["attempt"]) for item in rows],
+                         [(row["runId"], "success", 1)])
+        self.assertEqual(self.artifacts(), {"raw": [row["runId"]], "evaluation": [row["runId"]]})
+        self.assertEqual(len(grounding_review.successful_review_candidates(
+            rows, grounding_review.grounding_condition(row))), 1)
+        self.runner()._check_storage_integrity()  # no orphan artifact
+        # After the lock is released, the terminal-success rule still refuses the same condition.
+        with self.assertRaisesRegex(ValueError, "successful Grounding already exists"):
+            self.runner().run_grounding(VIDEO, "gemini_video", 1, second)
+        self.assertEqual(second.calls, [])
+
+    def test_simultaneous_start_allows_exactly_one_generation(self):
+        barrier = threading.Barrier(2)
+        providers = [SimulatedApiFixture(GROUNDED), SimulatedApiFixture(GROUNDED)]
+
+        def start(provider):
+            runner = self.runner()
+            barrier.wait(timeout=10)
+            try:
+                return runner.run_grounding(VIDEO, "gemini_video", 1, provider)["apiStatus"]
+            except ValueError as exc:
+                return str(exc)
+
+        outcomes = [future.result(timeout=10) for future in
+                    [self.pool.submit(start, provider) for provider in providers]]
+        # The loser is refused by the lock, or, if the winner already finished, by terminal success.
+        self.assertEqual(sum(len(provider.calls) for provider in providers), 1)
+        self.assertEqual(outcomes.count("success"), 1)
+        self.assertTrue(any(BUSY in item or "successful Grounding already exists" in item
+                            for item in outcomes if item != "success"))
+        self.assertEqual(len(self.grounding_rows()), 1)
+        self.runner()._check_storage_integrity()
+
+    def test_concurrent_reviews_store_exactly_one_review(self):
+        candidate = self.runner().run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(GROUNDED))
+        entered, release = threading.Event(), threading.Event()
+        original = PilotRunner._rewrite_grounding_row
+
+        def held_rewrite(result_file, lines, index, row):
+            entered.set()
+            self.assertTrue(release.wait(timeout=10))
+            return original(result_file, lines, index, row)
+
+        with mock.patch.object(PilotRunner, "_rewrite_grounding_row", staticmethod(held_rewrite)):
+            future = self.pool.submit(self.runner().review_grounding, candidate["runId"], "reviewer-a", ALL_PASS)
+            self.assertTrue(entered.wait(timeout=10))
+            with self.assertRaisesRegex(ValueError, BUSY):
+                self.runner().review_grounding(candidate["runId"], "reviewer-b",
+                                               dict(ALL_PASS, factualAccuracy="fail"))
+            release.set()
+            reviewed = future.result(timeout=10)
+        stored = self.grounding_rows()
+        self.assertEqual(stored, [reviewed])
+        review = stored[0]["groundingReview"]
+        self.assertEqual((review["reviewedBy"], stored[0]["contentTextApprovalStatus"],
+                          stored[0]["approvedBy"], stored[0]["approvedAt"]),
+                         ("reviewer-a", "approved", "reviewer-a", review["reviewedAt"]))
+        self.runner()._check_storage_integrity()
+        with self.assertRaisesRegex(ValueError, "never overwritten"):
+            self.runner().review_grounding(candidate["runId"], "reviewer-b", dict(ALL_PASS, factualAccuracy="fail"))
+        self.assertEqual(self.grounding_rows(), [reviewed])
+
+    def test_different_operations_never_overlap_and_keep_every_row(self):
+        source = self.runner().run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(GROUNDED))
+        self.runner().review_grounding(source["runId"], APPROVER, ALL_PASS)
+        quiz = {"quiz": {"normalized": dict(QUIZ, promptVersion="pilot-v2"), "responseBody": FIXTURE_RAW}}
+        quiz_a, quiz_b = BlockingProvider(quiz), SimulatedApiFixture(quiz)
+        future = self.hold(lambda: self.runner().run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, quiz_a,
+                                                          source_grounding_run_id=source["runId"]), quiz_a)
+        other = SimulatedApiFixture(GROUNDED)
+        for blocked in (lambda: self.runner().run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, quiz_b,
+                                                       source_grounding_run_id=source["runId"]),
+                        lambda: self.runner().run_grounding("nasa-methane-2020", "gemini_video", 1, other),
+                        lambda: self.runner().approve_content(source["runId"], APPROVER),
+                        lambda: self.runner().run_end_to_end(VIDEO, "gemini_direct_quiz", 1, other)):
+            with self.assertRaisesRegex(ValueError, BUSY):
+                blocked()
+        quiz_a.release.set()
+        first = future.result(timeout=10)
+        self.assertEqual((quiz_b.calls, other.calls), ([], []))
+        second = self.runner().run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, quiz_b,
+                                        source_grounding_run_id=source["runId"])
+        quiz_rows = [json.loads(line) for line in
+                     (self.results / "quiz-generation.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([row["runId"] for row in quiz_rows], [first["runId"], second["runId"]])
+        self.runner()._check_storage_integrity()
+
+    def test_lock_is_released_after_success_and_after_exceptions(self):
+        runner = self.runner()
+        runner.run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(GROUNDED))
+
+        class Interrupted(SimulatedApiFixture):
+            def invoke(self, kind, **kwargs):
+                raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):  # escapes the operation, not a recorded failure
+            runner.run_grounding("nasa-methane-2020", "gemini_video", 1, Interrupted({}))
+        with self.assertRaisesRegex(ValueError, "Unknown Pilot videoId"):
+            runner.run_grounding("unknown-video", "gemini_video", 1, SimulatedApiFixture(GROUNDED))
+        # No stale lock: the next operation acquires it normally.
+        row = self.runner().run_grounding("nasa-methane-2020", "gemini_video", 1, SimulatedApiFixture(GROUNDED))
+        self.assertEqual(row["apiStatus"], "success")
+        self.assertTrue((self.results / PilotRunner.LOCK_FILE).is_file())  # existing file is not a lock
+
+    def test_only_lock_contention_is_reported_as_busy(self):
+        with self.runner()._results_lock():
+            with self.assertRaisesRegex(ValueError, BUSY):  # real contention from another handle
+                with self.runner()._results_lock():
+                    self.fail("the lock must not be granted twice")
+        failure = OSError(errno.EIO, "simulated lock I/O failure")
+        with mock.patch("msvcrt.locking" if os.name == "nt" else "fcntl.flock", side_effect=failure):
+            with self.assertRaises(OSError) as raised:
+                with self.runner()._results_lock():
+                    self.fail("the lock must not be granted after a lock error")
+        self.assertIs(raised.exception, failure)  # not disguised as a concurrent operation
+        with self.runner()._results_lock():  # the failed attempt left no lock behind
+            pass
+
+    def test_results_lock_holds_across_processes(self):
+        child_code = textwrap.dedent("""
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, sys.argv[1])
+            from src.pilot_runner import PilotRunner
+            with PilotRunner(Path(sys.argv[2]), Path(sys.argv[3]))._results_lock():
+                print("locked", flush=True)
+                sys.stdin.readline()
+            print("released", flush=True)
+        """)
+        child = subprocess.Popen([sys.executable, "-c", child_code, str(ROOT), str(self.repository), str(self.results)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        lines = queue.Queue()
+        reader = threading.Thread(target=lambda: [lines.put(line.strip()) for line in child.stdout], daemon=True)
+        reader.start()
+        try:
+            self.assertEqual(lines.get(timeout=30), "locked")  # handshake: the child holds the OS lock
+            provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+            with self.assertRaisesRegex(ValueError, BUSY):
+                self.runner().run_grounding(VIDEO, "gemini_video", 1, provider)
+            self.assertEqual(provider.calls, [])
+            self.assertEqual([path.name for path in self.results.rglob("*")], [PilotRunner.LOCK_FILE])
+            child.stdin.write("\n")
+            child.stdin.flush()
+            self.assertEqual(lines.get(timeout=30), "released")
+            self.assertEqual(child.wait(timeout=30), 0)
+            with self.runner()._results_lock():  # released by the other process: acquired again
+                pass
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=30)
+            reader.join(timeout=30)
+            child.stdin.close()
+            child.stdout.close()
+
+    def test_different_results_directories_do_not_block_each_other(self):
+        first_dir, second_dir = self.results / "first", self.results / "second"
+        holder = BlockingProvider(GROUNDED)
+        future = self.hold(lambda: self.runner(first_dir).run_grounding(VIDEO, "gemini_video", 1, holder), holder)
+        row = self.runner(second_dir).run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(GROUNDED))
+        holder.release.set()
+        self.assertEqual((row["apiStatus"], future.result(timeout=10)["apiStatus"]), ("success", "success"))
 
 
 if __name__ == "__main__":
