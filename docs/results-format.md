@@ -101,6 +101,29 @@ machine eligibility를 통과한 Grounding의 정확한 `contentText`로 Gemini 
 - Judge-ready 판정(`require_judge_ready`): 저장된 상태를 믿지 않고 operation fingerprint, 모든 attempt의 `operation.json` → `started.json` → raw·output → `result.json` 연결(각 기록의 operation·attempt·fingerprint·snapshot·Grounding run·`contentTextSha256`·model·prompt version·시작 시각 일치, 허용 필드, 파일 SHA-256, raw metadata 계약), snapshot SHA-256과 그 evidence의 Grounding eligibility, snapshot의 `contentText` 기준 output gate를 다시 확인합니다. 통과하면 `contentText`, 문항(`questionIndex` 포함)과 provenance(operation·fingerprint·Grounding run·`contentTextSha256`·validation version·snapshot·output SHA-256)를 돌려주며 생성 모델 정보는 넣지 않습니다.
 - 정하지 않은 정책: 자동 재생성 횟수, Creator reject 후 재생성, 서비스 retry 횟수, production 비용 상한, `contentText` 최대 크기, Judge 실패·uncertain 처리, 게시 정책, 영상 사실 검증.
 
+## Production GPT Pointwise Judge (Issue #41)
+
+Judge-ready production Quiz를 GPT Pointwise Judge로 평가하고 문항별 결과를 저장합니다(`src/production_judge.py`, `configs/production-judge.yaml`). Pilot Judge의 OpenAI client(인증, usage·비용 계산, cost guard, HTTP retry), Pointwise prompt·schema, `validate_pointwise`(strict JSON, 중복 key 거부)를 그대로 재사용합니다. Pilot Judge([Judge 프로토콜](judge-protocol.md))의 Pairwise, A/B, Human 비교는 쓰지 않으며 변경하지 않습니다.
+
+- **평가 범위**: Judge는 Quiz를 정확한 `contentText` 기준으로만 평가합니다. 영상을 보지 않으므로 Grounding과 원본 영상의 사실 일치, Grounding의 핵심 정보 누락이나 사실 오류, timestamp·`evidenceType`의 정확성을 검증하지 않습니다. 잘못된 Grounding에 충실한 Quiz도 `pass`일 수 있습니다.
+- **설정**: OpenAI `gpt-6.1-sol`, reasoning `medium`, `max_output_tokens` 8192, prompt version `production-pointwise-judge-v1`, 기존 rubric·schema(`judge-rubric-v1`, `judge-schema-v1`)의 7개 항목(`textAnswerCorrect`, `uniqueAnswer`, `evidenceSupportsAnswer`, `questionClarity`, `koreanQuality`, `distractorQuality`, `textFaithfulness`)마다 `pass | fail | uncertain`과 reason. API key는 `OPENAI_API_KEY` 환경변수에서 읽으며 저장하지 않습니다.
+- **입력**: `ProductionQuizRunner.require_judge_ready()`를 통과한 Quiz만 평가합니다. 통과하지 못하면 HTTP 요청과 저장이 없습니다. prompt에는 `contentText`와 문항(`questionIndex`, `question`, `options`, `correctOptionIndex`, `explanation`, `sourceEvidence`)만 들어가며, operation ID, hash, 생성 모델, validation 상태 같은 provenance는 저장소에만 남습니다.
+- **실행 guard**: timeout, 호출당·평가 전체 비용 상한, 입력 token 추정치, 단가(출처·확인일 포함)는 기본값이 없으며 실행마다 명시합니다. 누락·잘못된 값, API key 없음은 저장과 요청 전에 거부합니다. 첫 실제 호출 전에 OpenAI 공식 가격과 token·reasoning 계산을 다시 확인합니다.
+- **재시도**: technical attempt 하나 안에서 429/5xx에 유효한 `Retry-After`가 있을 때만 HTTP 재시도 1회. 평가당 technical attempt 최대 2, HTTP 요청 최대 4이며 다음 attempt는 자동으로 시작하지 않습니다.
+
+| attempt 결과 | 해당 경우 | 다음 동작 |
+| --- | --- | --- |
+| `completed` | 유효한 응답(`fail`·`uncertain` 판정 포함) | 평가 완료. 같은 평가를 다시 호출하지 않음 |
+| `retryable_failure` | malformed JSON, schema·문항 index·빈 reason 오류, `incomplete`, 해석할 수 없는 응답, HTTP 재시도 후에도 429/5xx이고 마지막 응답에 유효한 `Retry-After`가 있음 | 원문·오류 보존. 상한 안에서 명시적 다음 attempt만 가능 |
+| `terminal_failure` | refusal, 일반 4xx, 마지막 응답에 유효한 `Retry-After`가 없는 429/5xx(HTTP 재시도 후 포함), 실행 guard | 다시 실행하지 않음 |
+| `uncertain` | timeout, network 오류(요청이 처리됐을 수 있음) | 자동 재실행 없음. 사람이 처리 |
+
+시작 기록이나 요청 예약만 있고 결과 기록이 없는 attempt도 `uncertain`입니다. 유효한 판정과 함께 usage가 잘못된 응답은 완료로 저장하되 비용은 알 수 없음(`null`)으로 둡니다. attempt 결과는 저장된 오류 분류와 HTTP 요청 기록(상태, `Retry-After`, 대기)에서 다시 계산하며, 저장된 결과와 다르면 기록이 손상된 것으로 봅니다.
+
+- **저장**(`results/production/operations/<quizOperationId>/judge/<evaluationId>/`, 모든 파일은 한 번만 만들고 바꾸지 않음): `evaluation.json`(identity: Quiz operation·attempt·fingerprint·output·result SHA-256, Grounding run, `contentTextSha256`, snapshot SHA-256, validation version, Quiz prompt·출력 계약 version과 Judge provider·model·reasoning·`max_output_tokens`·prompt·rubric·schema version, Pointwise 계약 hash, 요청 본문 SHA-256; identity의 fingerprint; 고정 retry 정책과 실행의 timeout·비용 상한·입력 추정치·단가), `request.json`(정확한 요청 본문), `attempts/<n>/started.json`, `attempts/<n>/requests/<k>.json`(HTTP 요청마다 전송 전에 기록하는 예약), `attempts/<n>/output.json`(모델 출력 원문), `attempts/<n>/result.json`(마지막에 기록: 결과, 오류 분류, HTTP 요청 기록과 예약·정산 비용, usage, 출력 SHA-256, 문항별 판정).
+- **재개와 무결성**: 같은 평가는 Quiz artifact, Judge 설정, 요청 본문, 실행 정책이 모두 같을 때만 이어갑니다. 저장된 실행 정책은 읽을 때도 새 실행과 같은 규칙으로 모든 값을 검증하고, 그 SHA-256(`executionPolicySha256`)이 각 attempt의 시작·요청 예약·결과 기록에 남아 있어 다른 유효한 값으로 바뀌어도 탐지합니다. 재개 시 기록된 요청 수와 비용(정산 비용, 알 수 없으면 예약 비용)을 복원하고 0으로 되돌리지 않습니다. 예약 비용은 저장된 단가와 추정치로, 정산 비용은 저장된 usage와 단가로 기존 Judge 비용 규칙(`estimate_cost`)에 따라 다시 계산해 저장값과 같아야 하며, 계산할 수 없는 비용은 `null`이어야 합니다. 결과를 읽을 때(`require_completed`)도 Quiz가 여전히 Judge-ready이고 바뀌지 않았는지, 기록 연결과 hash, 저장된 모델 출력의 재검증 결과가 저장된 판정과 같은지 확인합니다.
+- **정하지 않은 정책**: Quiz 전체 PASS/FAIL 집계와 Creator에게 보여 줄 방식, semantic `fail` 이후 재생성, Creator 승인, 게시. 이번에는 문항별 7개 항목 판정·reason, 실행 상태, provenance까지만 저장합니다.
+
 ## LLM-as-a-Judge 결과
 
 A/B Quiz에 대한 사후 보조 평가(LLM-as-a-Judge) 결과는 `results/judge/<judgeRunId>/`에만 저장하며 위 세 JSONL과 `results/raw`, `results/evaluation`에는 쓰지 않습니다. 이 하위 디렉터리는 Pilot 저장 무결성 검사 대상이 아닙니다. Judge는 Pilot 결과와 Human Evaluation을 읽기만 합니다. 계약과 파일 구조는 [Judge 프로토콜](judge-protocol.md)을 따릅니다.
