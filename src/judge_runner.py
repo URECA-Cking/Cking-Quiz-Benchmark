@@ -165,22 +165,93 @@ def _non_negative_number(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
-def run_expenditure(attempts):
-    """(HTTP requests sent, spend) for a live run from its persisted request records.
+REQUEST_JOURNAL_VERSION = 1
 
-    Every request counts, including failed and retried ones. A request's settled cost is used when
-    known; otherwise its pre-call reservation stays in force. Records without a reservation cannot be
+
+def _positive_int(value):
+    return type(value) is int and value >= 1
+
+
+def validate_request_journal(intents):
+    """Every field recovery and accounting rely on, checked before anything uses the journal.
+
+    Identities must match how they were generated (attemptId = <measurement>-<attempt>,
+    requestId = <attemptId>-r<request>), so a row can only recover the attempt it was written for.
+    """
+    for intent in intents:
+        if (not isinstance(intent, dict)
+                or not all(isinstance(intent.get(key), str) and intent[key]
+                           for key in ("requestId", "attemptId", "logicalMeasurementId", "createdAt"))
+                or not _positive_int(intent.get("attempt")) or not _positive_int(intent.get("request"))
+                or not _non_negative_number(intent.get("reservedUsd"))
+                or intent["attemptId"] != "%s-%d" % (intent["logicalMeasurementId"], intent["attempt"])
+                or intent["requestId"] != "%s-r%d" % (intent["attemptId"], intent["request"])):
+            raise ValueError("Live run has an invalid request journal: start a new Judge run")
+
+
+def run_expenditure(intents, attempts):
+    """(HTTP requests, spend) for a live run from its durable request journal.
+
+    Every journaled request counts, including failed, retried and interrupted ones (a request whose
+    reservation was written may or may not have been sent). Its settled cost from the linked attempt
+    record is used when known; otherwise its reservation stays in force. Inconsistent records cannot be
     restored safely, so the run cannot be resumed.
     """
-    requests, spent = 0, 0.0
+    validate_request_journal(intents)
+    settlements = {}
     for attempt in attempts:
         for entry in attempt.get("httpRequests") or []:
-            reserved, settled = entry.get("reservedUsd"), entry.get("settledUsd")
-            if not _non_negative_number(reserved) or (settled is not None and not _non_negative_number(settled)):
-                raise ValueError("Live run lacks restorable request reservations: start a new Judge run")
-            requests += 1
-            spent += settled if settled is not None else reserved
+            request_id = entry.get("requestId")
+            if not isinstance(request_id, str) or request_id in settlements:
+                raise ValueError("Live run has request records that cannot be linked: start a new Judge run")
+            settlements[request_id] = entry
+    requests, spent, seen = 0, 0.0, set()
+    for intent in intents:
+        request_id, reserved = intent.get("requestId"), intent.get("reservedUsd")
+        if not isinstance(request_id, str) or request_id in seen or not _non_negative_number(reserved):
+            raise ValueError("Live run has an invalid request journal: start a new Judge run")
+        seen.add(request_id)
+        settled = settlements[request_id].get("settledUsd") if request_id in settlements else None
+        if settled is not None and not _non_negative_number(settled):
+            raise ValueError("Live run has an invalid request settlement: start a new Judge run")
+        requests += 1
+        spent += settled if settled is not None else reserved
+    if set(settlements) - seen:
+        raise ValueError("Live run has requests without a journaled reservation: start a new Judge run")
     return requests, spent
+
+
+def interrupted_attempts(intents, attempts, measurements):
+    """Attempts whose reservation was journaled but whose completed record was never written.
+
+    Each becomes one ``interrupted`` technical attempt (identity = its attemptId), so killing and
+    resuming a run cannot exceed the attempt limit. Attempts already recorded are never duplicated.
+    """
+    validate_request_journal(intents)
+    recorded = {item["attemptId"] for item in attempts}
+    by_id = {item["logicalMeasurementId"]: item for item in measurements}
+    records = {}
+    for intent in intents:
+        attempt_id = intent["attemptId"]
+        if attempt_id in recorded:
+            continue
+        measurement = by_id.get(intent["logicalMeasurementId"])
+        if measurement is None:
+            raise ValueError("Request journal refers to a measurement outside this run: start a new Judge run")
+        record = records.setdefault(attempt_id, {
+            "attemptId": attempt_id, "logicalMeasurementId": intent["logicalMeasurementId"],
+            "attempt": intent["attempt"], "startedAt": intent["createdAt"], "finishedAt": None,
+            "outcome": "failure", "errorCategory": "interrupted", "httpStatus": None,
+            "providerErrorCode": None, "httpRequests": [], "retryAfterSeconds": None, "runStopReason": None,
+            "requestedModel": measurement.get("model"), "reportedModel": None,
+            "reasoning": measurement.get("reasoning"), "inputHash": measurement.get("inputHash"),
+            "usage": None, "estimatedCostUsd": None, "pricingReference": None, "pricingCheckedAt": None,
+            "outputRef": None})
+        record["httpRequests"].append({
+            "requestId": intent["requestId"], "request": intent["request"], "isHttpRetry": intent["request"] > 1,
+            "status": None, "outcome": "unknown", "retryAfterSeconds": None, "waitedSeconds": None,
+            "reservedUsd": intent["reservedUsd"], "settledUsd": None})
+    return sorted(records.values(), key=lambda item: (item["startedAt"], item["attemptId"]))
 
 
 def cost_summary(attempts, selected_attempt_ids):
@@ -267,6 +338,8 @@ class JudgeRunner:
             "operational": (operational_contract(client.policy) if execution_mode(client) == "live"
                             else operational or {}),
             "executionMode": execution_mode(client),
+            # Live requests are journaled before they are sent (requests.jsonl); resume relies on it.
+            "requestJournalVersion": REQUEST_JOURNAL_VERSION if execution_mode(client) == "live" else None,
             "sourceResults": self.source.relative_to(self.repository).as_posix(),
             "sourceSnapshot": plan["sourceSnapshot"]}))
         _write_jsonl(run_dir / "eligibility.jsonl", eligibility_records(plan))
@@ -290,14 +363,23 @@ class JudgeRunner:
             # before any status change or Provider call.
             if manifest.get("operational") != operational_contract(client.policy):
                 raise ValueError("Live limits or prices differ from the stored run: start a new Judge run")
+            if manifest.get("requestJournalVersion") != REQUEST_JOURNAL_VERSION:
+                raise ValueError("Live run has no durable request journal: start a new Judge run")
             attempts = _read_jsonl(run_dir / "attempts.jsonl")
-            requests, spent = run_expenditure(attempts)
-            pending = next((item for item in measurements if self._needs_attempt(item, attempts)), None)
+            intents = _read_jsonl(run_dir / "requests.jsonl")
+            requests, spent = run_expenditure(intents, attempts)
+            interrupted = interrupted_attempts(intents, attempts, measurements)
+            effective = attempts + interrupted
+            pending = next((item for item in measurements if self._needs_attempt(item, effective)), None)
             if pending is not None:
                 try:
                     client.policy.authorize(pending["kind"], pending["provider"], requests, spent)
                 except JudgeCallFailure as failure:
                     raise ValueError("The run's request or cost budget is exhausted") from failure
+            # All checks passed: record interrupted attempts once (append-only; already-recorded
+            # attemptIds are skipped by interrupted_attempts), then continue from the restored usage.
+            for record in interrupted:
+                _append_jsonl(run_dir / "attempts.jsonl", dict(record, recoveredAt=_now()))
             client.restore_usage(requests, spent)
         self._set_status(run_dir, "running", None)
         return self._execute(run_dir, measurements, client)
@@ -352,7 +434,14 @@ class JudgeRunner:
                   "pricingCheckedAt": price.get("checkedAt"), "outputRef": None}
         output = {"rawText": None, "parsed": None, "validationStage": None}
         try:
-            result = client.call_measurement(measurement, body)
+            journal = None
+            if execution_mode(client) == "live":
+                def journal(intent):
+                    # Written (fsync + atomic replace) before the transport is entered.
+                    _append_jsonl(run_dir / "requests.jsonl", dict(
+                        intent, attemptId=attempt_id, logicalMeasurementId=measurement["logicalMeasurementId"],
+                        attempt=number, createdAt=_now()))
+            result = client.call_measurement(measurement, body, attempt_id=attempt_id, before_send=journal)
             record.update(reportedModel=result.get("reportedModel"), usage=result.get("usage"),
                           estimatedCostUsd=result.get("estimatedCostUsd"),
                           httpRequests=result.get("httpRequests", []))
@@ -398,6 +487,10 @@ class JudgeRunner:
         eligibility = _read_jsonl(run_dir / "eligibility.jsonl")
         measurements = _read_jsonl(run_dir / "measurements.jsonl")
         attempts = _read_jsonl(run_dir / "attempts.jsonl")
+        # Journaled requests without a completed attempt count as interrupted attempts with unknown
+        # cost even before a resume records them; derive itself never writes raw records.
+        attempts = attempts + interrupted_attempts(_read_jsonl(run_dir / "requests.jsonl"), attempts,
+                                                   measurements)
         states = measurement_states(measurements, attempts)
         attempts_by_id = {item["attemptId"]: item for item in attempts}
 

@@ -283,10 +283,12 @@ class JudgeHttpClient:
         self.requests_made = requests_made
         self.reserved_cost = reserved_cost
 
-    def call_measurement(self, measurement, body):
-        return self.call(measurement["provider"], measurement["kind"], body)
+    def call_measurement(self, measurement, body, attempt_id=None, before_send=None):
+        return self.call(measurement["provider"], measurement["kind"], body, attempt_id, before_send)
 
-    def call(self, provider, kind, body):
+    def call(self, provider, kind, body, attempt_id=None, before_send=None):
+        """``before_send(intent)`` must durably record each request's reservation; it runs before the
+        transport is entered, so a request is never sent without a persisted reservation."""
         url = OPENAI_URL if provider == "openai" else GEMINI_URL
         key = self._key(provider)
         log = []
@@ -306,10 +308,15 @@ class JudgeHttpClient:
             self.reserved_cost += estimate
             # Created before the transport call so every request actually sent is traceable. reservedUsd is
             # this request's pre-call reservation; settledUsd replaces it only once its cost is known.
-            entry = {"request": http_try + 1, "isHttpRetry": http_try > 0, "status": None,
-                     "outcome": "sent", "retryAfterSeconds": None, "waitedSeconds": None,
+            request_id = "%s-r%d" % (attempt_id, http_try + 1) if attempt_id else None
+            entry = {"requestId": request_id, "request": http_try + 1, "isHttpRetry": http_try > 0,
+                     "status": None, "outcome": "sent", "retryAfterSeconds": None, "waitedSeconds": None,
                      "reservedUsd": estimate, "settledUsd": None}
             log.append(entry)
+            if before_send is not None:
+                # Durable reservation first; if this write fails the request is never sent.
+                before_send({"requestId": request_id, "request": http_try + 1, "provider": provider,
+                             "kind": kind, "reservedUsd": estimate})
             try:
                 status, response, retry_after = self.transport(url, headers, body, self.policy.timeout_seconds)
             except (TimeoutError, socket.timeout):
@@ -375,7 +382,8 @@ class JudgeFixtureClient:
         self.default = default
         self.calls = []
 
-    def call_measurement(self, measurement, body):
+    def call_measurement(self, measurement, body, attempt_id=None, before_send=None):
+        # No HTTP request is made, so there is no reservation to journal.
         self.calls.append(measurement["logicalMeasurementId"])
         queue = self.script.get(measurement["logicalMeasurementId"])
         if queue is None:

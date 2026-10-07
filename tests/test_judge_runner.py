@@ -3,12 +3,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from src.judge_client import (JudgeCallFailure, JudgeFixtureClient, JudgeHttpClient, JudgePolicy, estimate_cost,
                               parse_response)
 from src.judge_eligibility import SourceIntegrityError
-from src.judge_runner import (JudgeRunner, cost_summary, measurement_states, preflight_live_policy,
-                              run_expenditure)
+from src.judge_runner import (JudgeRunner, cost_summary, interrupted_attempts, measurement_states,
+                              preflight_live_policy, run_expenditure)
 from src.pilot_runner import PilotRunner
 from tests.judge_fixtures import build_synthetic_pilot, default_outcome, pairwise_output, pointwise_output
 
@@ -202,7 +203,10 @@ class FakeTransport:
 
     def __call__(self, url, headers, body, timeout):
         self.calls.append(url)
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def openai_ok(status="completed", content=None):
@@ -612,12 +616,29 @@ class ResumeRunGuardTest(unittest.TestCase):
         return JudgeHttpClient(live_policy(**overrides), {}, transport=transport, sleep=lambda seconds: None,
                                api_keys={"openai": "k", "gemini": "k"})
 
+    def jsonl(self, run_id, name):
+        path = self.results / "judge" / run_id / name
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
     def attempts(self, run_id):
-        path = self.results / "judge" / run_id / "attempts.jsonl"
-        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        return self.jsonl(run_id, "attempts.jsonl")
+
+    def intents(self, run_id):
+        return self.jsonl(run_id, "requests.jsonl")
+
+    def expenditure(self, run_id):
+        return run_expenditure(self.intents(run_id), self.attempts(run_id))
 
     def status(self, run_id):
         return json.loads((self.results / "judge" / run_id / "run.json").read_text(encoding="utf-8"))["status"]
+
+    def crashed_run(self, transport, **overrides):
+        judge = self.results / "judge"
+        before = set(judge.iterdir()) if judge.exists() else set()
+        with self.assertRaises(KeyboardInterrupt):
+            self.runner.start(self.client(transport, **overrides))
+        (created,) = set(judge.iterdir()) - before
+        return created.name
 
     def stopped_run(self, transport, **overrides):
         manifest = self.runner.start(self.client(transport, **overrides))
@@ -630,22 +651,69 @@ class ResumeRunGuardTest(unittest.TestCase):
             self.runner.resume(run_id, client)
         self.assertEqual((transport.calls, self.attempts(run_id), self.status(run_id)), ([], before, "stopped"))
 
-    def test_run_expenditure_counts_every_request(self):
-        attempts = [{"httpRequests": [{"reservedUsd": 0.01, "settledUsd": 0.004},
-                                      {"reservedUsd": 0.01, "settledUsd": None}]}, {"httpRequests": []}]
-        requests, spent = run_expenditure(attempts)
-        self.assertEqual(requests, 2)
-        self.assertAlmostEqual(spent, 0.014)
-        for entry in ({"settledUsd": 0.004}, {"reservedUsd": 0.01, "settledUsd": float("nan")},
-                      {"reservedUsd": -1.0}):
+    @staticmethod
+    def intent(measurement, attempt, request, reserved=0.01):
+        attempt_id = "%s-%d" % (measurement, attempt)
+        return {"requestId": "%s-r%d" % (attempt_id, request), "attemptId": attempt_id,
+                "logicalMeasurementId": measurement, "attempt": attempt, "request": request,
+                "provider": "openai", "kind": "pointwise", "reservedUsd": reserved,
+                "createdAt": "2026-10-07T00:00:00Z"}
+
+    def test_run_expenditure_counts_every_journaled_request(self):
+        intents = [self.intent("a", 1, 1), self.intent("a", 1, 2),
+                   self.intent("b", 1, 1)]  # b-1-r1 has no settlement record
+        attempts = [{"httpRequests": [{"requestId": "a-1-r1", "settledUsd": 0.004},
+                                      {"requestId": "a-1-r2", "settledUsd": None}]}, {"httpRequests": []}]
+        requests, spent = run_expenditure(intents, attempts)
+        self.assertEqual(requests, 3)
+        self.assertAlmostEqual(spent, 0.004 + 0.01 + 0.01)
+        intent = self.intent("x", 1, 1)
+        bad = [([dict(intent, reservedUsd=-1.0)], []),  # negative reservation
+               ([intent, intent], []),  # duplicate requestId
+               ([intent], [{"httpRequests": [{"requestId": "x-1-r1", "settledUsd": float("nan")}]}]),
+               ([], [{"httpRequests": [{"requestId": "y", "settledUsd": 0.0}]}]),  # settlement without intent
+               ([intent], [{"httpRequests": [{"settledUsd": 0.0}]}])]  # settlement without requestId
+        for case_intents, case_attempts in bad:
             with self.assertRaises(ValueError):
-                run_expenditure([{"httpRequests": [entry]}])
+                run_expenditure(case_intents, case_attempts)
+
+    def test_malformed_request_journal_rows_are_rejected(self):
+        intent = self.intent("x", 1, 1)
+        malformed = [dict(intent, **{key: None}) for key in intent if key not in ("provider", "kind")]
+        malformed += [{key: value for key, value in intent.items() if key != missing}
+                      for missing in ("requestId", "attemptId", "logicalMeasurementId", "attempt", "request",
+                                      "reservedUsd", "createdAt")]
+        malformed += [dict(intent, attempt="1"), dict(intent, attempt=True), dict(intent, attempt=0),
+                      dict(intent, request=1.0), dict(intent, createdAt=123), dict(intent, reservedUsd="0.01"),
+                      dict(intent, attemptId="x-2"), dict(intent, requestId="x-1-r2"), "not a row"]
+        for row in malformed:
+            for check in (lambda: run_expenditure([row], []), lambda: interrupted_attempts([row], [], [])):
+                with self.assertRaises(ValueError):
+                    check()
+
+    def test_malformed_journal_refuses_resume_before_any_recovery(self):
+        for corrupt in (lambda row: row.pop("attemptId"), lambda row: row.update(attempt="1"),
+                        lambda row: row.pop("createdAt")):
+            with self.subTest(corrupt=corrupt):
+                run_id = self.crashed_run(FakeTransport(KeyboardInterrupt()))
+                run_dir = self.results / "judge" / run_id
+                rows = self.intents(run_id)
+                corrupt(rows[0])
+                journal = "".join(json.dumps(row) + "\n" for row in rows)
+                (run_dir / "requests.jsonl").write_text(journal, encoding="utf-8")
+                before = snapshot(run_dir)
+                transport = FakeTransport(openai_usage_response(0))
+                client = self.client(transport)
+                with self.assertRaises(ValueError):
+                    self.runner.resume(run_id, client)
+                self.assertEqual((transport.calls, client.requests_made, client.reserved_cost), ([], 0, 0))
+                self.assertEqual(snapshot(run_dir), before)  # no interrupted record, status or journal change
 
     def test_resume_continues_from_persisted_requests_and_spend(self):
         # KARI A succeeds (known cost), KARI B gets a 400 -> stopped after 2 of 4 allowed requests.
         run_id = self.stopped_run(FakeTransport(openai_usage_response(0, text=pointwise_output([0, 1, 2])),
                                                 (400, {}, None)), http_request_limit=4)
-        requests, spent = run_expenditure(self.attempts(run_id))
+        requests, spent = self.expenditure(run_id)
         estimate = live_policy().estimate("pointwise", "openai")
         self.assertEqual(requests, 2)
         self.assertAlmostEqual(spent, (1000 * 1.0 + 300 * 2.0) / 1e6 + estimate)
@@ -655,13 +723,14 @@ class ResumeRunGuardTest(unittest.TestCase):
         manifest = self.runner.resume(run_id, client)
         # Only N - k = 2 more requests were allowed before the run-level request guard stopped the run.
         self.assertEqual((len(transport.calls), manifest["stopReason"], client.requests_made), (2, "live_guard", 4))
-        self.assertAlmostEqual(client.reserved_cost, run_expenditure(self.attempts(run_id))[1])
+        self.assertAlmostEqual(client.reserved_cost, self.expenditure(run_id)[1])
+        self.assertEqual(len(self.intents(run_id)), 4)
 
     def test_unknown_cost_reservation_survives_resume(self):
         estimate = live_policy().estimate("pointwise", "openai")
         malformed = CachedCostGuardTest.details_response("invalid", text=pointwise_output([0, 1, 2]))
         run_id = self.stopped_run(FakeTransport(malformed), total_cost_limit=estimate * 1.5)
-        self.assertEqual(run_expenditure(self.attempts(run_id)), (1, estimate))
+        self.assertEqual(self.expenditure(run_id), (1, estimate))
         transport = FakeTransport()
         self.assert_refused(run_id, self.client(transport, total_cost_limit=estimate * 1.5), transport)
 
@@ -683,17 +752,114 @@ class ResumeRunGuardTest(unittest.TestCase):
         self.assert_refused(run_id, JudgeHttpClient(changed_price, {}, transport=transport, sleep=lambda s: None,
                                                     api_keys={"openai": "k", "gemini": "k"}), transport)
 
-    def test_legacy_live_run_without_reservations_is_refused(self):
+    def test_live_run_without_a_request_journal_is_refused(self):
+        # A run written before the journal existed: no requestJournalVersion and no requests.jsonl.
         run_id = self.stopped_run(FakeTransport((400, {}, None)))
-        path = self.results / "judge" / run_id / "attempts.jsonl"
-        rows = self.attempts(run_id)
-        for row in rows:
-            for entry in row["httpRequests"]:
-                entry.pop("reservedUsd")
-                entry.pop("settledUsd")
-        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        run_dir = self.results / "judge" / run_id
+        manifest = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        manifest.pop("requestJournalVersion")
+        (run_dir / "run.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (run_dir / "requests.jsonl").unlink()
         transport = FakeTransport(openai_usage_response(0))
         self.assert_refused(run_id, self.client(transport), transport)
+
+    def test_request_journal_is_durable_before_the_transport_is_entered(self):
+        seen = []
+
+        def transport(url, headers, body, timeout):
+            run_dir = next((self.results / "judge").iterdir())
+            seen.append([intent["requestId"] for intent in self.jsonl(run_dir.name, "requests.jsonl")])
+            return (400, {}, None)
+        self.runner.start(self.client(transport))
+        run_id = next(path.name for path in (self.results / "judge").iterdir())
+        self.assertEqual(seen, [[self.intents(run_id)[0]["requestId"]]])
+        self.assertEqual(self.attempts(run_id)[0]["httpRequests"][0]["requestId"],
+                         self.intents(run_id)[0]["requestId"])
+
+    def test_crash_after_reservation_before_response_becomes_an_interrupted_attempt(self):
+        estimate = live_policy().estimate("pointwise", "openai")
+        run_id = self.crashed_run(FakeTransport(KeyboardInterrupt()))
+        self.assertEqual((len(self.intents(run_id)), self.attempts(run_id)), (1, []))
+        self.assertEqual(self.expenditure(run_id), (1, estimate))
+        transport = FakeTransport(openai_usage_response(0, text=pointwise_output([0, 1, 2])), (400, {}, None))
+        crashed = self.intents(run_id)[0]["logicalMeasurementId"]
+        self.runner.resume(run_id, self.client(transport))
+        history = [row for row in self.attempts(run_id) if row["logicalMeasurementId"] == crashed]
+        self.assertEqual([(row["attempt"], row["errorCategory"], row["outcome"]) for row in history],
+                         [(1, "interrupted", "failure"), (2, None, "success")])
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_crash_after_response_before_attempt_record_keeps_reservation(self):
+        import src.judge_runner as runner_module
+        original = runner_module._append_jsonl
+
+        def crash_on_attempts(path, row):
+            if path.name == "attempts.jsonl":
+                raise KeyboardInterrupt()
+            return original(path, row)
+        transport = FakeTransport(openai_usage_response(0, text=pointwise_output([0, 1, 2])))
+        with mock.patch.object(runner_module, "_append_jsonl", side_effect=crash_on_attempts):
+            run_id = self.crashed_run(transport)
+        estimate = live_policy().estimate("pointwise", "openai")
+        self.assertEqual((len(transport.calls), self.attempts(run_id), self.expenditure(run_id)),
+                         (1, [], (1, estimate)))
+        report = self.runner.derive(run_id)  # derive sees the interrupted attempt without writing it
+        self.assertEqual(report["cost"]["allAttempts"], {"usd": None, "knownUsd": 0, "unknownCostCount": 1})
+        self.assertEqual(self.attempts(run_id), [])
+        resumed = FakeTransport((400, {}, None))
+        self.runner.resume(run_id, self.client(resumed))
+        first, second = self.attempts(run_id)[:2]
+        self.assertEqual((first["attempt"], first["errorCategory"], first["estimatedCostUsd"]), (1, "interrupted", None))
+        self.assertEqual((second["logicalMeasurementId"], second["attempt"]), (first["logicalMeasurementId"], 2))
+
+    def test_crash_after_completed_attempt_does_not_resend_it(self):
+        run_id = self.crashed_run(FakeTransport(openai_usage_response(0, text=pointwise_output([0, 1, 2])),
+                                                KeyboardInterrupt()))
+        completed = self.attempts(run_id)
+        self.assertEqual([row["outcome"] for row in completed], ["success"])
+        estimate = live_policy().estimate("pointwise", "openai")
+        self.assertEqual(self.expenditure(run_id)[0], 2)
+        self.assertAlmostEqual(self.expenditure(run_id)[1], (1000 * 1.0 + 300 * 2.0) / 1e6 + estimate)
+        transport = FakeTransport((400, {}, None))
+        self.runner.resume(run_id, self.client(transport))
+        ids = [row["logicalMeasurementId"] for row in self.attempts(run_id)]
+        self.assertEqual(ids.count(completed[0]["logicalMeasurementId"]), 1)  # the success is never resent
+
+    def test_repeated_crashes_never_exceed_the_request_cap(self):
+        run_id = self.crashed_run(FakeTransport(KeyboardInterrupt()), http_request_limit=2)
+        with self.assertRaises(KeyboardInterrupt):
+            self.runner.resume(run_id, self.client(FakeTransport(KeyboardInterrupt()), http_request_limit=2))
+        self.assertEqual(self.expenditure(run_id)[0], 2)
+        transport = FakeTransport(openai_usage_response(0))
+        before = self.attempts(run_id)
+        with self.assertRaises(ValueError):
+            self.runner.resume(run_id, self.client(transport, http_request_limit=2))
+        self.assertEqual((transport.calls, self.attempts(run_id)), ([], before))
+
+    def test_unsettled_reservation_counts_against_the_cost_cap(self):
+        estimate = live_policy().estimate("pointwise", "openai")
+        run_id = self.crashed_run(FakeTransport(KeyboardInterrupt()), total_cost_limit=estimate * 1.5)
+        transport = FakeTransport(openai_usage_response(0))
+        with self.assertRaises(ValueError):
+            self.runner.resume(run_id, self.client(transport, total_cost_limit=estimate * 1.5))
+        self.assertEqual((transport.calls, self.attempts(run_id)), ([], []))
+
+    def test_interrupted_attempts_count_toward_the_attempt_limit_and_are_not_duplicated(self):
+        run_id = self.crashed_run(FakeTransport(KeyboardInterrupt()))
+        for _ in range(2):
+            with self.assertRaises(KeyboardInterrupt):
+                self.runner.resume(run_id, self.client(FakeTransport(KeyboardInterrupt())))
+        first_measurement = self.intents(run_id)[0]["logicalMeasurementId"]
+        transport = FakeTransport((400, {}, None))
+        self.runner.resume(run_id, self.client(transport))
+        self.runner.resume(run_id, self.client(FakeTransport((400, {}, None))))
+        rows = [row for row in self.attempts(run_id) if row["logicalMeasurementId"] == first_measurement]
+        self.assertEqual([(row["attempt"], row["errorCategory"]) for row in rows],
+                         [(1, "interrupted"), (2, "interrupted"), (3, "interrupted")])
+        self.assertFalse([intent for intent in self.intents(run_id)
+                          if intent["logicalMeasurementId"] == first_measurement and intent["attempt"] > 3])
+        attempt_ids = [row["attemptId"] for row in self.attempts(run_id)]
+        self.assertEqual(len(attempt_ids), len(set(attempt_ids)))
 
 
 if __name__ == "__main__":
