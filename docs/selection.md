@@ -1,6 +1,6 @@
 # 방식·모델 선택 기록
 
-이 문서는 Cking AI Quiz Pilot에서 영상 분석 방법을 정한 근거, Pilot v1 실행 기록, 현재 Pilot v2의 실행 프로토콜과 결과 해석 기준, Pilot v2-r2 결과와 그에 따른 Quiz 생성 방식 결정을 기록합니다. Pilot v1(2~3장)과 Pilot v2(6~8장)는 별개의 실험입니다. 근거의 성격은 다음 표기로 구분합니다.
+이 문서는 Cking AI Quiz Pilot에서 영상 분석 방법을 정한 근거, Pilot v1 실행 기록, 현재 Pilot v2의 실행 프로토콜과 결과 해석 기준, Pilot v2-r2 결과와 그에 따른 Quiz 생성 방식 결정, 이후의 production architecture 변경을 기록합니다. Pilot v1(2~3장)과 Pilot v2(6~8장)는 별개의 실험입니다. 근거의 성격은 다음 표기로 구분합니다.
 
 - **USER DECISION**: 사람이 정한 요구사항이나 결정입니다. 저장소 코드로 증명된 사실이 아닙니다.
 - **CONFIRMED BY OFFICIAL DOCS**: 2026-10-02에 각 Provider 공식 문서에서 확인한 사실입니다. 문서는 이후 바뀔 수 있습니다.
@@ -493,7 +493,9 @@ Human blind evaluation(조건별 8 set·24문항, set 단위 3항목과 문항 �
 - 따라서 Quiz 단계 수치만으로 "C가 비싸다·느리다"고 비교하지 않습니다. "영상 하나 → Quiz set 하나" 흐름에서 Grounding까지 더하면 C가 비용·지연 면에서 불리하다는 결과는 나오지 않았습니다.
 - Grounding 하나를 여러 Quiz 생성에 재사용하는 구조라면 A/B의 분할 비용·지연은 달라집니다. 조건별 8건의 평균이며, 영상과 시점에 따라 달라질 수 있습니다.
 
-### Quiz 생성 방식 결정: C — Gemini Direct (USER DECISION)
+### Quiz 생성 방식 결정: C — Gemini Direct (USER DECISION, 이후 변경)
+
+> 이 결정은 이후 [Production architecture 재검토](#production-architecture-재검토-a-기반-구조로-변경-user-decision)에서 A 기반 구조로 변경되었습니다. 결정 이력으로 이 소절과 다음 두 소절의 원래 기록을 유지합니다. 다음 소절의 production 목표 흐름과 Judge 방향의 생성기 표기(`gemini_direct_quiz`)는 변경 전 기록입니다.
 
 Production Quiz 생성의 기본 방향으로 C(YouTube 영상 → `gemini-3.8-flash` `gemini_direct_quiz` → Quiz)를 선택합니다. 근거:
 
@@ -523,6 +525,65 @@ YouTube 링크 → Gemini Direct Quiz 생성 → GPT 계열 LLM Judge → Creato
 - 결정됨: Judge 계열 GPT.
 - 후속 결정: 정확한 GPT Judge 모델, Judge prompt version, 판정 기준(threshold)과 pass/fail 정책, retry 정책, reject 후 재생성 정책, Judge 실패 시 fallback, Direct Quiz 입력 계약, production 비용 상한.
 - 현재 저장소의 Judge([Judge 평가 프로토콜](judge-protocol.md))는 A/B를 승인 `contentText` 기준으로 사후 평가하는 보조 도구이며, Direct Quiz(C)는 범위 밖입니다. 따라서 C에 대한 production GPT Judge는 입력 계약을 포함해 별도로 설계해야 하며, 기존 Judge를 그대로 쓸 수 있는지는 후속 조사 대상입니다.
+
+### Production architecture 재검토: A 기반 구조로 변경 (USER DECISION)
+
+Production Quiz 생성기 구조를 C(Gemini Direct)에서 A 기반 구조로 변경합니다. Pilot 결과를 새로 해석하거나 추가 실험을 한 결과가 아니라, production Judge를 붙이는 방법을 검토하면서 내린 architecture 결정입니다.
+
+결정 순서:
+
+1. **Pilot 결과**: A/B/C 모두 Human 평가 전 항목 `pass`로 조건 간 품질 차이가 관측되지 않았습니다(위 "결과").
+2. **최초 선택 C**: 서비스 흐름 일치, pipeline 단순성, E2E 비용·지연 구조를 근거로 C를 선택했습니다(위 "Quiz 생성 방식 결정: C").
+3. **PR #20 Judge 재분석**: production GPT Judge를 C에 붙일 수 있는지 현재 Judge 코드와 계약을 다시 확인했습니다.
+4. **Direct C의 evidence blocker**: C에는 Judge가 기준으로 삼을 독립된 근거가 없습니다.
+   - C의 `sourceEvidence`는 Quiz를 생성한 모델 자신의 출력입니다. 생성과 독립적으로 만들어진 evidence 산출물이나 ground-truth 계약이 없습니다.
+   - 현재 Judge 계약은 승인된 `contentText`만을 판정 근거로 사용하며(`src/judge_contract.py`), C는 범위 밖입니다([Judge 평가 프로토콜](judge-protocol.md)).
+   - 현재 OpenAI Judge adapter는 prompt 텍스트만 입력으로 보내며(`src/judge_client.py`의 `build_request`) 영상 입력 경로가 없습니다. 따라서 GPT Judge가 C의 Quiz를 영상 기준으로 판정할 수 없습니다.
+5. **A 기반 구조로 변경**: Quiz 생성 전에 Gemini Grounding이 `contentText`를 만들고, Quiz와 Judge가 같은 `contentText`를 기준으로 삼는 구조로 바꿉니다.
+6. **GPT Judge 계열 유지**: Quiz 생성기(Gemini)와 Judge(GPT)를 서로 다른 계열로 분리하는 Judge 방향(위 "Judge 방향")은 그대로입니다.
+7. **evidence 신뢰 정책은 다음 설계 과제**: 자동 Grounding 결과를 어디까지 믿고 어떻게 다룰지는 아직 정하지 않았습니다.
+
+변경된 production 목표 흐름:
+
+```
+YouTube 링크 → Gemini 자동 Grounding → contentText → Gemini Quiz 생성 → GPT Pointwise Judge → Creator 확인·승인 → 게시
+```
+
+A 기반 구조를 택한 이유:
+
+- **명시적인 evidence 산출물**: `contentText`가 Quiz 생성과 분리된 별도 산출물로 남습니다. Quiz의 `sourceEvidence`를 이 텍스트와 대조할 수 있습니다.
+- **기존 Pointwise Judge 구성요소 재사용**: OpenAI transport, strict structured output parser, schema 검증, retry와 재개(resume), usage·비용 계산, 요청 journal과 결과 저장, `contentText` 기준 Pointwise 구조를 이어서 쓸 수 있습니다.
+- **감사 가능성(auditability)**: Quiz와 Judge 판정이 어떤 텍스트를 근거로 했는지 저장된 `contentText`로 추적할 수 있습니다.
+- **production Judge 호환성**: 텍스트 기준 Judge 계약과 text-only OpenAI Judge 입력 경로를 그대로 따를 수 있습니다.
+- **Pilot 품질 결과와 충돌하지 않음**: 이번 Pilot에서 A의 Human 판정은 C와 같이 모두 `pass`였으므로, A 기반 구조를 선택해도 관측된 품질 결과와 어긋나지 않습니다.
+
+재사용 범위의 한계: 현재 Judge는 Pilot의 A/B 조건을 대상으로 하며, 원천 Grounding이 사람 승인(`contentTextApprovalStatus=approved`와 승인 추적 필드)을 갖춘 경우에만 대상으로 삼습니다(`src/judge_eligibility.py`). production의 자동 Grounding 결과는 이 조건을 만족하지 않으므로, 현재 Judge 실행기를 그대로 production에 쓸 수 있는 것은 아닙니다. 재사용 대상은 위의 구성요소이며, 자동 Grounding evidence 입력 계약은 새로 정해야 합니다.
+
+분명히 해 둘 점:
+
+- Pilot의 사람 Grounding 검수·승인은 production workflow에 포함되지 않습니다. Pilot 비교를 위한 프로토콜이었습니다(위 "Pilot 프로토콜과 production의 구분").
+- production의 자동 Grounding 결과는 검증된 ground truth가 아닙니다. Judge가 `contentText` 기준으로 `pass`를 내도 영상 기준의 사실 정확성을 보장하지 않습니다.
+- 정확한 GPT Judge 모델은 정하지 않았습니다(TBD). `configs/judge.yaml`의 `gpt-6.1-sol`은 Pilot 사후 Judge 설정이며 production 모델 결정이 아닙니다.
+- production에는 Pairwise가 필요하지 않습니다. production Judge는 Pointwise입니다.
+- Creator의 최종 확인·승인은 유지합니다.
+- 두 번째 72문항 실행은 하지 않습니다(위 "실행 범위").
+
+트레이드오프:
+
+- 영상 → Quiz 사이에 Grounding 단계가 하나 더 생깁니다.
+- Grounding 호출이 하나 늘어 비용과 지연이 커질 수 있습니다. 이번 Pilot의 단순 순차 합산 평균에서 A는 C보다 비용·지연이 높았습니다(위 "비용과 지연 해석", production 수치가 아님).
+- Grounding 실패가 새로운 실패 지점이 됩니다. Grounding이 실패하면 Quiz를 생성할 수 없으며, production의 Grounding retry·실패 처리 정책은 정하지 않았습니다.
+- Grounding의 오류가 Quiz와 Judge evidence 양쪽으로 전파됩니다. Judge는 같은 `contentText`를 기준으로 판정하므로, `contentText` 자체의 사실 오류는 Judge가 잡아내지 못할 수 있습니다.
+- 사람 검수 없이 자동 Grounding 결과를 쓰므로 evidence 신뢰 정책이 필요합니다.
+
+이 변경은 다음을 주장하지 않습니다: A의 품질이 C보다 좋다는 것, C가 실패했다는 것, A/C 비교에서 A가 이겼다는 것, GPT Judge 실험 결과가 이 결정을 뒷받침한다는 것. 이 결정은 Judge 실행 결과에 근거하지 않습니다.
+
+다음 단계 (제안, 아직 진행하지 않음):
+
+1. Production A 자동 Grounding evidence 계약 정의(evidence 신뢰 정책 포함).
+2. Production A와 GPT Pointwise Judge 지원 구현.
+3. GPT Judge 검증: Human 평가로 `pass`가 확인된 기존 Quiz를 positive 데이터로 재사용하고, 알려진 결함 사례(known-bad)를 추가해 확인.
+4. 최종 E2E 검증.
 
 ## 공식 문서 출처 (2026-10-02 확인)
 
