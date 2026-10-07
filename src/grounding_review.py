@@ -13,9 +13,11 @@ from src.provider_adapters import GROUNDING_PROMPTS
 
 # Legacy Grounding rows (promptVersion=null) were recorded before Grounding prompt versioning.
 LEGACY_GROUNDING_PROMPT_VERSION = "video-grounding-v1"
-REVIEW_REQUIRED_PROMPT_VERSIONS = frozenset({"video-grounding-v2"})
-# The Grounding version group each Quiz experiment may take its source contentText from.
-QUIZ_GROUNDING_VERSIONS = {"pilot-v1": "video-grounding-v1", "pilot-v2": "video-grounding-v2"}
+REVIEW_REQUIRED_PROMPT_VERSIONS = frozenset({"video-grounding-v2", "video-grounding-v3"})
+# The Grounding version group each Quiz experiment may take its source contentText from. Pilot v2
+# moved to video-grounding-v3 (MM:SS string timestamps); its paused video-grounding-v2 run is kept
+# as pre-fix evidence and is no longer a Quiz source.
+QUIZ_GROUNDING_VERSIONS = {"pilot-v1": "video-grounding-v1", "pilot-v2": "video-grounding-v3"}
 
 
 def is_known_grounding_version(prompt_version):
@@ -26,7 +28,7 @@ def is_known_grounding_version(prompt_version):
 def grounding_version_matches_quiz_version(quiz_prompt_version, grounding_prompt_version):
     """Whether a Quiz experiment may use a source Grounding of this version (unknown versions never match).
 
-    pilot-v1 takes legacy null and video-grounding-v1 sources; pilot-v2 takes video-grounding-v2 only.
+    pilot-v1 takes legacy null and video-grounding-v1 sources; pilot-v2 takes video-grounding-v3 only.
     """
     expected = (QUIZ_GROUNDING_VERSIONS.get(quiz_prompt_version)
                 if isinstance(quiz_prompt_version, str) else None)

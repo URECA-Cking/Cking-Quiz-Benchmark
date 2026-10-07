@@ -23,7 +23,8 @@ from src.grounding_review import (build_review, derive_approval_status, groundin
                                   require_valid_grounding_review, requires_review,
                                   successful_review_candidates)
 from src.human_evaluation import require_valid_human_evaluation
-from src.provider_adapters import GROUNDING_PROMPTS, validate_quiz_config
+from src.provider_adapters import (GROUNDING_PROMPTS, STRING_TIMESTAMP_GROUNDING_VERSIONS,
+                                   validate_quiz_config, video_timestamp_seconds)
 from src.provider_failure import ProviderFailure
 
 
@@ -496,7 +497,7 @@ class PilotRunner:
                 or any(char not in "0123456789abcdef" for char in approved_hash)):
             raise ValueError("An approved Grounding result is required")
         # Pilot v1 Quiz takes only legacy/video-grounding-v1 sources and Pilot v2 Quiz only
-        # video-grounding-v2 sources; the fixed-content manifest is not relied on for this.
+        # video-grounding-v3 sources; the fixed-content manifest is not relied on for this.
         if not grounding_version_matches_quiz_version(self.config["prompt_version"], source.get("promptVersion")):
             raise ValueError("The source Grounding prompt version does not belong to this Pilot experiment")
         # Pilot v2 Quiz must use its own repetition's Grounding; offline aggregation, Judge and
@@ -683,9 +684,22 @@ class PilotRunner:
                 facts = normalized.get("facts", [])
                 if not isinstance(facts, list):
                     raise ProviderFailure("invalid_grounding_response")
+                string_timestamps = row["promptVersion"] in STRING_TIMESTAMP_GROUNDING_VERSIONS
+                # Validate every fact first; a failed response stores no partial groundingFacts.
+                checked = []
                 for fact in facts:
-                    start = fact.get("timestampStartSeconds") if isinstance(fact, dict) else None
-                    end = fact.get("timestampEndSeconds") if isinstance(fact, dict) else None
+                    if string_timestamps:
+                        # The Provider writes "MM:SS" strings; only the converted elapsed seconds are kept.
+                        if not isinstance(fact, dict) or not {"timestampStart", "timestampEnd"} <= set(fact):
+                            raise ProviderFailure("invalid_grounding_response")
+                        try:
+                            start, end = (video_timestamp_seconds(fact["timestampStart"]),
+                                          video_timestamp_seconds(fact["timestampEnd"]))
+                        except ValueError:
+                            raise ProviderFailure("invalid_grounding_response") from None
+                    else:
+                        start = fact.get("timestampStartSeconds") if isinstance(fact, dict) else None
+                        end = fact.get("timestampEndSeconds") if isinstance(fact, dict) else None
                     if (not isinstance(fact, dict)
                             or any(not isinstance(fact.get(key), str) or not fact[key].strip()
                                    for key in ("fact", "evidenceType", "evidence"))
@@ -696,14 +710,21 @@ class PilotRunner:
                                    for value in (start, end))
                             or start is not None and end is not None and start > end):
                         raise ProviderFailure("invalid_grounding_response")
-                    row["groundingFacts"].append({
+                    checked.append({
                         "fact": fact["fact"], "evidenceType": fact["evidenceType"],
                         "evidence": fact["evidence"],
-                        "timestampStartSeconds": fact.get("timestampStartSeconds"),
-                        "timestampEndSeconds": fact.get("timestampEndSeconds"),
+                        "timestampStartSeconds": start,
+                        "timestampEndSeconds": end,
                         "factExists": None, "evidenceTypeCorrect": None,
                         "timestampAccurate": None, "reviewNote": None,
                     })
+                row["groundingFacts"] = checked
+                if string_timestamps:
+                    # The evaluation file keeps the stored timestamp contract, not the Provider strings.
+                    normalized = dict(normalized, facts=[
+                        {key: item[key] for key in ("fact", "evidenceType", "evidence",
+                                                    "timestampStartSeconds", "timestampEndSeconds")}
+                        for item in row["groundingFacts"]])
                 self._success(row, provider, response, elapsed)
             row["contentTextSha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
             return self._save(row, raw, normalized), content

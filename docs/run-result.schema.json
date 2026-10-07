@@ -12,7 +12,7 @@
     },
     {
       "if": {"required": ["groundingReview"]},
-      "then": {"required": ["contentTextApprovalStatus", "contentTextSha256"], "properties": {"benchmarkType": {"const": "video_grounding"}, "promptVersion": {"const": "video-grounding-v2"}, "apiStatus": {"const": "success"}, "contentTextApprovalStatus": {"enum": ["approved", "rejected"]}}}
+      "then": {"required": ["contentTextApprovalStatus", "contentTextSha256"], "properties": {"benchmarkType": {"const": "video_grounding"}, "promptVersion": {"enum": ["video-grounding-v2", "video-grounding-v3"]}, "apiStatus": {"const": "success"}, "contentTextApprovalStatus": {"enum": ["approved", "rejected"]}}}
     },
     {
       "if": {"required": ["contentTextApprovalStatus"], "properties": {"contentTextApprovalStatus": {"const": "rejected"}}},

@@ -3,10 +3,12 @@
 import json
 import math
 import os
+import re
 import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from pathlib import Path
 
 import yaml
@@ -40,12 +42,44 @@ def _elapsed_seconds(edge):
                             "(예: 01:30.5 → 90.5). 근거 위치를 특정할 수 없으면 null.")}
 
 
-def grounding_schema():
+def _video_timestamp(edge):
+    # Gemini's documented schema subset has no "pattern"; the exact format is enforced in code.
+    return {"type": ["string", "null"],
+            "description": (f"근거 구간의 {edge} 위치. 영상 시작부터의 시각을 \"MM:SS\" 또는 \"MM:SS.s\" 문자열로 쓰며"
+                            " 초는 00~59(예: \"01:41.2\"). 초 단위 숫자로 바꾸지 않음. 근거 위치를 특정할 수 없으면 null.")}
+
+
+# Grounding versions whose Provider-facing timestamps are "MM:SS" strings (timestampStart/timestampEnd).
+# The runner converts them; stored rows keep timestampStartSeconds/timestampEndSeconds in elapsed seconds.
+STRING_TIMESTAMP_GROUNDING_VERSIONS = frozenset({"video-grounding-v3"})
+_VIDEO_TIMESTAMP = re.compile(r"(\d{1,3}):([0-5]\d)(?:\.(\d{1,3}))?", re.ASCII)
+
+
+def video_timestamp_seconds(value):
+    """Elapsed seconds from the video start for an "MM:SS" or "MM:SS.s" string; None stays None.
+
+    Deterministic: minutes * 60 + seconds, computed in decimal (01:41.2 -> 101.2). Anything else,
+    including seconds of 60 or more, signs, non-ASCII digits or a non-string, raises ValueError.
+    """
+    if value is None:
+        return None
+    match = _VIDEO_TIMESTAMP.fullmatch(value) if type(value) is str else None
+    if match is None:
+        raise ValueError("A video timestamp must be an MM:SS or MM:SS.s string")
+    minutes, seconds, fraction = match.groups()
+    return float(int(minutes) * 60 + Decimal(seconds + "." + (fraction or "0")))
+
+
+def grounding_schema(prompt_version=None):
+    if prompt_version in STRING_TIMESTAMP_GROUNDING_VERSIONS:
+        timestamps = {"timestampStart": _video_timestamp("시작"), "timestampEnd": _video_timestamp("끝")}
+    else:
+        timestamps = {"timestampStartSeconds": _elapsed_seconds("시작"),
+                      "timestampEndSeconds": _elapsed_seconds("끝")}
     fact = {"type": "object", "additionalProperties": False,
             "properties": {"fact": _string(), "evidenceType": {"type": "string", "enum": ["speech", "visual", "unknown"]}, "evidence": _string(),
-                           "timestampStartSeconds": _elapsed_seconds("시작"),
-                           "timestampEndSeconds": _elapsed_seconds("끝")},
-            "required": ["fact", "evidenceType", "evidence", "timestampStartSeconds", "timestampEndSeconds"]}
+                           **timestamps},
+            "required": ["fact", "evidenceType", "evidence", *timestamps]}
     return {"type": "object", "additionalProperties": False,
             "properties": {"contentText": _string(), "facts": {"type": "array", "items": fact}},
             "required": ["contentText", "facts"]}
@@ -72,9 +106,22 @@ _GROUNDING_CONTENT_TEXT_CONTRACT_V2 = (
     "5) contentText는 한국어로 작성하세요. "
     "6) 같은 응답의 facts와 모순되는 내용을 쓰지 마세요. "
     "7) '이 영상은 ~에 대해 설명합니다'처럼 내용을 요약하거나 소개만 하는 메타 문장을 넣지 마세요.")
+# video-grounding-v3: the v2 rules, but timestamps are "MM:SS" strings the code converts. A real
+# video-grounding-v2 call returned MM:SS digits as numbers (01:41.2 -> 141.2) despite the v1 rule.
+_GROUNDING_PROMPT_V3 = ("영상에서 확인 가능한 사실과 발화/화면 근거, 제시된 timestamp를 추출하세요. 추측은 제외하세요. "
+                        "evidenceType은 speech, visual, unknown 중 하나만 사용하세요. "
+                        "speech는 주된 근거가 영상의 발화 또는 나레이션인 경우, "
+                        "visual은 주된 근거가 화면에서 확인되는 시각 정보인 경우입니다. "
+                        "발화와 화면 양쪽에 근거가 있어도 주된 근거에 따라 speech 또는 visual을 선택하세요. "
+                        "주된 근거를 speech 또는 visual 중 하나로 신뢰성 있게 분류할 수 없을 때만 unknown을 사용하세요. "
+                        "timestampStart와 timestampEnd는 영상 시작부터의 시각을 \"MM:SS\" 또는 \"MM:SS.s\" 형식의 문자열로 기록하세요. "
+                        "예: 1분 41.2초 → \"01:41.2\", 3분 4.5초 → \"03:04.5\". 초는 00~59로 쓰고, 초 단위 숫자로 바꾸어 계산하지 마세요. "
+                        "timestampStart는 timestampEnd보다 늦을 수 없고, timestampEnd는 영상 길이를 넘을 수 없습니다. "
+                        "근거 위치를 특정할 수 없으면 null을 사용하세요.")
 GROUNDING_PROMPTS = {
     "video-grounding-v1": _GROUNDING_PROMPT_V1,
     "video-grounding-v2": _GROUNDING_PROMPT_V1 + _GROUNDING_CONTENT_TEXT_CONTRACT_V2,
+    "video-grounding-v3": _GROUNDING_PROMPT_V3 + _GROUNDING_CONTENT_TEXT_CONTRACT_V2,
 }
 
 # Freeze the v1 text and interpolation; versioning must not rewrite historical requests.
@@ -356,7 +403,7 @@ class ProviderRouter:
             prompt = GROUNDING_PROMPTS.get(version) if isinstance(version, str) else None
             if prompt is None:
                 raise ProviderFailure("invalid_input")
-            schema = grounding_schema()
+            schema = grounding_schema(version)
         else:
             question_count, option_count = kwargs.get("questionCount"), kwargs.get("optionCount")
             prompt_version = kwargs.get("promptVersion")

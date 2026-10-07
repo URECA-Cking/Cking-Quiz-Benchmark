@@ -89,13 +89,13 @@ class OfflineAggregatorTest(unittest.TestCase):
         reviewed_at = "2026-10-07T00:00:00+00:00"
         review = dict({item: "pass" for item in REVIEW_ITEMS}, reviewNote=None, reviewedBy="r",
                       reviewedAt=reviewed_at)
-        v2 = dict(self.grounding, runId="ground-v2", attempt=2, promptVersion="video-grounding-v2",
+        v2 = dict(self.grounding, runId="ground-v2", attempt=2, promptVersion="video-grounding-v3",
                   groundingReview=review, approvedBy="r", approvedAt=reviewed_at)
         version_rows = [
             self.row("video_grounding", "ground-v1-3", "gemini_video", "gemini-3.8-flash", 3,
                      apiStatus="error", promptVersion="video-grounding-v1"),
             self.row("video_grounding", "ground-v2-1", "gemini_video", "gemini-3.8-flash", 1,
-                     apiStatus="error", promptVersion="video-grounding-v2")]
+                     apiStatus="error", promptVersion="video-grounding-v3")]
         legacy = self.row("video_grounding", "ground-1", "gemini_video", "gemini-3.8-flash", 1,
                           apiStatus="error", errorCategory="server_error", httpStatus=503)
         quiz = dict(self.quiz, runId="quiz-v2", sourceGroundingRunId="ground-v2", promptVersion="pilot-v2")
@@ -116,7 +116,7 @@ class OfflineAggregatorTest(unittest.TestCase):
         reviewed_at = "2026-10-07T00:00:00+00:00"
         verdict = "fail" if status == "rejected" else "pass"
         row = self.row("video_grounding", run_id, "gemini_video", "gemini-3.8-flash", attempt,
-                       apiStatus=api_status, promptVersion="video-grounding-v2", groundingFacts=[],
+                       apiStatus=api_status, promptVersion="video-grounding-v3", groundingFacts=[],
                        contentTextSha256=SHA, contentTextApprovalStatus=None)
         if api_status == "success" and status in ("approved", "rejected"):
             row.update(contentTextApprovalStatus=status, groundingReview=dict(
@@ -163,9 +163,12 @@ class OfflineAggregatorTest(unittest.TestCase):
     def test_quiz_and_source_grounding_must_belong_to_the_same_experiment(self):
         sources = {"legacy": dict(self.grounding, runId="ground-x"),
                    "v1": dict(self.grounding, runId="ground-x", promptVersion="video-grounding-v1"),
-                   "v2": self.v2_grounding("ground-x", 1)}
-        cases = (("pilot-v1", "legacy", True), ("pilot-v1", "v1", True), ("pilot-v1", "v2", False),
-                 ("pilot-v2", "legacy", False), ("pilot-v2", "v1", False), ("pilot-v2", "v2", True))
+                   "v3": self.v2_grounding("ground-x", 1),
+                   # The paused first Pilot v2 run used video-grounding-v2; it is no longer a Pilot v2 source.
+                   "v2": dict(self.v2_grounding("ground-x", 1), promptVersion="video-grounding-v2")}
+        cases = (("pilot-v1", "legacy", True), ("pilot-v1", "v1", True), ("pilot-v1", "v3", False),
+                 ("pilot-v1", "v2", False), ("pilot-v2", "legacy", False), ("pilot-v2", "v1", False),
+                 ("pilot-v2", "v2", False), ("pilot-v2", "v3", True))
         for quiz_version, source, allowed in cases:
             with self.subTest(quiz=quiz_version, source=source):
                 quizzes = [dict(self.quiz, sourceGroundingRunId="ground-x", promptVersion=quiz_version),

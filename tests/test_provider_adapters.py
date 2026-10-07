@@ -13,7 +13,7 @@ from unittest import mock
 
 from src.pilot_runner import PilotRunner, ProviderFailure
 from src.provider_adapters import (GROUNDING_PROMPTS, LivePolicy, ProviderRouter, grounding_schema,
-                                   urllib_transport)
+                                   urllib_transport, video_timestamp_seconds)
 
 
 CONTENT = "NASA measures global rain and snow every 30 minutes."
@@ -27,6 +27,10 @@ GROUNDING_V1 = "video-grounding-v1"
 GROUNDING = {"contentText": CONTENT, "facts": [{
     "fact": "NASA measures rainfall", "evidenceType": "speech", "evidence": "global rain and snow",
     "timestampStartSeconds": 61, "timestampEndSeconds": 73}]}
+# video-grounding-v3 (configs/pilot-v2.yaml) takes "MM:SS" string timestamps.
+GROUNDING_V3 = {"contentText": CONTENT, "facts": [{
+    "fact": "NASA measures rainfall", "evidenceType": "speech", "evidence": "global rain and snow",
+    "timestampStart": "01:01", "timestampEnd": "01:13"}]}
 
 
 def approve_test_source(runner, content=CONTENT):
@@ -528,8 +532,56 @@ class ProviderAdapterTest(unittest.TestCase):
         self.assertEqual((v2["input"][0], v2["response_format"]), (v1["input"][0], v1["response_format"]))
         self.assertEqual(GROUNDING_PROMPTS["video-grounding-v2"], prompt)
 
+    def test_v1_and_v2_grounding_prompts_and_schema_are_frozen(self):
+        # SHA-256 at main df71ba7, before video-grounding-v3; historical Grounding requests keep their text.
+        sha = lambda text: hashlib.sha256(text.encode("utf-8")).hexdigest()
+        self.assertEqual(sha(GROUNDING_PROMPTS["video-grounding-v1"]),
+                         "717c36f5762f20824728e6ce41a276a2c53faa68a41d10fb0a019f21bc9a5fab")
+        self.assertEqual(sha(GROUNDING_PROMPTS["video-grounding-v2"]),
+                         "b9e8c1d3e175879743802a3289a6f0b54df1c3771021905d1b70191173acd543")
+        for version in (None, GROUNDING_V1, "video-grounding-v2"):
+            with self.subTest(version=version):
+                self.assertEqual(sha(json.dumps(grounding_schema(version), ensure_ascii=False, sort_keys=True)),
+                                 "bacaab94a50239ef13a4d8c5e53605cec75328c3a4d9d6be84419c6f4843ec5b")
+                self.assertEqual(self.grounding_request(version or GROUNDING_V1)["response_format"]["schema"],
+                                 grounding_schema())
+
+    def test_v3_grounding_requests_mmss_string_timestamps(self):
+        v2, v3 = self.grounding_request("video-grounding-v2"), self.grounding_request("video-grounding-v3")
+        prompt = v3["input"][1]["text"]
+        self.assertEqual(prompt, GROUNDING_PROMPTS["video-grounding-v3"])
+        for text in ('"MM:SS"', '"MM:SS.s"', '"01:41.2"', '"03:04.5"', "00~59", "계산하지 마세요", "null"):
+            self.assertIn(text, prompt)
+        self.assertNotIn("timestampStartSeconds", prompt)  # the Provider never writes seconds
+        self.assertTrue(prompt.endswith(GROUNDING_PROMPTS["video-grounding-v2"][len(GROUNDING_PROMPTS["video-grounding-v1"]):]))
+        fact = v3["response_format"]["schema"]["properties"]["facts"]["items"]
+        self.assertEqual(fact["required"], ["fact", "evidenceType", "evidence", "timestampStart", "timestampEnd"])
+        self.assertEqual(set(fact["properties"]), {"fact", "evidenceType", "evidence", "timestampStart", "timestampEnd"})
+        for key in ("timestampStart", "timestampEnd"):
+            self.assertEqual(fact["properties"][key]["type"], ["string", "null"])
+            self.assertNotIn("pattern", fact["properties"][key])  # not in Gemini's documented schema subset
+            for text in ('"MM:SS"', '"01:41.2"', "00~59", "null"):
+                self.assertIn(text, fact["properties"][key]["description"])
+        self.assertEqual(v3["input"][0], v2["input"][0])
+
+    def test_video_timestamp_conversion_is_deterministic(self):
+        for text, seconds in (("00:57.2", 57.2), ("01:41.2", 101.2), ("02:26.7", 146.7), ("03:04.5", 184.5),
+                              ("00:00", 0.0), ("01:00", 60.0), ("1:41.2", 101.2), ("59:59.999", 3599.999),
+                              ("01:53.25", 113.25), ("100:00", 6000.0)):
+            with self.subTest(text=text):
+                self.assertEqual(video_timestamp_seconds(text), seconds)
+                self.assertEqual(json.dumps(video_timestamp_seconds(text)), json.dumps(seconds))
+        self.assertIsNone(video_timestamp_seconds(None))  # an unlocatable position stays null
+
+    def test_malformed_video_timestamps_are_rejected(self):
+        for value in ("01:75.0", "01:60", "-01:41.2", "01:-41.2", "+01:41.2", "abc", "01:4a.2", "141.2", "0141.2",
+                      "01:41:20", "01:41.", "01:41.2345", ":41.2", "01:", "", " 01:41.2", "01:41.2\n",
+                      "０１:４１.２", "1000:00", 141.2, 101, True, [], {}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                video_timestamp_seconds(value)
+
     def test_unknown_or_missing_grounding_prompt_version_is_rejected_before_http(self):
-        for arguments in ({}, {"promptVersion": None}, {"promptVersion": "video-grounding-v3"},
+        for arguments in ({}, {"promptVersion": None}, {"promptVersion": "video-grounding-v9"},
                           {"promptVersion": "pilot-v2"}, {"promptVersion": [GROUNDING_V1]}):
             transport = FakeTransport(gemini_response(GROUNDING))
             with self.subTest(arguments=arguments), self.assertRaises(ProviderFailure) as failure:
@@ -539,13 +591,14 @@ class ProviderAdapterTest(unittest.TestCase):
 
     def test_runner_sends_the_configured_grounding_prompt_version(self):
         root = Path(__file__).resolve().parents[1]
-        for config, version in (("pilot.yaml", GROUNDING_V1), ("pilot-v2.yaml", "video-grounding-v2")):
+        for config, version, payload in (("pilot.yaml", GROUNDING_V1, GROUNDING),
+                                         ("pilot-v2.yaml", "video-grounding-v3", GROUNDING_V3)):
             with self.subTest(config=config), tempfile.TemporaryDirectory() as folder:
                 runner = self.temporary_runner(folder)
                 if config != "pilot.yaml":
                     shutil.copyfile(root / "configs" / config, runner.repository / "configs" / config)
                     runner = PilotRunner(runner.repository, runner.results, runner.repository / "configs" / config)
-                transport = FakeTransport(gemini_response(GROUNDING))
+                transport = FakeTransport(gemini_response(payload))
                 row = runner.run_grounding(VIDEO["videoId"], "gemini_video", 1, self.router(transport))
                 self.assertEqual((row["apiStatus"], row["promptVersion"]), ("success", version))
                 self.assertEqual(transport.calls[0][2]["input"][1]["text"], GROUNDING_PROMPTS[version])

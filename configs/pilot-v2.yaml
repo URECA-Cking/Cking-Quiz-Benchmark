@@ -15,7 +15,9 @@ pilot:
     # 이 값 도입 전 Grounding 결과의 promptVersion은 null이다. authorized_transcript에는 적용하지 않는다.
     # video-grounding-v2 adds the contentText contract and requires the human Grounding
     # checklist (PilotRunner.review_grounding) before its contentText can feed A/B Quiz.
-    prompt_version: video-grounding-v2
+    # video-grounding-v3 keeps that and asks for "MM:SS" string timestamps that the runner converts
+    # to elapsed seconds. The paused first Pilot v2 run (results/pilot-v2) used video-grounding-v2.
+    prompt_version: video-grounding-v3
     methods:
       - id: gemini_video
         model: gemini-3.8-flash
