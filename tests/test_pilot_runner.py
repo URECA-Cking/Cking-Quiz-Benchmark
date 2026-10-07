@@ -857,7 +857,7 @@ class PilotRunnerTest(unittest.TestCase):
         hashes = ["a" * 64, "b" * 64]
         with mock.patch("src.pilot_runner.os.link", side_effect=synchronized_link):
             with ThreadPoolExecutor(max_workers=2) as pool:
-                futures = [pool.submit(self.runner._require_fixed_content, VIDEO, item) for item in hashes]
+                futures = [pool.submit(self.runner._require_fixed_content, VIDEO, 1, item) for item in hashes]
                 outcomes = []
                 for future in futures:
                     try:
@@ -879,7 +879,7 @@ class PilotRunnerTest(unittest.TestCase):
             return original_link(source, target)
         with mock.patch("src.pilot_runner.os.link", side_effect=synchronized_link):
             with ThreadPoolExecutor(max_workers=2) as pool:
-                futures = [pool.submit(self.runner._require_fixed_content, VIDEO, "a" * 64)
+                futures = [pool.submit(self.runner._require_fixed_content, VIDEO, 1, "a" * 64)
                            for _ in range(2)]
                 for future in futures:
                     future.result()
@@ -1089,10 +1089,10 @@ class PilotV2QuizControlsTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def approved(self, runner=None):
+    def approved(self, runner=None, repetition=1, content=CONTENT):
         runner = runner or self.v2
-        source = runner.run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(
-            {"grounding": {"normalized": GROUNDING, "responseBody": FIXTURE_RAW}}))
+        source = runner.run_grounding(VIDEO, "gemini_video", repetition, SimulatedApiFixture(
+            {"grounding": {"normalized": dict(GROUNDING, contentText=content), "responseBody": FIXTURE_RAW}}))
         if runner is self.v2:
             runner.review_grounding(source["runId"], APPROVER, ALL_PASS)
         else:
@@ -1119,9 +1119,9 @@ class PilotV2QuizControlsTest(unittest.TestCase):
         self.assertTrue(all("facts" not in call and "groundingFacts" not in call for call in calls))
 
     def test_v2_question_count_and_parse_failures_are_terminal_without_mutation(self):
-        source = self.approved()
         for repetition, output in ((1, dict(QUIZ, promptVersion="pilot-v2", questions=QUIZ["questions"][:2])),
                                    (2, "{incomplete")):
+            source = self.approved(repetition=repetition)
             provider = self.provider("quiz", output)
             row = self.v2.run_quiz(VIDEO, "gemini-3.8-flash", repetition, CONTENT, provider, source_grounding_run_id=source)
             self.assertEqual(row["apiStatus"], "success")
@@ -1213,6 +1213,119 @@ class PilotV2QuizControlsTest(unittest.TestCase):
                 self.v2.run_end_to_end(VIDEO, "gemini_direct_quiz", 1, provider)
             self.assertEqual(provider.calls, [])
             self.assertEqual(self.snapshot(), before)
+
+    # ----- fixed contentText per repetition (Pilot v2) -------------------------------------------
+
+    def manifests(self):
+        root = self.repository / "data" / "restricted" / "fixed-content"
+        return {path.name: path.read_bytes() for path in root.glob("*.json")} if root.exists() else {}
+
+    def run_ab(self, repetition, content, source):
+        rows = []
+        for model in ("gemini-3.8-flash", "gpt-5.4-mini"):
+            provider = self.provider("quiz", dict(QUIZ, promptVersion="pilot-v2"))
+            rows.append(self.v2.run_quiz(VIDEO, model, repetition, content, provider, source_grounding_run_id=source))
+            self.assertEqual(provider.calls[0]["contentText"], content)
+        return rows
+
+    def test_v2_each_repetition_fixes_its_own_approved_content(self):
+        other = CONTENT + " Rainfall data reach scientists within hours."
+        first = self.approved(repetition=1, content=CONTENT)
+        for row in self.run_ab(1, CONTENT, first):
+            self.assertEqual((row["apiStatus"], row["repetition"], row["sourceGroundingRunId"]), ("success", 1, first))
+        second = self.approved(repetition=2, content=other)
+        for row in self.run_ab(2, other, second):
+            self.assertEqual((row["apiStatus"], row["repetition"], row["sourceGroundingRunId"]), ("success", 2, second))
+            self.assertEqual(row["contentTextSha256"], hashlib.sha256(other.encode()).hexdigest())
+        records = sorted((json.loads(data) for data in self.manifests().values()), key=lambda item: item["repetition"])
+        self.assertEqual(records, [
+            {"videoId": VIDEO, "promptVersion": "pilot-v2", "repetition": repetition,
+             "contentTextSha256": hashlib.sha256(text.encode()).hexdigest()}
+            for repetition, text in ((1, CONTENT), (2, other))])
+
+    def test_v2_same_repetition_cannot_change_its_fixed_content(self):
+        source = self.approved(repetition=1)
+        self.run_ab(1, CONTENT, source)
+        before = self.snapshot()
+        provider = self.provider("quiz", dict(QUIZ, promptVersion="pilot-v2"))
+        with self.assertRaises(ValueError):
+            self.v2.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT + " changed", provider, source_grounding_run_id=source)
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(self.snapshot(), before)
+        # The manifest itself still refuses another hash for the registered repetition only.
+        changed = hashlib.sha256((CONTENT + " changed").encode()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "fixed contentText"):
+            self.v2._require_fixed_content(VIDEO, 1, changed)
+        self.assertEqual(self.snapshot(), before)
+        self.v2._require_fixed_content(VIDEO, 2, changed)
+        self.assertEqual(len(self.manifests()), 2)
+        for repetition in (True, 1.0):  # equal to 1, but must not register a second repetition 1 entry
+            with self.assertRaisesRegex(ValueError, "integer repetition"):
+                self.v2._require_fixed_content(VIDEO, repetition, changed)
+        self.assertEqual(len(self.manifests()), 2)
+
+    def test_v2_quiz_from_another_repetitions_grounding_is_refused_before_provider(self):
+        other = CONTENT + " Rainfall data reach scientists within hours."
+        first = self.approved(repetition=1, content=CONTENT)
+        second = self.approved(repetition=2, content=other)
+        for prepared in (False, True):  # before and after repetition 1 registered its fixed content
+            if prepared:
+                self.run_ab(1, CONTENT, first)
+            for repetition, content, source in ((2, CONTENT, first), (1, other, second)):
+                with self.subTest(prepared=prepared, repetition=repetition):
+                    before = self.snapshot()
+                    provider = self.provider("quiz", dict(QUIZ, promptVersion="pilot-v2"))
+                    with self.assertRaisesRegex(ValueError, "same repetition"):
+                        self.v2.run_quiz(VIDEO, "gemini-3.8-flash", repetition, content, provider,
+                                         source_grounding_run_id=source)
+                    self.assertEqual(provider.calls, [])
+                    self.assertEqual(self.snapshot(), before)  # no Quiz row, raw/evaluation or manifest
+        quiz_rows = [json.loads(line) for line in
+                     (self.results / "quiz-generation.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual({row["repetition"] for row in quiz_rows}, {1})
+        # Repetition 2 still runs from its own Grounding afterwards.
+        self.assertTrue(all(row["apiStatus"] == "success" for row in self.run_ab(2, other, second)))
+
+    def test_v1_manifest_key_record_and_cross_repetition_use_are_unchanged(self):
+        source = self.approved(self.v1)
+        for repetition in (1, 2):  # Pilot v1 keeps one fixed input per video, shared by its repetitions.
+            row = self.v1.run_quiz(VIDEO, "gemini-3.8-flash", repetition, CONTENT,
+                                   self.provider("quiz", QUIZ), source_grounding_run_id=source)
+            self.assertEqual((row["apiStatus"], row["repetition"]), ("success", repetition))
+        key = hashlib.sha256((VIDEO + "\0pilot-v1").encode("utf-8")).hexdigest()
+        expected = ('{"videoId": "%s", "promptVersion": "pilot-v1", "contentTextSha256": "%s"}'
+                    % (VIDEO, hashlib.sha256(CONTENT.encode()).hexdigest())).encode("utf-8")
+        self.assertEqual(self.manifests(), {key + ".json": expected})
+        with self.assertRaisesRegex(ValueError, "fixed contentText"):
+            self.v1._require_fixed_content(VIDEO, 2, hashlib.sha256(b"other").hexdigest())
+        self.assertEqual(self.manifests(), {key + ".json": expected})
+
+    def test_v2_concurrent_manifest_publication_is_per_repetition(self):
+        original_link = os.link
+        barrier = Barrier(4)
+        def synchronized_link(source, target):
+            barrier.wait(timeout=5)
+            return original_link(source, target)
+        calls = [(1, "a" * 64), (1, "b" * 64), (2, "c" * 64), (2, "c" * 64)]
+        with mock.patch("src.pilot_runner.os.link", side_effect=synchronized_link):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(self.v2._require_fixed_content, VIDEO, repetition, item)
+                           for repetition, item in calls]
+                outcomes = []
+                for future in futures:
+                    try:
+                        future.result()
+                        outcomes.append("accepted")
+                    except ValueError:
+                        outcomes.append("mismatch")
+        self.assertEqual(sorted(outcomes[:2]), ["accepted", "mismatch"])  # repetition 1: first writer wins
+        self.assertEqual(outcomes[2:], ["accepted", "accepted"])  # repetition 2: same content, independent
+        records = {json.loads(data)["repetition"]: json.loads(data)["contentTextSha256"]
+                   for data in self.manifests().values()}
+        self.assertEqual(set(records), {1, 2})
+        self.assertIn(records[1], ("a" * 64, "b" * 64))
+        self.assertEqual(records[2], "c" * 64)
+        self.assertEqual(list((self.repository / "data" / "restricted" / "fixed-content").glob("*.tmp")), [])
 
 
 class PilotV2GroundingReviewTest(unittest.TestCase):

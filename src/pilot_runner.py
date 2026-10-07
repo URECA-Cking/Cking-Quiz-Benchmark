@@ -429,7 +429,7 @@ class PilotRunner:
                 except ProviderFailure:
                     pass
 
-    def _require_fixed_content(self, video_id, content_hash):
+    def _require_fixed_content(self, video_id, repetition, content_hash):
         root = self.repository / "data" / "restricted" / "fixed-content"
         if root.parent.exists() and root.parent.resolve() != root.parent:
             raise ValueError("Fixed content directory must not be a link")
@@ -437,11 +437,20 @@ class PilotRunner:
         if root.resolve() != root:
             raise ValueError("Fixed content manifest directory must not be a link")
         prompt_version = self.config["prompt_version"]
-        key = hashlib.sha256((video_id + "\0" + prompt_version).encode("utf-8")).hexdigest()
+        identity = video_id + "\0" + prompt_version
+        record = {"videoId": video_id, "promptVersion": prompt_version, "contentTextSha256": content_hash}
+        # Pilot v2 repetitions each start from their own approved Grounding, so the fixed input is
+        # one per repetition there; Pilot v1 keeps its one-per-video key and record unchanged.
+        if prompt_version == "pilot-v2":
+            if type(repetition) is not int:  # True or 1.0 would pass the range check but key another entry
+                raise ValueError("Pilot v2 fixed content requires an integer repetition")
+            identity += "\0" + str(repetition)
+            record = {"videoId": video_id, "promptVersion": prompt_version, "repetition": repetition,
+                      "contentTextSha256": content_hash}
+        key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         manifest = root / (key + ".json")
         if manifest.resolve() != manifest:
             raise ValueError("Fixed content manifest must not be a link")
-        record = {"videoId": video_id, "promptVersion": prompt_version, "contentTextSha256": content_hash}
         temp_path = None
         try:
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=root,
@@ -460,7 +469,7 @@ class PilotRunner:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
 
-    def _require_approved_content(self, video_id, content_text, source_grounding_run_id):
+    def _require_approved_content(self, video_id, repetition, content_text, source_grounding_run_id):
         if (not isinstance(source_grounding_run_id, str)
                 or len(source_grounding_run_id) != 32
                 or any(char not in "0123456789abcdef" for char in source_grounding_run_id)):
@@ -490,6 +499,10 @@ class PilotRunner:
         # video-grounding-v2 sources; the fixed-content manifest is not relied on for this.
         if not grounding_version_matches_quiz_version(self.config["prompt_version"], source.get("promptVersion")):
             raise ValueError("The source Grounding prompt version does not belong to this Pilot experiment")
+        # Pilot v2 Quiz must use its own repetition's Grounding; offline aggregation, Judge and
+        # Human evaluation reject a cross-repetition pair, so it is refused before any Provider call.
+        if self.config["prompt_version"] == "pilot-v2" and source.get("repetition") != repetition:
+            raise ValueError("Pilot v2 Quiz must use the approved Grounding of the same repetition")
         require_valid_approval_tracking(source)
         # A Grounding version that needs the human checklist is usable only when every item passed.
         require_valid_grounding_review(source)
@@ -789,10 +802,10 @@ class PilotRunner:
         if model not in models or not isinstance(content_text, str) or not content_text.strip():
             raise ValueError("Configured quiz model and nonempty fixed contentText are required")
         content_hash = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
-        self._require_approved_content(video_id, content_text, source_grounding_run_id)
+        self._require_approved_content(video_id, repetition, content_text, source_grounding_run_id)
         self._require_open_quiz_condition("quiz_generation", video_id, "fixed_content_text", model,
                                           repetition, content_hash)
-        self._require_fixed_content(video_id, content_hash)
+        self._require_fixed_content(video_id, repetition, content_hash)
         row = self._base("quiz_generation", video_id, "fixed_content_text", model, repetition,
                          content_hash)
         row.update(contentTextSha256=content_hash,
