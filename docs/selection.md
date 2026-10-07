@@ -1,6 +1,6 @@
 # 방식·모델 선택 기록
 
-이 문서는 Cking AI Quiz Pilot에서 영상 분석 방법을 정한 근거, Pilot v1 실행 기록, 현재 Pilot v2의 실행 프로토콜과 결과 해석 기준을 기록합니다. Pilot v1(2~3장)과 Pilot v2(6~7장)는 별개의 실험입니다. 근거의 성격은 다음 표기로 구분합니다.
+이 문서는 Cking AI Quiz Pilot에서 영상 분석 방법을 정한 근거, Pilot v1 실행 기록, 현재 Pilot v2의 실행 프로토콜과 결과 해석 기준, Pilot v2-r2 결과와 그에 따른 Quiz 생성 방식 결정을 기록합니다. Pilot v1(2~3장)과 Pilot v2(6~8장)는 별개의 실험입니다. 근거의 성격은 다음 표기로 구분합니다.
 
 - **USER DECISION**: 사람이 정한 요구사항이나 결정입니다. 저장소 코드로 증명된 사실이 아닙니다.
 - **CONFIRMED BY OFFICIAL DOCS**: 2026-10-02에 각 Provider 공식 문서에서 확인한 사실입니다. 문서는 이후 바뀔 수 있습니다.
@@ -218,7 +218,7 @@ Transcript condition was not executed in this Pilot. 권한 있는 transcript를
 
 ## 4. 선택 근거 기록 원칙
 
-결과를 선택 근거로 사용할 때 Video Grounding, 고정 입력 Quiz Generation, End-to-End 결과를 구분해 기록합니다. 각 선택에는 사용 데이터와 권리 확인, 실행 날짜, 모델 ID, 프롬프트 버전, 가격 출처, 자동 지표, 실제 영상과 승인된 ground truth를 대조한 사람 검수 근거, 제한사항 및 Cking-BE 적용 결정을 남깁니다. 직접 Quiz의 `beCompatibility`는 `not_applicable`입니다. 다른 영상의 Pilot과 최종 Quiz 방식·모델 선정은 아직 완료되지 않았습니다.
+결과를 선택 근거로 사용할 때 Video Grounding, 고정 입력 Quiz Generation, End-to-End 결과를 구분해 기록합니다. 각 선택에는 사용 데이터와 권리 확인, 실행 날짜, 모델 ID, 프롬프트 버전, 가격 출처, 자동 지표, 실제 영상과 승인된 ground truth를 대조한 사람 검수 근거, 제한사항 및 Cking-BE 적용 결정을 남깁니다. 직접 Quiz의 `beCompatibility`는 `not_applicable`입니다. Pilot v2-r2 결과와 최종 Quiz 생성 방식 선정은 8장에 기록합니다.
 
 ## 5. 결과 해석 caveat와 후속 과제
 
@@ -259,7 +259,7 @@ Pilot v1 결과 해석 시 함께 기록할 caveat:
 - 사람이 원본 영상과 비교한 결과, facts timestamp가 경과 초가 아니라 MM:SS의 콜론만 뺀 숫자였습니다(예: 01:41.2 → 141.2, 02:26.7 → 226.7, 03:04.5 → 304.5). prompt의 경과 초 지시를 Provider가 지키지 않았고, 숫자 하나만으로는 이 오류를 판별할 수 없으며, 당시 이 영상에는 `durationSeconds`가 없어 길이 검사도 적용되지 않았습니다(Issue #31).
 - Pilot v2는 이 시점에 중단했습니다. 이 Grounding은 검수하지 않았고, 이후 Quiz A/B와 Direct C, 다른 영상은 실행하지 않았습니다.
 - `results/pilot-v2`는 실제 Provider 출력이자 이 문제의 근거로 그대로 보존합니다. 수정·삭제·이동하거나 timestamp를 사후 보정하지 않습니다. 이 결과는 Pilot v2 집계·평가에 포함하지 않으며, 수정 후 Pilot v2 Quiz는 `video-grounding-v2` Grounding을 원천으로 받지 않습니다.
-- 수정 후 Pilot v2는 Grounding `video-grounding-v3`로 `results/pilot-v2-r2`에서 첫 영상·repetition부터 다시 시작합니다. `video-grounding-v3`는 Provider에게 timestamp를 `"MM:SS"` 문자열로 받고 실행기가 경과 초로 변환해 저장합니다. 길이 검사를 위해 NASA 세 편에도 `durationSeconds`를 기록했지만, 이는 영상 길이를 넘는 값만 잡는 추가 방어입니다. 재시작은 아직 실행하지 않았습니다.
+- 수정 후 Pilot v2는 Grounding `video-grounding-v3`로 `results/pilot-v2-r2`에서 첫 영상·repetition부터 다시 시작합니다. `video-grounding-v3`는 Provider에게 timestamp를 `"MM:SS"` 문자열로 받고 실행기가 경과 초로 변환해 저장합니다. 길이 검사를 위해 NASA 세 편에도 `durationSeconds`를 기록했지만, 이는 영상 길이를 넘는 값만 잡는 추가 방어입니다. 재시작 실행 결과는 8장에 기록합니다.
 
 ### 조건과 모델
 
@@ -422,7 +422,7 @@ blind evaluation 절차:
 
 ## 7. Pilot v2 결과 해석 기준
 
-Pilot v2는 아직 실행하지 않았습니다. 이 장은 결과를 해석할 기준만 정하며, 실제 집계 결과는 실행을 마친 뒤 별도로 기록합니다.
+이 장은 Pilot v2 결과를 해석할 기준입니다. 실제 Pilot v2-r2 집계 결과와 이 기준에 따른 결정은 8장에 기록합니다.
 
 - **표본 크기**: 영상 4개 × repetition 2입니다. 이 결과만으로 모델 전체의 성능을 일반화하지 않습니다.
 - **Quiz A와 B**: 같은 repetition 안에서 같은 승인 `contentText`를 쓰므로 생성 모델 비교에 가장 가깝습니다. 다만 두 Provider의 `medium`은 같은 추론량을 뜻하지 않고, 구조화 출력 schema 적용 방식도 Provider마다 다릅니다. A/B 차이는 모델과 Provider별 설정을 합친 차이로 해석합니다.
@@ -432,6 +432,97 @@ Pilot v2는 아직 실행하지 않았습니다. 이 장은 결과를 해석할 
 - **sourceEvidence와 blind 평가**: blind export는 조건·모델·runId·`contentText`·repetition을 숨기지만, 문항의 `sourceEvidence`는 `evidenceSupportsAnswer` 판정에 필요해 그대로 보여줍니다. Quiz A/B의 `sourceEvidence`는 한국어 `contentText`를 인용하고 Direct C는 영상 내용을 직접 인용하므로, 문체로 A/B와 C가 구별될 수 있습니다. 평가자는 `contentText`를 보지 않으므로 근거 판정은 영상을 기준으로 합니다. 이 한계를 결과와 함께 기록합니다.
 - **Judge**: 보조 평가이며 Human Evaluation이 기준입니다. Judge는 Pilot v2의 `evaluation.json`을 읽지 않으므로, Judge와 Pilot v2 Human 판정의 비교는 자동으로 계산되지 않습니다.
 - **Pilot v1과의 비교**: prompt 버전, 생성 설정, 사람 평가 절차가 다르므로 Pilot v1 결과와 같은 조건의 결과로 합치지 않습니다.
+
+## 8. Pilot v2-r2 결과와 Quiz 생성 방식 결정
+
+### 실행 범위 (OBSERVED IN PILOT)
+
+- 결과 디렉터리 `results/pilot-v2-r2`, 설정 `configs/pilot-v2.yaml`, 실행일 2026-10-07(UTC). 기준 commit은 Issue #31 수정이 반영된 `617d6ebd6c0c6864056fce5fa0ed56ca2764aa30`(PR #32)입니다. water·methane 실행 직전 HEAD가 이 commit임을 확인했습니다. mars·kari의 실제 실행 commit은 현재 저장된 저장소 근거만으로는 확인할 수 없습니다. 결과 행에는 실행 commit이 저장되지 않으며, 현재 HEAD나 결과 파일 시각으로 추정하지 않습니다.
+- 영상 4개 × repetition 2 × 조건 A/B/C = Quiz set 24개, 문항 72개. Grounding 8건과 Quiz·Direct 24건, 모두 32건의 실행이 각각 attempt 1에서 `apiStatus=success`로 끝났습니다. 저장된 추정 비용 합계는 $0.3301입니다.
+- Grounding 8건은 모두 `video-grounding-v3`이며, 사람이 원본 영상과 대조해 5개 검수 항목을 모두 `pass`로 기록했습니다(`approved`).
+- Human blind evaluation은 세션 1개로 24개 set·72문항을 모두 평가했습니다(`notEligible` 없음).
+- 두 번째 72문항 실행은 하지 않습니다(USER DECISION). 이 프로토콜이 정한 표본을 모두 채웠습니다.
+
+### 비교한 조건
+
+| 조건 | 흐름 | 모델·방식 | 생성 설정 |
+| --- | --- | --- | --- |
+| A | Gemini Grounding → 사람 검수·승인 → 고정 `contentText` → Quiz | `gemini-3.8-flash`, `fixed_content_text`, `pilot-v2` | `thinking_level: medium` |
+| B | A와 같은 repetition의 같은 승인 `contentText` → Quiz | `gpt-5.4-mini`, `fixed_content_text`, `pilot-v2` | `reasoning_effort: medium` |
+| C | YouTube 영상 → 영상 이해와 Quiz 생성을 한 번에 | `gemini-3.8-flash`, `gemini_direct_quiz`, `pilot-v2` | `thinking_level: medium` |
+
+A/B의 Grounding은 `gemini-3.8-flash`, `gemini_video`, `video-grounding-v3`(thinking 설정 없음)이며 repetition마다 하나를 A와 B가 공유합니다. C에는 별도의 Grounding 단계가 없습니다.
+
+### 결과 (OBSERVED IN PILOT)
+
+Human blind evaluation(조건별 8 set·24문항, set 단위 3항목과 문항 단위 6항목):
+
+| 조건 | set | 문항 | 판정 |
+| --- | --- | --- | --- |
+| A | 8 | 24 | 168개 모두 `pass` |
+| B | 8 | 24 | 168개 모두 `pass` |
+| C | 8 | 24 | 168개 모두 `pass` |
+
+이번 Pilot 표본에서 Human 평가 기준으로 조건 간 차이는 관측되지 않았습니다. 세 방식의 일반적인 품질이 같다는 증명은 아닙니다(7장 "표본 크기").
+
+자동 신뢰성 지표:
+
+| 지표 | A | B | C |
+| --- | --- | --- | --- |
+| API 성공 | 8/8 | 8/8 | 8/8 |
+| parsing | 8/8 | 8/8 | 8/8 |
+| 3문항 | 8/8 | 8/8 | 8/8 |
+| validator | 8/8 `pass` | 7/8 `pass`, 1/8 `fail` | 8/8 `not_run` (해당 없음) |
+| `beCompatibility` | 8/8 `pass` | 7/8 `pass`, 1/8 `fail` | 8/8 `not_applicable` |
+
+- B의 1건(methane repetition 1, runId `49966005f167411394bc5d91a399059d`, `evidence_not_in_content`): 세 `sourceEvidence`가 모두 ASCII 큰따옴표로 감싸여 있어 정확한 부분 문자열 계약을 통과하지 못했습니다. 따옴표 안의 문장은 승인 `contentText`와 정확히 일치하며, 이 set은 Human 평가에서 `pass`였습니다. 의미상 Human 품질 실패가 아니라 현재 evidence 직렬화·정확 부분 문자열 계약과의 불일치 1건입니다. v2 규칙에 따라 다시 생성하지 않았습니다.
+- C에는 고정 `contentText`가 없어 A/B의 evidence validator를 적용하지 않습니다. C의 `validatorStatus=not_run`과 `beCompatibility=not_applicable`은 통과도 실패도 아닙니다. C는 parsing과 공통 구조 검사를 모두 통과했습니다.
+
+### 비용과 지연 해석
+
+비용은 실행기가 실제 사용량과 실행 직전 확인한 공식 단가로 계산한 추정치(`estimatedCostUsd`)이며 실제 청구액이 아닙니다. 지연은 Provider 응답 시간이며, 사람의 Grounding 검수 시간은 포함하지 않습니다.
+
+| 지표 (조건별 평균) | A | B | C |
+| --- | --- | --- | --- |
+| Quiz 단계만 비용 | $0.00456 | $0.00414 | $0.01670 (영상 처리 포함) |
+| Grounding 포함 단순 순차 비용 | $0.02042 | $0.02001 | $0.01670 |
+| Quiz 단계만 지연 | 9.95초 | 6.26초 | 20.79초 (영상 처리 포함) |
+| Grounding 포함 단순 순차 지연 | 26.82초 | 23.12초 | 20.79초 |
+
+- Grounding 평균 비용은 $0.01587, 평균 지연은 16.87초입니다. A/B의 Quiz 단계 수치에는 이 Grounding이 포함되지 않습니다.
+- 따라서 Quiz 단계 수치만으로 "C가 비싸다·느리다"고 비교하지 않습니다. "영상 하나 → Quiz set 하나" 흐름에서 Grounding까지 더하면 C가 비용·지연 면에서 불리하다는 결과는 나오지 않았습니다.
+- Grounding 하나를 여러 Quiz 생성에 재사용하는 구조라면 A/B의 분할 비용·지연은 달라집니다. 조건별 8건의 평균이며, 영상과 시점에 따라 달라질 수 있습니다.
+
+### Quiz 생성 방식 결정: C — Gemini Direct (USER DECISION)
+
+Production Quiz 생성의 기본 방향으로 C(YouTube 영상 → `gemini-3.8-flash` `gemini_direct_quiz` → Quiz)를 선택합니다. 근거:
+
+1. **Human 품질**: 이번 Pilot에서 A/B/C 모두 Human 평가 전 항목이 `pass`였고, C에서 A/B보다 낮은 품질은 관측되지 않았습니다.
+2. **서비스 흐름 일치**: 서비스 흐름은 Creator가 YouTube 링크 입력 → Quiz 생성 → 생성된 Quiz 확인 → Creator 승인 → 게시입니다. C는 이 한 번의 생성 흐름과 가장 직접적으로 일치합니다.
+3. **pipeline 단순성**: A/B는 영상 → Grounding → 고정 `contentText` → Quiz의 중간 단계가 필요하고, C는 영상 → Quiz입니다.
+4. **E2E 비용**: C의 비용에는 영상 처리가 포함되어 A/B의 Quiz 단계 비용과 직접 비교할 수 없으며, Grounding까지 포함한 단순 비교에서 C가 불리하지 않았습니다.
+5. **E2E 지연**: Grounding 지연까지 고려하면 한 번의 생성 흐름에서 C는 경쟁력이 있습니다.
+6. **최종 승인 위치**: Creator가 생성된 Quiz를 확인하고 승인하므로, 중간 Grounding에 대한 사람 승인을 추가하기보다 최종 Quiz의 품질 검증과 Creator 승인에 집중합니다.
+
+이 결정은 다음을 주장하지 않습니다: C의 Quiz 품질이 A/B보다 좋다는 것(이번 Human 결과는 동률), C가 항상 더 싸거나 빠르다는 것, C가 모든 영상에서 더 우수하다는 것. Human 품질이 이번 Pilot에서 동등하게 관측된 상황에서 서비스 흐름, pipeline 단순성, E2E 비용·지연 구조를 함께 고려한 선택입니다.
+
+### Pilot 프로토콜과 production의 구분
+
+Pilot의 Grounding 생성 → 사람 Grounding 검수 → 승인 → 고정 `contentText` → Quiz 절차는 A/B/C를 공정하고 검증 가능하게 비교하기 위한 Pilot 프로토콜의 일부입니다. production의 필수 사람 절차가 아니며, production에서 Creator가 중간 Grounding을 검토·승인하는 UX는 현재 목표가 아닙니다.
+
+Production 목표 흐름:
+
+```
+YouTube 링크 → Gemini Direct Quiz 생성 → GPT 계열 LLM Judge → Creator 확인·승인 → 게시
+```
+
+### Judge 방향 (USER DECISION)
+
+- Quiz 생성기는 Gemini 계열(현재 선택: `gemini-3.8-flash`, `gemini_direct_quiz`), Quiz 검증용 LLM Judge는 GPT 계열을 사용합니다.
+- 이는 architecture 결정입니다. 생성기와 Judge를 서로 다른 model·provider 계열로 분리해, 생성 모델이 자기 출력을 다시 평가하는 구조를 피하기 위한 것입니다. GPT가 Gemini보다 Judge 성능이 좋다는 Pilot 결과나 Judge 모델 비교 실험에 근거한 결론이 아닙니다.
+- 결정됨: Judge 계열 GPT.
+- 후속 결정: 정확한 GPT Judge 모델, Judge prompt version, 판정 기준(threshold)과 pass/fail 정책, retry 정책, reject 후 재생성 정책, Judge 실패 시 fallback, Direct Quiz 입력 계약, production 비용 상한.
+- 현재 저장소의 Judge([Judge 평가 프로토콜](judge-protocol.md))는 A/B를 승인 `contentText` 기준으로 사후 평가하는 보조 도구이며, Direct Quiz(C)는 범위 밖입니다. 따라서 C에 대한 production GPT Judge는 입력 계약을 포함해 별도로 설계해야 하며, 기존 Judge를 그대로 쓸 수 있는지는 후속 조사 대상입니다.
 
 ## 공식 문서 출처 (2026-10-02 확인)
 
