@@ -75,9 +75,31 @@ Production 자동 Grounding은 사람 검수를 거치지 않으므로 Pilot의 
 **Machine validation은 원본 영상 기준의 사실 정확성을 검증하지 않습니다.** 사실 정확성, 핵심 정보 포함, timestamp가 가리키는 실제 위치, `evidenceType`의 실제 일치를 확인하지 않으며, 통과한 `contentText`도 verified ground truth가 아닙니다. 구조적으로 올바르지만 영상과 다른 내용은 통과할 수 있습니다.
 
 - 대상 artifact: Grounding summary 행, `evaluation/<runId>.json`(`contentText`, `facts`), `raw/<runId>.json`(Provider 완료 metadata). validation version `production-grounding-validation-v1`은 `gemini_video` / `gemini-3.8-flash` / `video-grounding-v3` Grounding만 다룹니다(`model`이 없거나 다른 모델이면 거부).
-- 기록: Grounding 행에 필드를 추가하지 않고 별도 객체 `{status: pass|fail|not_run, version, groundingRunId, contentTextSha256, validatedAt, failureReasons}`로 만듭니다. `fail`에만 사유가 있고, `validatedAt`은 실제로 존재하는 canonical UTC 시각이어야 합니다. 이 기록을 어디에 저장할지는 Production Quiz 연결에서 정합니다. 기존 Pilot 결과는 migration하지 않습니다.
+- 기록: Grounding 행에 필드를 추가하지 않고 별도 객체 `{status: pass|fail|not_run, version, groundingRunId, contentTextSha256, validatedAt, failureReasons}`로 만듭니다. `fail`에만 사유가 있고, `validatedAt`은 실제로 존재하는 canonical UTC 시각이어야 합니다. Quiz 생성에 실제로 사용한 기록은 아래 Production Quiz evidence snapshot에 저장합니다. 기존 Pilot 결과는 migration하지 않습니다.
 - production 사용 가능 조건(`require_production_grounding_eligible`, 모두 만족해야 하며 아니면 사유와 함께 거부): 지원하는 validation version의 `pass` 기록이 같은 `runId`와 실제 `contentText` SHA-256을 가리킴, 요청한 `videoId`와 일치, `apiStatus=success`·`errorCategory=null`, raw metadata가 Pilot 저장과 같은 계약(`validate_raw_metadata`)을 만족하는 Gemini 완료 기록(fixture `not_run`과 Provider 미완료 거부), 비어 있지 않고 UTF-8로 표현할 수 있는 `contentText`, `facts` 필드가 배열로 존재(누락을 빈 배열로 보지 않음. `video-grounding-v3` 응답에 `facts`가 없으면 evaluation 파일에도 `facts` key를 쓰지 않음), 각 fact가 저장 계약(5개 key, 비어 있지 않은 문자열, `evidenceType` 허용값, timestamp는 `null` 또는 0 이상·순서·알려진 영상 길이 이내)을 만족, 행의 `groundingFacts`와 일치, 행의 `contentTextSha256`과 일치. 저장된 `pass`만 믿지 않고 artifact를 다시 검사합니다. Human 승인은 이 기록을 대신하지 않습니다.
 - 정하지 않은 정책: facts 최소 개수(빈 배열도 구조상 허용), `null` timestamp 금지 여부, `contentText` 최소 길이, 영상 길이 metadata가 없을 때의 정책(현재 계약처럼 상한 검사를 하지 않음), 의미·사실 검증, retry·재생성, Creator reject 이후 동작.
+
+## Production Quiz 생성과 output gate (Issue #39)
+
+machine eligibility를 통과한 Grounding의 정확한 `contentText`로 Gemini Quiz를 만들고, GPT Pointwise Judge로 보낼 수 있는지(Judge-ready) 판정합니다(`src/production_quiz.py`, `configs/production.yaml`). Pilot과 별도 실행 경로이며 Pilot Human 승인, repetition, fixed-content manifest를 쓰지 않고 Pilot 결과에 쓰지 않습니다. GPT Judge 호출, Creator 승인, 게시, 재생성은 포함하지 않습니다.
+
+| 구분 | 의미 | 의미하지 않는 것 |
+| --- | --- | --- |
+| Grounding machine eligibility | Grounding 구조·식별·hash·저장 무결성 계약 통과 | 영상 사실 승인 |
+| Quiz output gate 통과(Judge-ready) | Quiz 구조와 `sourceEvidence`의 정확한 포함, provenance 무결성 통과 | 정답·설명의 의미적 정확성, 한국어·오답 보기 품질, 의미상 중복, 학습 가치(후속 GPT Judge 영역) |
+| Judge-ready | GPT Pointwise Judge 입력으로 보낼 수 있음 | Creator 최종 승인 |
+
+- 생성 조건: `gemini-3.8-flash`, `thinking_level: medium`, `max_output_tokens: 8192`(Pilot v2 Quiz A와 같은 값), `fixed_content_text`, prompt `production-quiz-v1`(Pilot prompt와 별도 registry이며 Pilot config는 선택할 수 없음), 출력 계약 `production-quiz-output-v1`(정확히 3문항, 각 4보기, 0-based `correctOptionIndex`, 문항 필드는 `question`·`options`·`correctOptionIndex`·`explanation`·`sourceEvidence`만 허용). Provider는 live(`is_actual_api`)여야 하며 fixture 출력은 production 결과가 아닙니다. 요청 내용을 바꾸는 생성 설정(`thinking_level`, `max_output_tokens`)은 Provider가 실제로 보낼 값(`request_settings`)이 config와 정확히 같아야 하며, 다르거나 확인할 수 없으면 Provider 호출과 저장 전에 거부합니다. retry 횟수·비용 상한·timeout 같은 실행 guard는 fingerprint에 넣지 않습니다.
+- 입력: `require_production_grounding_eligible`가 반환한 `contentText`를 그대로 보냅니다. 미적격이면 Provider를 호출하지 않고 아무것도 저장하지 않습니다.
+- 저장(`results/production/`, 모든 파일은 한 번만 만들고 바꾸지 않음):
+  - `sources/<sha256>.json`: evidence snapshot. Grounding 행, evaluation(`contentText`, `facts`), raw metadata, 사용한 machine validation record, `videoId`, `sourceGroundingRunId`, `contentTextSha256`, 영상 길이. 파일 이름이 내용의 SHA-256이며, 원본 Grounding이 바뀌거나 지워져도 이 snapshot으로 근거를 복원합니다.
+  - `operations/<operationId>/operation.json`: 생성 작업 ID, 입력·설정 fingerprint(`videoId`, `sourceGroundingRunId`, `contentTextSha256`, Grounding validation version, model, method, prompt version, 출력 계약 version, 생성 설정(`thinking_level`, `max_output_tokens`)의 canonical JSON SHA-256), snapshot SHA-256.
+  - `operations/<operationId>/attempts/<n>/started.json`(요청 전), `raw.json`(canonical raw metadata), `output.json`(모델 출력 원문, 수정하지 않음), `result.json`(마지막에 기록: API·parse·validator·output gate 상태와 사유, `errorCategory`, latency, token, 추정 비용, raw·output SHA-256).
+- 작업 ID와 재시도: 새 Quiz 생성(재생성 포함)은 새 operation ID입니다. 같은 operation을 다른 입력·설정·evidence snapshot으로 다시 쓰는 것은 거부합니다. Provider 성공(`apiStatus=success`)이 기록된 operation은 output gate 결과와 관계없이 다시 실행하지 않습니다. 같은 operation의 다음 attempt는 이전 attempt가 모두 검증된 기술적 실패일 때만 명시적으로 실행할 수 있습니다. 검증된 기술적 실패란 `started.json`과 `result.json`이 모두 있고, 두 기록의 식별 필드가 `operation.json`에서 다시 도출한 값과 일치하며, `apiStatus`가 정확히 `error`이고 `errorCategory`가 있으며 raw·output 파일이 없는 attempt입니다. `apiStatus`가 없거나 `not_run`·알 수 없는 값, 형식이 깨진 기록, `started.json` 없는 `result.json`, 식별 불일치는 모두 Provider 호출 전에 거부합니다. 자동 재시도·재생성은 없습니다. 서비스 retry 횟수와 비용 상한은 정하지 않았고, live 요청은 기존처럼 호출 수·비용 상한·timeout·HTTP retry 횟수를 실행할 때 명시해야 합니다.
+- 불확실·손상 상태: `started.json`만 있고 `result.json`이 없는 attempt는 요청이 Provider에 도달했을 수 있으므로 `uncertain`이며, 완료나 Judge-ready로 보지 않고 자동으로 다시 실행하지 않습니다. `result.json`만 있거나 기록 사이 식별이 맞지 않으면 `corrupted`입니다. 두 파일이 모두 없는 attempt 디렉터리는 요청 전이므로 attempt로 보지 않습니다. 처리 방법은 사람이 정합니다.
+- output gate: Provider 완료, parse, 허용 필드, promptVersion 일치, 문항 수, 문항 구조(Pilot과 같은 규칙: 비어 있지 않고 중복 없는 질문·보기, 보기 수, 정답 index 범위, 비어 있지 않은 설명·근거), `sourceEvidence`가 `contentText`의 정확한 부분 문자열. `sourceEvidence`를 따옴표 제거·trim·수정하지 않으며 `evidence_not_in_content`는 출력과 실패를 보존한 채 Judge-ready가 되지 않습니다. 다른 구조 실패(`quiz_contract_error`, `parse_error`)도 같습니다.
+- Judge-ready 판정(`require_judge_ready`): 저장된 상태를 믿지 않고 operation fingerprint, 모든 attempt의 `operation.json` → `started.json` → raw·output → `result.json` 연결(각 기록의 operation·attempt·fingerprint·snapshot·Grounding run·`contentTextSha256`·model·prompt version·시작 시각 일치, 허용 필드, 파일 SHA-256, raw metadata 계약), snapshot SHA-256과 그 evidence의 Grounding eligibility, snapshot의 `contentText` 기준 output gate를 다시 확인합니다. 통과하면 `contentText`, 문항(`questionIndex` 포함)과 provenance(operation·fingerprint·Grounding run·`contentTextSha256`·validation version·snapshot·output SHA-256)를 돌려주며 생성 모델 정보는 넣지 않습니다.
+- 정하지 않은 정책: 자동 재생성 횟수, Creator reject 후 재생성, 서비스 retry 횟수, production 비용 상한, `contentText` 최대 크기, Judge 실패·uncertain 처리, 게시 정책, 영상 사실 검증.
 
 ## LLM-as-a-Judge 결과
 

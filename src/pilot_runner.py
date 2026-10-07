@@ -27,6 +27,7 @@ from src.provider_adapters import (GROUNDING_PROMPTS, STRING_TIMESTAMP_GROUNDING
                                    valid_grounding_fact, validate_quiz_config, validate_raw_metadata,
                                    video_timestamp_seconds)
 from src.provider_failure import ProviderFailure
+from src.quiz_contract import parse_quiz_output, quiz_questions_valid
 
 
 class FixtureProvider:
@@ -743,21 +744,7 @@ class PilotRunner:
 
     def _evaluate_quiz(self, row, raw, content_text):
         try:
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("questions"), list):
-                raise ValueError()
-            if "promptVersion" in parsed and parsed["promptVersion"] is not None and not isinstance(parsed["promptVersion"], str):
-                raise ValueError()
-            for question in parsed["questions"]:
-                if not isinstance(question, dict) or any(not isinstance(question.get(key), str)
-                                                        for key in ("question", "explanation", "sourceEvidence")):
-                    raise ValueError()
-                if not isinstance(question.get("options"), list) or any(
-                        not isinstance(option, str) for option in question["options"]):
-                    raise ValueError()
-                index = question.get("correctOptionIndex")
-                if type(index) is not int or not -(2 ** 31) <= index <= 2 ** 31 - 1:
-                    raise ValueError()
+            parsed = parse_quiz_output(raw)
         except (ValueError, TypeError):
             row.update(parseStatus="fail", validatorStatus="not_run", errorCategory="parse_error")
             return
@@ -772,24 +759,10 @@ class PilotRunner:
                 raise ValueError()
             if content_text is not None and len(content_text) > 50000:
                 raise ValueError()
-            contained = True
-            seen_questions = set()
-            for question in questions:
-                options = question.get("options")
-                index = question.get("correctOptionIndex")
-                normalized_question = question["question"].strip().lower()
-                normalized_options = [option.strip().lower() for option in options]
-                if (not normalized_question or normalized_question in seen_questions
-                        or len(options) != self.config["options_per_question"]
-                        or any(not option for option in normalized_options)
-                        or len(set(normalized_options)) != len(options)
-                        or not 0 <= index < len(options)
-                        or not question["explanation"].strip()
-                        or not question["sourceEvidence"].strip()):
-                    raise ValueError()
-                seen_questions.add(normalized_question)
-                if content_text is not None and question["sourceEvidence"] not in content_text:
-                    contained = False
+            if not quiz_questions_valid(questions, self.config["options_per_question"]):
+                raise ValueError()
+            contained = all(question["sourceEvidence"] in content_text for question in questions) \
+                if content_text is not None else True
             row["evidenceTextContained"] = contained if content_text is not None else None
             row["validatorStatus"] = ("not_run" if content_text is None
                                       else "pass" if contained else "fail")
