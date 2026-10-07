@@ -19,6 +19,17 @@ APPROVED_AT_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{6}
                                  re.ASCII)
 
 
+def valid_utc_timestamp(value):
+    """A canonical UTC timestamp string that is also a real calendar date and time."""
+    if not isinstance(value, str) or APPROVED_AT_PATTERN.fullmatch(value) is None:
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
 def normalize_approved_by(approved_by):
     """Return the stripped caller-supplied approver or raise ValueError."""
     if (not isinstance(approved_by, str)

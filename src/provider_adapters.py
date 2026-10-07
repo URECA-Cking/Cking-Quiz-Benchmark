@@ -70,6 +70,46 @@ def video_timestamp_seconds(value):
     return float(int(minutes) * 60 + Decimal(seconds + "." + (fraction or "0")))
 
 
+FIXTURE_RAW_METADATA = {"source": "fixture"}
+
+
+def validate_raw_metadata(value):
+    """Canonical stored raw metadata contract; raise ValueError otherwise.
+
+    A completed live call keeps only status, Provider name and numeric token usage; a fixture run
+    keeps only its marker, and None means no raw file. Shared by Pilot storage and production validation.
+    """
+    if value is None or value == FIXTURE_RAW_METADATA:
+        return
+    if (not isinstance(value, dict) or set(value) != {"status", "provider", "usage"}
+            or value["status"] != "completed" or value["provider"] not in ("gemini", "openai")
+            or not isinstance(value["usage"], dict)
+            or set(value["usage"]) != {"inputTokens", "outputTokens", "thinkingTokens", "toolUseTokens"}
+            or any(token is not None and (type(token) is not int or token < 0)
+                   for token in value["usage"].values())):
+        raise ValueError("Raw results may contain allowlisted provider metadata only")
+
+
+GROUNDING_EVIDENCE_TYPES = ("speech", "visual", "unknown")
+
+
+def valid_grounding_fact(fact, start, end, duration):
+    """Structural contract of one Grounding fact whose timestamps are already elapsed seconds.
+
+    Shared by the Pilot runner (on the Provider response) and production machine validation (on the
+    stored artifact). Null timestamps are allowed and the duration bound applies only when it is known.
+    This checks structure only, never whether the fact, evidence or timestamp is true to the video.
+    """
+    return (isinstance(fact, dict)
+            and all(isinstance(fact.get(key), str) and fact[key].strip()
+                    for key in ("fact", "evidenceType", "evidence"))
+            and fact["evidenceType"] in GROUNDING_EVIDENCE_TYPES
+            and all(value is None or (type(value) in (int, float) and math.isfinite(value) and value >= 0
+                                      and (duration is None or value <= duration))
+                    for value in (start, end))
+            and (start is None or end is None or start <= end))
+
+
 def grounding_schema(prompt_version=None):
     if prompt_version in STRING_TIMESTAMP_GROUNDING_VERSIONS:
         timestamps = {"timestampStart": _video_timestamp("시작"), "timestampEnd": _video_timestamp("끝")}
