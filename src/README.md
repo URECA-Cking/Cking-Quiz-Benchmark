@@ -1,5 +1,13 @@
 # Pilot 실행 코드 경계
 
+## Pilot v2 Quiz·Direct 생성 통제 (Issue #23)
+
+`configs/pilot-v2.yaml`은 Quiz A·Direct C(Gemini)의 thinking level과 Quiz B(OpenAI)의 reasoning effort를 `medium`으로 고정합니다. Direct는 Quiz Gemini 모델 설정을 공유하지만 Grounding 요청에는 적용하지 않습니다. Provider별 medium은 동일한 추론량을 뜻하지 않습니다. temperature/top_p는 설정하지 않습니다.
+
+v2에서 `--reasoning-effort` 또는 `--thinking-level`을 생략하면 해당 Provider의 config medium을 사용하고, 명시한 값이 다르면 HTTP 전에 거부합니다. `--retry-attempts 0`은 v2 Quiz·Direct live의 필수 정책이며 Router 직접 호출에도 적용합니다. Grounding technical retry는 Issue #23에서 변경하지 않습니다. v1의 기존 CLI reasoning 및 retry 동작은 유지합니다.
+
+A/B는 같은 승인 contentText만 사용하며 facts는 입력하지 않습니다. 정확히 3문항을 요청하되 schema로 개수를 강제하지 않습니다. API success를 받은 v2 Quiz·Direct 조건은 parse/validator/품질 실패도 terminal이며 다시 생성하지 않습니다. technical error만 다음 live attempt를 허용하고 fixture not_run은 API success가 아닙니다. Direct attempt는 promptVersion으로 v1/v2를 구분합니다. 기존 결과 및 결과 schema는 변경하지 않습니다.
+
 `pilot_runner.py`는 Video Grounding, 고정 `contentText` 기반 Quiz Generation, End-to-End 조합을 **한 조건씩** 실행합니다. CLI 기본 경로는 `FixtureProvider`이며 `--live`를 명시하고 호출·비용·timeout·모델 설정을 모두 제공해야 외부 요청이 가능합니다. Gemini·OpenAI Adapter는 `invoke(kind, **kwargs)`를 구현하고 실제 API 호출 구현에만 `is_actual_api = True`를 명시해야 합니다. Provider 생성 텍스트는 평가용 `normalized`로만 전달합니다. `results/raw/`에는 완료 상태, Provider 이름, 숫자형 token usage만 허용하며 fixture는 식별 표지만 저장합니다. 평가할 출력은 별도 `results/evaluation/`에 저장하므로 공유 전 민감정보를 확인해야 합니다. 요청, 헤더, API Key, 인증 정보와 예외 원문은 raw metadata에 저장하지 않습니다. Grounding과 Quiz 결과는 별도 JSONL에 쓰고 `runId`로 End-to-End 결과와 연결합니다. `--results-dir`은 저장소의 `results/`와 그 하위 경로만 허용합니다.
 
 `pip install -r requirements.txt` 후 저장소 루트에서 예를 들어 `python -m src.pilot_runner quiz --video-id nasa-water-cycle-2019 --model gemini-3.8-flash --repetition 1 --content-file <로컬-고정-텍스트> --source-grounding-run-id <사람이-승인한-Grounding-runId> --fixture <로컬-fixture.json>`처럼 한 조건을 지정합니다. Quiz 입력은 `results/video-grounding.jsonl`의 성공한 승인 행과 `results/evaluation/<runId>.json`의 원본 텍스트를 같은 해시로 검증한 뒤에만 Provider에 전달합니다. 승인 필드가 없는 기존 행과 임의의 content 파일은 거부합니다. fixture에는 `{"quiz":{"raw":{"promptVersion":"pilot-v1","questions":[...]}}}` 형식의 응답을 둡니다. 다른 두 mode는 `grounding`과 `end-to-end`이며 `--method`를 명시합니다. 두 단계 E2E는 새 Grounding 직후 자동 Quiz 호출을 하지 않도록 차단되어 있습니다. Direct Quiz는 그대로 독립 실행합니다. 허용 method/model/repetition은 `configs/pilot.yaml`에서 읽습니다. transcript 경로는 이용 권한을 확인한 파일을 `--authorized-transcript-file`로 **명시적으로** 제공할 때만 실행합니다. 입력 내용, 원본 응답과 로컬 결과는 Git에 올리지 않습니다.

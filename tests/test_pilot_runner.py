@@ -1073,6 +1073,148 @@ class PilotRunnerTest(unittest.TestCase):
 ALL_PASS = {item: "pass" for item in grounding_review.REVIEW_ITEMS}
 
 
+class PilotV2QuizControlsTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.repository = Path(self.temp.name)
+        (self.repository / "configs").mkdir()
+        (self.repository / "data").mkdir()
+        for name in ("pilot.yaml", "pilot-v2.yaml"):
+            shutil.copyfile(ROOT / "configs" / name, self.repository / "configs" / name)
+        shutil.copyfile(ROOT / "data/videos.jsonl", self.repository / "data/videos.jsonl")
+        self.results = self.repository / "results"
+        self.v1 = PilotRunner(self.repository, self.results)
+        self.v2 = PilotRunner(self.repository, self.results, self.repository / "configs/pilot-v2.yaml")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def approved(self, runner=None):
+        runner = runner or self.v2
+        source = runner.run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(
+            {"grounding": {"normalized": GROUNDING, "responseBody": FIXTURE_RAW}}))
+        if runner is self.v2:
+            runner.review_grounding(source["runId"], APPROVER, ALL_PASS)
+        else:
+            runner.approve_content(source["runId"], APPROVER)
+        return source["runId"]
+
+    def provider(self, kind, output, actual=True):
+        return (SimulatedApiFixture if actual else FixtureProvider)(
+            {kind: {"normalized": output, "raw": output, "responseBody": FIXTURE_RAW}})
+
+    def snapshot(self):
+        return {str(p.relative_to(self.repository)): p.read_bytes() for p in self.repository.rglob("*")
+                if p.is_file() and p.name != PilotRunner.LOCK_FILE}
+
+    def test_v2_ab_input_is_identical_approved_text_without_facts(self):
+        source = self.approved()
+        calls = []
+        for model in ("gemini-3.8-flash", "gpt-5.4-mini"):
+            provider = self.provider("quiz", dict(QUIZ, promptVersion="pilot-v2"))
+            row = self.v2.run_quiz(VIDEO, model, 1, CONTENT, provider, source_grounding_run_id=source)
+            calls.append(provider.calls[0])
+            self.assertEqual(row["contentTextSha256"], hashlib.sha256(CONTENT.encode()).hexdigest())
+        self.assertEqual([call["contentText"] for call in calls], [CONTENT, CONTENT])
+        self.assertTrue(all("facts" not in call and "groundingFacts" not in call for call in calls))
+
+    def test_v2_question_count_and_parse_failures_are_terminal_without_mutation(self):
+        source = self.approved()
+        for repetition, output in ((1, dict(QUIZ, promptVersion="pilot-v2", questions=QUIZ["questions"][:2])),
+                                   (2, "{incomplete")):
+            provider = self.provider("quiz", output)
+            row = self.v2.run_quiz(VIDEO, "gemini-3.8-flash", repetition, CONTENT, provider, source_grounding_run_id=source)
+            self.assertEqual(row["apiStatus"], "success")
+            self.assertEqual(row["errorCategory"], "quiz_contract_error" if repetition == 1 else "parse_error")
+            if repetition == 1:
+                self.assertEqual((row["questionCount"], row["validatorStatus"]), (2, "fail"))
+            before = self.snapshot()
+            refused = self.provider("quiz", dict(QUIZ, promptVersion="pilot-v2"))
+            with self.assertRaisesRegex(ValueError, "terminal"):
+                self.v2.run_quiz(VIDEO, "gemini-3.8-flash", repetition, CONTENT, refused, source_grounding_run_id=source)
+            self.assertEqual(refused.calls, [])
+            self.assertEqual(self.snapshot(), before)
+
+    def test_direct_quality_terminal_and_technical_failure_next_attempt(self):
+        row = self.v2.run_end_to_end(VIDEO, "gemini_direct_quiz", 1,
+            SimulatedApiFixture({"direct": {"errorCategory": "server_error"}}))
+        self.assertEqual((row["apiStatus"], row["attempt"]), ("error", 1))
+        row = self.v2.run_end_to_end(VIDEO, "gemini_direct_quiz", 1,
+            self.provider("direct", dict(QUIZ, promptVersion="pilot-v2", questions=[])))
+        self.assertEqual((row["apiStatus"], row["validatorStatus"], row["attempt"]), ("success", "fail", 2))
+        before = self.snapshot()
+        provider = self.provider("direct", dict(QUIZ, promptVersion="pilot-v2"))
+        with self.assertRaisesRegex(ValueError, "terminal"):
+            self.v2.run_end_to_end(VIDEO, "gemini_direct_quiz", 1, provider)
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_v1_reruns_and_direct_version_isolation(self):
+        for attempt in (1, 2, 3):
+            row = self.v1.run_end_to_end(VIDEO, "gemini_direct_quiz", 1,
+                self.provider("direct", dict(QUIZ, questions=[])))
+            self.assertEqual(row["attempt"], attempt)
+        row = self.v2.run_end_to_end(VIDEO, "gemini_direct_quiz", 1,
+            self.provider("direct", dict(QUIZ, promptVersion="pilot-v2")))
+        self.assertEqual(row["attempt"], 1)
+        self.assertEqual(self.v2.run_end_to_end(VIDEO, "gemini_direct_quiz", 2,
+            self.provider("direct", dict(QUIZ, promptVersion="pilot-v2")))["attempt"], 1)
+
+    def test_fixture_not_run_does_not_terminal_block_live(self):
+        self.v2.run_end_to_end(VIDEO, "gemini_direct_quiz", 1,
+            self.provider("direct", dict(QUIZ, promptVersion="pilot-v2"), actual=False))
+        row = self.v2.run_end_to_end(VIDEO, "gemini_direct_quiz", 1,
+            self.provider("direct", dict(QUIZ, promptVersion="pilot-v2")))
+        self.assertEqual((row["apiStatus"], row["attempt"]), ("success", 2))
+
+    def test_quiz_technical_failure_allows_next_attempt_and_other_model_is_independent(self):
+        source = self.approved()
+        row = self.v2.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
+            SimulatedApiFixture({"quiz": {"errorCategory": "server_error"}}), source_grounding_run_id=source)
+        self.assertEqual((row["apiStatus"], row["attempt"]), ("error", 1))
+        row = self.v2.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
+            self.provider("quiz", dict(QUIZ, promptVersion="pilot-v2")), source_grounding_run_id=source)
+        self.assertEqual((row["apiStatus"], row["attempt"]), ("success", 2))
+        other = self.v2.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT,
+            self.provider("quiz", dict(QUIZ, promptVersion="pilot-v2")), source_grounding_run_id=source)
+        self.assertEqual(other["attempt"], 1)
+        changed = hashlib.sha256((CONTENT + " changed").encode()).hexdigest()
+        self.assertFalse(self.v2._same_condition(row, "quiz_generation", VIDEO, "fixed_content_text",
+                         "gemini-3.8-flash", 1, "pilot-v2", changed))
+        before = self.snapshot()
+        refused = self.provider("quiz", dict(QUIZ, promptVersion="pilot-v2"))
+        with self.assertRaisesRegex(ValueError, "terminal"):
+            self.v2.run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, refused, source_grounding_run_id=source)
+        self.assertEqual(refused.calls, [])
+        self.assertEqual(self.snapshot(), before)
+
+    def test_v1_fixed_quiz_quality_failure_still_allows_rerun(self):
+        source = self.approved(self.v1)
+        for attempt in (1, 2):
+            row = self.v1.run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT,
+                self.provider("quiz", dict(QUIZ, questions=[])), source_grounding_run_id=source)
+            self.assertEqual((row["apiStatus"], row["validatorStatus"], row["attempt"]), ("success", "fail", attempt))
+
+    def test_v2_direct_parse_failure_is_terminal_and_keeps_measurement_contract(self):
+        row = self.v2.run_end_to_end(VIDEO, "gemini_direct_quiz", 1, self.provider("direct", "{bad json"))
+        self.assertEqual((row["apiStatus"], row["parseStatus"], row["errorCategory"]), ("success", "fail", "parse_error"))
+        provider = self.provider("direct", dict(QUIZ, promptVersion="pilot-v2"))
+        with self.assertRaisesRegex(ValueError, "terminal"):
+            self.v2.run_end_to_end(VIDEO, "gemini_direct_quiz", 1, provider)
+        self.assertEqual(provider.calls, [])
+
+    def test_invalid_v2_config_and_unknown_version_refuse_fixture_before_mutation(self):
+        for version, count in (("pilot-v2", 4), ("pilot-v99", 3)):
+            self.v2.config["prompt_version"] = version
+            self.v2.config["questions_per_video"] = count
+            provider = self.provider("direct", QUIZ, actual=False)
+            before = self.snapshot()
+            with self.assertRaises(ValueError):
+                self.v2.run_end_to_end(VIDEO, "gemini_direct_quiz", 1, provider)
+            self.assertEqual(provider.calls, [])
+            self.assertEqual(self.snapshot(), before)
+
+
 class PilotV2GroundingReviewTest(unittest.TestCase):
     """Pilot v2 (video-grounding-v2) human Grounding checklist and its A/B gate."""
 
@@ -1118,7 +1260,7 @@ class PilotV2GroundingReviewTest(unittest.TestCase):
         return (runner or self.v2).run_quiz(VIDEO, model, 1, CONTENT, provider,
                                             source_grounding_run_id=source_id), provider
 
-    def test_v2_config_changes_only_the_two_versions(self):
+    def test_v2_config_changes_only_versions_and_quiz_execution_controls(self):
         self.assertEqual((self.v1.config["prompt_version"], self.v1.config["video_grounding"]["prompt_version"]),
                          ("pilot-v1", "video-grounding-v1"))
         self.assertEqual((self.v2.config["prompt_version"], self.v2.config["video_grounding"]["prompt_version"]),
@@ -1126,6 +1268,11 @@ class PilotV2GroundingReviewTest(unittest.TestCase):
         for config in (self.v1.config, self.v2.config):
             config.pop("prompt_version")
             config["video_grounding"].pop("prompt_version")
+        self.assertEqual(self.v2.config.pop("live_execution"), {"retry_attempts": 0})
+        for model in self.v2.config["quiz_generation"]["models"]:
+            self.assertEqual(model.pop("generation_settings"),
+                             {"thinking_level": "medium"} if model["provider"] == "gemini"
+                             else {"reasoning_effort": "medium"})
         self.assertEqual(self.v1.config, self.v2.config)
 
     def test_runner_passes_the_grounding_prompt_version_to_the_provider(self):

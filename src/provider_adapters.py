@@ -6,7 +6,7 @@ import os
 import socket
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
@@ -77,6 +77,42 @@ GROUNDING_PROMPTS = {
     "video-grounding-v2": _GROUNDING_PROMPT_V1 + _GROUNDING_CONTENT_TEXT_CONTRACT_V2,
 }
 
+# Freeze the v1 text and interpolation; versioning must not rewrite historical requests.
+QUIZ_PROMPTS = {
+    "pilot-v1": ("한국어 4지선다 퀴즈 {question_count}개, 각 {option_count}개 보기를 생성하세요. "
+                 "correctOptionIndex는 0-based입니다. promptVersion은 {prompt_version}입니다. "
+                 "정답 근거인 sourceEvidence를 포함하세요."),
+    "pilot-v2": ("한국어 4지선다 퀴즈를 정확히 3문항 생성하세요. 각 문항은 4개 보기를 갖습니다. "
+                 "correctOptionIndex는 0-based입니다. promptVersion은 pilot-v2입니다. "
+                 "정답 근거인 sourceEvidence를 포함하세요."),
+}
+
+
+def validate_quiz_config(config):
+    """Bind v2's recorded prompt version to its fixed generation conditions."""
+    version = config.get("prompt_version")
+    if not isinstance(version, str) or version not in QUIZ_PROMPTS:
+        raise ValueError("Unsupported Quiz/Direct promptVersion")
+    if version != "pilot-v2":
+        return
+    retry = config.get("live_execution", {}).get("retry_attempts")
+    if (type(retry) is not int or retry != 0
+            or type(config.get("questions_per_video")) is not int or config["questions_per_video"] != 3
+            or type(config.get("options_per_question")) is not int or config["options_per_question"] != 4):
+        raise ValueError("Pilot v2 requires three questions, four options and retry_attempts=0")
+    expected = {"gemini-3.8-flash": ("gemini", {"thinking_level": "medium"}),
+                "gpt-5.4-mini": ("openai", {"reasoning_effort": "medium"})}
+    models = config["quiz_generation"]["models"]
+    if len(models) != 2 or {item["id"] for item in models} != set(expected):
+        raise ValueError("Pilot v2 Quiz models must match the experiment")
+    for item in models:
+        provider, settings = expected[item["id"]]
+        if item["provider"] != provider or item.get("generation_settings") != settings:
+            raise ValueError("Pilot v2 generation settings must be medium")
+    direct = [item for item in config["end_to_end"]["methods"] if item["id"] == "gemini_direct_quiz"]
+    if len(direct) != 1 or direct[0]["quiz_model"] != "gemini-3.8-flash" or direct[0]["grounding"] != "direct_video":
+        raise ValueError("Pilot v2 Direct model must match the experiment")
+
 
 @dataclass
 class LivePolicy:
@@ -95,6 +131,7 @@ class LivePolicy:
     output_price_per_million: float = None
     pricing_reference: str = None
     provider_prices: dict = None
+    thinking_level: str = None
 
     def prices(self, provider):
         if self.provider_prices is not None:
@@ -163,6 +200,7 @@ class ProviderRouter:
         if pilot_config is None:
             config_path = Path(__file__).resolve().parents[1] / "configs" / "pilot.yaml"
             pilot_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))["pilot"]
+        self.config = pilot_config
         self.models = self._model_registry(pilot_config)
         self.calls = 0
         self.reserved_cost = 0.0
@@ -194,28 +232,52 @@ class ProviderRouter:
                 registry[model]["kinds"].add("direct")
         return registry
 
+    def execution_policy(self, kind, model, prompt_version=None):
+        """Resolve CLI overrides without mutating shared policy or Grounding settings."""
+        policy = self.policy
+        if self.config.get("prompt_version") == "pilot-v2":
+            if kind in ("quiz", "direct"):
+                if type(policy.retry_attempts) is not int or policy.retry_attempts != 0:
+                    raise ProviderFailure("live_guard")
+                validate_quiz_config(self.config)
+                if prompt_version != "pilot-v2":
+                    raise ProviderFailure("invalid_input")
+                entry = next((item for item in self.config["quiz_generation"]["models"] if item["id"] == model), None)
+                if entry is None:
+                    raise ProviderFailure("unsupported_provider")
+                settings = entry["generation_settings"]
+                field = "thinking_level" if entry["provider"] == "gemini" else "reasoning_effort"
+                supplied = getattr(policy, field)
+                if supplied is not None and supplied != settings[field]:
+                    raise ProviderFailure("live_guard")
+                policy = replace(policy, **{field: settings[field]})
+        elif kind in ("quiz", "direct") and prompt_version != self.config.get("prompt_version"):
+            raise ProviderFailure("invalid_input")
+        return policy
+
     def invoke(self, kind, **kwargs):
         model = kwargs.get("model")
         entry = self.models.get(model)
         if entry is None or kind not in entry["kinds"]:
             raise ProviderFailure("unsupported_provider")
         provider = entry["provider"]
-        estimate = self.policy.authorize(kind, self.calls, self.reserved_cost, provider)
+        policy = self.execution_policy(kind, model, kwargs.get("promptVersion"))
+        estimate = policy.authorize(kind, self.calls, self.reserved_cost, provider)
         key = (self.api_keys or {}).get(provider) if self.api_keys is not None else os.getenv(
             entry["key_name"])
         if not key:
             raise ProviderFailure("api_key_missing")
-        body = self._request(provider, kind, **kwargs)
+        body = self._request(provider, kind, _policy=policy, **kwargs)
         url = GEMINI_URL if provider == "gemini" else OPENAI_URL
         headers = {"Content-Type": "application/json"}
         headers["x-goog-api-key" if provider == "gemini" else "Authorization"] = (
             key if provider == "gemini" else "Bearer " + key)
         status = None
         last_http_failure = None
-        for attempt in range(self.policy.retry_attempts + 1):
+        for attempt in range(policy.retry_attempts + 1):
             # Count every HTTP attempt, including retries, against the explicit caps.
             try:
-                self.policy.authorize(kind, self.calls, self.reserved_cost, provider)
+                policy.authorize(kind, self.calls, self.reserved_cost, provider)
             except ProviderFailure:
                 if last_http_failure is not None:
                     # Keep the last observed Provider failure and record why no retry was sent.
@@ -275,7 +337,8 @@ class ProviderRouter:
         measurements["pricingReference"] = reference
         self.reserved_cost += measurements["estimatedCostUsd"] - pre_call_estimate
 
-    def _request(self, provider, kind, **kwargs):
+    def _request(self, provider, kind, _policy=None, **kwargs):
+        policy = _policy or self.policy
         model = kwargs["model"]
         if kind == "quiz":
             text = kwargs.get("contentText")
@@ -298,21 +361,24 @@ class ProviderRouter:
             question_count, option_count = kwargs.get("questionCount"), kwargs.get("optionCount")
             prompt_version = kwargs.get("promptVersion")
             if (type(question_count) is not int or question_count < 1 or type(option_count) is not int
-                    or option_count < 2 or not isinstance(prompt_version, str) or not prompt_version):
+                    or option_count < 2 or not isinstance(prompt_version, str) or prompt_version not in QUIZ_PROMPTS
+                    or (prompt_version == "pilot-v2" and (question_count != 3 or option_count != 4))):
                 raise ProviderFailure("invalid_input")
-            prompt = (f"한국어 4지선다 퀴즈 {question_count}개, 각 {option_count}개 보기를 생성하세요. "
-                      f"correctOptionIndex는 0-based입니다. promptVersion은 {prompt_version}입니다. "
-                      "정답 근거인 sourceEvidence를 포함하세요.")
+            prompt = QUIZ_PROMPTS[prompt_version].format(question_count=question_count,
+                                                       option_count=option_count, prompt_version=prompt_version)
             schema = quiz_schema()
         if provider == "gemini":
             input_parts = ([{"type": "video", "uri": source, "processing": self.policy.video_processing}]
                            if kind != "quiz" else [])
             input_parts.append({"type": "text", "text": prompt + ("\n" + source if kind == "quiz" else "")})
+            generation = {"max_output_tokens": policy.max_output_tokens}
+            if kind in ("quiz", "direct") and kwargs["promptVersion"] == "pilot-v2":
+                generation["thinking_level"] = policy.thinking_level
             return {"model": model, "input": input_parts, "store": False,
                     "response_format": {"type": "text", "mime_type": "application/json", "schema": schema},
-                    "generation_config": {"max_output_tokens": self.policy.max_output_tokens}}
+                    "generation_config": generation}
         return {"model": model, "input": prompt + "\n" + source, "store": False,
-                "reasoning": {"effort": self.policy.reasoning_effort},
+                "reasoning": {"effort": policy.reasoning_effort},
                 "max_output_tokens": self.policy.max_output_tokens,
                 "text": {"format": {"type": "json_schema", "name": "pilot_quiz",
                                      "strict": True, "schema": schema}}}

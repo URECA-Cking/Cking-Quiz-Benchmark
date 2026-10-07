@@ -23,7 +23,7 @@ from src.grounding_review import (build_review, derive_approval_status, groundin
                                   require_valid_grounding_review, requires_review,
                                   successful_review_candidates)
 from src.human_evaluation import require_valid_human_evaluation
-from src.provider_adapters import GROUNDING_PROMPTS
+from src.provider_adapters import GROUNDING_PROMPTS, validate_quiz_config
 from src.provider_failure import ProviderFailure
 
 
@@ -132,6 +132,34 @@ class PilotRunner:
         if not 1 <= repetition <= self.config["repetitions_per_condition"]:
             raise ValueError("Repetition is outside pilot configuration")
 
+    @staticmethod
+    def _same_condition(existing, benchmark_type, video_id, method, model, repetition,
+                        prompt_version=None, content_hash=None):
+        if not (existing.get("videoId") == video_id and existing.get("method") == method
+                and existing.get("model") == model and existing.get("repetition") == repetition):
+            return False
+        if benchmark_type == "quiz_generation":
+            return (existing.get("promptVersion") == prompt_version
+                    and existing.get("contentTextSha256") == content_hash)
+        if benchmark_type == "video_grounding":
+            return grounding_attempt_version(existing.get("promptVersion")) == grounding_attempt_version(prompt_version)
+        if method == "gemini_direct_quiz":
+            return existing.get("promptVersion") == prompt_version
+        return True
+
+    def _require_open_quiz_condition(self, benchmark_type, video_id, method, model, repetition,
+                                     content_hash=None):
+        validate_quiz_config(self.config)
+        self._check_storage_integrity()
+        if self.config["prompt_version"] != "pilot-v2":
+            return
+        path = self.results / self.FILES[benchmark_type]
+        rows = self._jsonl(path) if path.exists() else []
+        if any(row.get("apiStatus") == "success" and self._same_condition(
+                row, benchmark_type, video_id, method, model, repetition,
+                self.config["prompt_version"], content_hash) for row in rows):
+            raise ValueError("Pilot v2 Quiz/Direct condition is terminal after API success")
+
     def _next_attempt(self, benchmark_type, video_id, method, model, repetition,
                       prompt_version=None, content_hash=None):
         result_file = self.results / self.FILES[benchmark_type]
@@ -144,14 +172,8 @@ class PilotRunner:
             if not line.strip():
                 continue
             existing = json.loads(line)
-            if (existing.get("videoId") == video_id and existing.get("method") == method
-                    and existing.get("model") == model and existing.get("repetition") == repetition
-                    and (benchmark_type != "quiz_generation"
-                         or (existing.get("promptVersion") == prompt_version
-                             and existing.get("contentTextSha256") == content_hash))
-                    and (benchmark_type != "video_grounding"
-                         or grounding_attempt_version(existing.get("promptVersion"))
-                         == grounding_attempt_version(prompt_version))):
+            if self._same_condition(existing, benchmark_type, video_id, method, model, repetition,
+                                    prompt_version, content_hash):
                 attempt = existing.get("attempt", 1)
                 if type(attempt) is not int or attempt < 1:
                     raise ValueError("Invalid attempt in existing result")
@@ -768,6 +790,8 @@ class PilotRunner:
             raise ValueError("Configured quiz model and nonempty fixed contentText are required")
         content_hash = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
         self._require_approved_content(video_id, content_text, source_grounding_run_id)
+        self._require_open_quiz_condition("quiz_generation", video_id, "fixed_content_text", model,
+                                          repetition, content_hash)
         self._require_fixed_content(video_id, content_hash)
         row = self._base("quiz_generation", video_id, "fixed_content_text", model, repetition,
                          content_hash)
@@ -801,6 +825,7 @@ class PilotRunner:
         setting = methods[method]
         if method != "gemini_direct_quiz":
             raise ValueError("Two-stage end-to-end Quiz requires separate human approval")
+        self._require_open_quiz_condition("end_to_end", video_id, method, setting["quiz_model"], repetition)
         row = self._base("end_to_end", video_id, method, setting["quiz_model"], repetition)
         row.update(groundingRunId=None, quizRunId=None, beCompatibility="not_run",
                    questionReviews=[], totalLatencyMs=None, totalEstimatedCostUsd=None,
@@ -865,6 +890,7 @@ def main():
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument("--retry-attempts", type=int)
     parser.add_argument("--reasoning-effort")
+    parser.add_argument("--thinking-level")
     parser.add_argument("--video-processing")
     parser.add_argument("--max-output-tokens", type=int)
     parser.add_argument("--video-estimated-input-tokens", type=int,
@@ -903,7 +929,8 @@ def main():
                             per_call_cost_limit=args.per_call_cost_limit,
                             total_cost_limit=args.total_cost_limit,
                             timeout_seconds=args.timeout_seconds, retry_attempts=args.retry_attempts,
-                            reasoning_effort=args.reasoning_effort, video_processing=args.video_processing,
+                            reasoning_effort=args.reasoning_effort, thinking_level=args.thinking_level,
+                            video_processing=args.video_processing,
                             max_output_tokens=args.max_output_tokens,
                             video_estimated_input_tokens=args.video_estimated_input_tokens,
                             quiz_estimated_input_tokens=args.quiz_estimated_input_tokens,
@@ -938,7 +965,8 @@ def main():
             entry = provider.models.get(model)
             if entry is None or kind not in entry["kinds"]:
                 parser.error("Unsupported live provider/model for the selected condition")
-            policy.authorize(kind, 0, 0, entry["provider"])
+            effective = provider.execution_policy(kind, model, runner.config["prompt_version"])
+            effective.authorize(kind, 0, 0, entry["provider"])
     else:
         provider = FixtureProvider(json.loads(args.fixture.read_text(encoding="utf-8")))
     transcript = args.authorized_transcript_file.read_text(encoding="utf-8") if args.authorized_transcript_file else None

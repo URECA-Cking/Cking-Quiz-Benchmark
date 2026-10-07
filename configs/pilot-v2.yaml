@@ -7,6 +7,8 @@ pilot:
   # Pilot v2: a separate experiment from pilot-v1 (configs/pilot.yaml stays unchanged).
   # Quiz A/B input is still the approved contentText only; facts are not added.
   prompt_version: pilot-v2
+  live_execution:
+    retry_attempts: 0
   # 실행 전 공식 모델 ID, 접근 권한, 계정별 제한과 비용 상한을 다시 확인한다.
   video_grounding:
     # AI Grounding prompt 계약 버전. 전역 prompt_version(Quiz·Direct Quiz)과 별개이며
@@ -29,9 +31,13 @@ pilot:
       - id: gemini-3.8-flash
         provider: gemini
         api_key_environment_variable: GEMINI_API_KEY
+        generation_settings:
+          thinking_level: medium
       - id: gpt-5.4-mini
         provider: openai
         api_key_environment_variable: OPENAI_API_KEY
+        generation_settings:
+          reasoning_effort: medium
   end_to_end:
     methods:
       - id: gemini_grounding_gemini_quiz

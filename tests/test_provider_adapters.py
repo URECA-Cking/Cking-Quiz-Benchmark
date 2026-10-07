@@ -78,6 +78,180 @@ def gemini_response(payload, status="completed"):
         "usage": {"total_input_tokens": 10, "total_output_tokens": 20, "total_thought_tokens": 3}}
 
 
+class PilotV2ControlsAdapterTest(unittest.TestCase):
+    def config(self):
+        import yaml
+        return yaml.safe_load((Path(__file__).resolve().parents[1] / "configs/pilot-v2.yaml").read_text(encoding="utf-8"))["pilot"]
+
+    def router(self, transport, config=None, **overrides):
+        return ProviderRouter(policy(**overrides), transport=transport,
+                              api_keys={"gemini": "test-key", "openai": "test-key"}, pilot_config=config)
+
+    def arguments(self, kind="quiz", model="gemini-3.8-flash", version="pilot-v2"):
+        return dict(model=model, promptVersion=version, questionCount=3, optionCount=4,
+                    **({"contentText": CONTENT} if kind == "quiz" else {"video": VIDEO}))
+
+    def test_v1_quiz_and_direct_request_literals_are_unchanged(self):
+        prompt = ("한국어 4지선다 퀴즈 3개, 각 4개 보기를 생성하세요. "
+                  "correctOptionIndex는 0-based입니다. promptVersion은 pilot-v1입니다. "
+                  "정답 근거인 sourceEvidence를 포함하세요.")
+        source = "아래 contentText의 근거 문구만 사용하세요. sourceEvidence는 원문에서 그대로 인용하세요.\n" + CONTENT
+        for kind, model in (("quiz", "gemini-3.8-flash"), ("quiz", "gpt-5.4-mini"), ("direct", "gemini-3.8-flash")):
+            transport = FakeTransport(gemini_response(QUIZ) if model.startswith("gemini") else {
+                "status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(QUIZ)}]}],
+                "usage": {"input_tokens": 10, "output_tokens": 20, "output_tokens_details": {"reasoning_tokens": 3}}})
+            self.router(transport).invoke(kind, **self.arguments(kind, model, "pilot-v1"))
+            body = transport.calls[0][2]
+            if model.startswith("gemini"):
+                expected_input = ([{"type": "video", "uri": VIDEO["youtubeUrl"], "processing": "static"}] if kind == "direct" else [])
+                expected_input.append({"type": "text", "text": prompt if kind == "direct" else prompt + "\n" + source})
+                self.assertEqual(body["input"], expected_input)
+                self.assertEqual(body["generation_config"], {"max_output_tokens": 2000})
+            else:
+                self.assertEqual(body["input"], prompt + "\n" + source)
+                self.assertEqual(body["reasoning"], {"effort": "none"})
+
+    def test_v2_requests_use_medium_without_sampling_or_exact_three_schema(self):
+        for kind, model in (("quiz", "gemini-3.8-flash"), ("quiz", "gpt-5.4-mini"), ("direct", "gemini-3.8-flash")):
+            output = dict(QUIZ, promptVersion="pilot-v2")
+            transport = FakeTransport(gemini_response(output) if model.startswith("gemini") else {
+                "status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(output)}]}],
+                "usage": {"input_tokens": 10, "output_tokens": 20, "output_tokens_details": {"reasoning_tokens": 3}}})
+            router = self.router(transport, self.config(), reasoning_effort=None)
+            self.assertEqual(router.invoke(kind, **self.arguments(kind, model))["normalized"], output)
+            body = transport.calls[0][2]
+            if model.startswith("gemini"):
+                self.assertEqual(body["generation_config"], {"max_output_tokens": 2000, "thinking_level": "medium"})
+                schema = body["response_format"]["schema"]
+                prompt = body["input"][-1]["text"]
+            else:
+                self.assertEqual(body["reasoning"], {"effort": "medium"})
+                schema = body["text"]["format"]["schema"]
+                prompt = body["input"]
+            self.assertIn("정확히 3", prompt)
+            self.assertNotIn("minItems", schema["properties"]["questions"])
+            self.assertNotIn("maxItems", schema["properties"]["questions"])
+            self.assertNotIn("temperature", json.dumps(body))
+            self.assertNotIn("top_p", json.dumps(body))
+
+    def test_v2_retry_and_settings_conflicts_are_rejected_before_http(self):
+        for overrides in ({"retry_attempts": 1}, {"reasoning_effort": "low"}):
+            transport = FakeTransport({})
+            with self.assertRaises((ValueError, ProviderFailure)):
+                self.router(transport, self.config(), **dict({"reasoning_effort": None}, **overrides)).invoke("quiz", **self.arguments(model="gpt-5.4-mini"))
+            self.assertEqual(transport.calls, [])
+
+    def test_grounding_technical_retry_is_preserved_for_v1_and_v2(self):
+        for config in (None, self.config()):
+            for status in (429, 503):
+                with self.subTest(version=config and config["prompt_version"], status=status):
+                    transport = FakeTransport(gemini_response(GROUNDING))
+                    responses = iter(((status, {}), (200, gemini_response(GROUNDING))))
+                    def send(url, headers, body, timeout):
+                        transport.calls.append((url, headers, body, timeout))
+                        return next(responses)
+                    router = self.router(send, config, retry_attempts=1, call_limit=2)
+                    result = router.invoke("grounding", video=VIDEO, model="gemini-3.8-flash",
+                                           promptVersion="video-grounding-v2" if config else GROUNDING_V1)
+                    self.assertEqual(result["normalized"], GROUNDING)
+                    self.assertEqual((router.calls, len(transport.calls)), (2, 2))
+                    self.assertEqual(transport.calls[0][2], transport.calls[1][2])
+                    self.assertNotIn("thinking_level", transport.calls[0][2]["generation_config"])
+
+    def test_v2_quiz_and_direct_nonzero_retry_fail_before_transport(self):
+        for kind, model in (("quiz", "gemini-3.8-flash"), ("quiz", "gpt-5.4-mini"),
+                            ("direct", "gemini-3.8-flash")):
+            with self.subTest(kind=kind, model=model):
+                transport = FakeTransport({})
+                router = self.router(transport, self.config(), retry_attempts=1, call_limit=2)
+                with self.assertRaises(ProviderFailure) as caught:
+                    router.invoke(kind, **self.arguments(kind, model))
+                self.assertEqual(caught.exception.category, "live_guard")
+                self.assertEqual((router.calls, router.reserved_cost, transport.calls), (0, 0, []))
+
+    def test_unknown_prompt_version_is_rejected_before_http(self):
+        for kind in ("quiz", "direct"):
+            transport = FakeTransport({})
+            with self.assertRaises((ValueError, ProviderFailure)):
+                self.router(transport).invoke(kind, **self.arguments(kind, version="pilot-v99"))
+            self.assertEqual(transport.calls, [])
+
+    def test_v2_missing_settings_and_wrong_question_count_fail_closed(self):
+        config = self.config()
+        config["questions_per_video"] = 2
+        transport = FakeTransport({})
+        with self.assertRaises((ValueError, ProviderFailure)):
+            self.router(transport, config).invoke("quiz", **self.arguments())
+        self.assertEqual(transport.calls, [])
+
+    def test_v2_grounding_request_is_identical_and_has_no_thinking_override(self):
+        config = self.config()
+        v2 = self.router(FakeTransport({}), config, reasoning_effort=None)
+        legacy = self.router(FakeTransport({}))
+        arguments = dict(video=VIDEO, model="gemini-3.8-flash", promptVersion="video-grounding-v2")
+        transport = FakeTransport(gemini_response(GROUNDING))
+        v2.transport = transport
+        v2.invoke("grounding", **arguments)
+        self.assertEqual(transport.calls[0][2], legacy._request("gemini", "grounding", **arguments))
+        self.assertEqual(transport.calls[0][2]["generation_config"], {"max_output_tokens": 2000})
+
+    def test_v2_gemini_thinking_override_mismatch_and_match(self):
+        for kind in ("quiz", "direct"):
+            transport = FakeTransport(gemini_response(dict(QUIZ, promptVersion="pilot-v2")))
+            with self.assertRaises(ProviderFailure):
+                self.router(transport, self.config(), thinking_level="high").invoke(kind, **self.arguments(kind))
+            self.assertEqual(transport.calls, [])
+            self.router(transport, self.config(), thinking_level="medium").invoke(kind, **self.arguments(kind))
+            self.assertEqual(len(transport.calls), 1)
+
+    def test_v2_invalid_generation_settings_are_rejected_without_reservation(self):
+        for settings in ({"thinking_level": "high"}, {"thinking_level": None},
+                         {"thinking_level": "medium", "temperature": 1}):
+            config = self.config()
+            config["quiz_generation"]["models"][0]["generation_settings"] = settings
+            transport = FakeTransport({})
+            router = self.router(transport, config)
+            with self.assertRaises(ValueError):
+                router.invoke("direct", **self.arguments("direct"))
+            self.assertEqual((router.calls, router.reserved_cost, transport.calls), (0, 0, []))
+        config = self.config()
+        config["quiz_generation"]["models"][0].pop("generation_settings", None)
+        with self.assertRaises((ValueError, ProviderFailure)):
+            self.router(transport, config).invoke("quiz", **self.arguments())
+        self.assertEqual(transport.calls, [])
+
+    def test_cli_v2_settings_are_resolved_or_rejected_before_runner(self):
+        from src.pilot_runner import main
+        for model, option in (("gpt-5.4-mini", "--reasoning-effort"), ("gemini-3.8-flash", "--thinking-level")):
+            for value in (None, "medium", "low"):
+                config = self.config()
+                runner = mock.Mock(config=config)
+                runner.run_quiz.return_value = {"runId": "offline-test", "apiStatus": "not_run", "errorCategory": None}
+                with tempfile.TemporaryDirectory() as folder:
+                    content_file = Path(folder) / "content.txt"
+                    content_file.write_text(CONTENT, encoding="utf-8")
+                    argv = ["pilot_runner", "quiz", "--video-id", VIDEO["videoId"], "--model", model,
+                            "--repetition", "1", "--live", "--content-file", str(content_file),
+                            "--source-grounding-run-id", "a" * 32, "--call-limit", "1", "--retry-attempts", "0",
+                            "--timeout-seconds", "10", "--per-call-cost-limit", "1", "--total-cost-limit", "1",
+                            "--max-output-tokens", "2000", "--quiz-estimated-input-tokens", "10000",
+                            "--input-price-per-million", "1", "--output-price-per-million", "1", "--pricing-reference", "test"]
+                    if value is not None:
+                        argv += [option, value]
+                    with mock.patch.object(sys, "argv", argv), mock.patch("src.pilot_runner.PilotRunner", return_value=runner), \
+                         mock.patch("src.provider_adapters.urllib_transport") as transport, contextlib.redirect_stdout(io.StringIO()):
+                        if value == "low":
+                            with self.assertRaises(ProviderFailure):
+                                main()
+                            runner.run_quiz.assert_not_called()
+                        else:
+                            main()
+                            router = runner.run_quiz.call_args.args[4]
+                            effective = router.execution_policy("quiz", model, "pilot-v2")
+                            self.assertEqual(getattr(effective, "reasoning_effort" if model.startswith("gpt") else "thinking_level"), "medium")
+                        transport.assert_not_called()
+
+
 class ProviderAdapterTest(unittest.TestCase):
     @staticmethod
     def temporary_runner(folder):
