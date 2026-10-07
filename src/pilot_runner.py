@@ -1,6 +1,9 @@
 """One-condition Pilot runner. Live HTTP requires explicit safety options."""
 
 import argparse
+import contextlib
+import errno
+import functools
 import hashlib
 import json
 import math
@@ -43,7 +46,23 @@ class FixtureProvider:
         return response
 
 
+# errno of an already held results lock: msvcrt.locking(LK_NBLCK) reports EACCES; flock(LOCK_NB)
+# reports EWOULDBLOCK (EAGAIN on Linux). Any other lock error is a real failure, not a busy lock.
+_LOCK_BUSY_ERRNOS = frozenset({errno.EACCES} if os.name == "nt" else {errno.EAGAIN, errno.EWOULDBLOCK})
+
+
+def _exclusive(method):
+    """Run a result mutation while holding the results-directory lock (see PilotRunner._results_lock)."""
+    @functools.wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._results_lock():
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class PilotRunner:
+    # Results-directory lock file; not a result artifact and never read as one.
+    LOCK_FILE = ".pilot.lock"
     FILES = {
         "video_grounding": "video-grounding.jsonl",
         "quiz_generation": "quiz-generation.jsonl",
@@ -66,6 +85,42 @@ class PilotRunner:
         if resolved != safe_root and safe_root not in resolved.parents:
             raise ValueError("The results directory must be inside repository/results")
         return resolved
+
+    @contextlib.contextmanager
+    def _results_lock(self):
+        """Exclusive, non-blocking OS lock for one results directory.
+
+        Only one Pilot mutation (integrity check, Provider call, artifact and summary writes) runs
+        per results directory; a concurrent one fails at once instead of waiting. The operating
+        system releases the lock when the process ends, so the lock file existing means nothing.
+        This serializes mutations only: a crash mid-operation is still caught by the integrity check.
+        """
+        self._safe_results_path(self.results)
+        self.results.mkdir(parents=True, exist_ok=True)
+        path = self.results / self.LOCK_FILE
+        if path.is_symlink():
+            raise ValueError("The results lock file must not be a link")
+        with open(path, "a+b") as handle:
+            handle.seek(0)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno not in _LOCK_BUSY_ERRNOS:
+                    raise
+                raise ValueError("Another Pilot operation is already in progress for this results directory") from exc
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
     def _jsonl(path):
@@ -423,6 +478,7 @@ class PilotRunner:
                 or hashlib.sha256(content_text.encode("utf-8")).hexdigest() != approved_hash):
             raise ValueError("Quiz contentText must match approved Grounding contentText")
 
+    @_exclusive
     def approve_content(self, source_grounding_run_id, approved_by):
         """Explicit human-review action; never called by a benchmark run."""
         if (not isinstance(source_grounding_run_id, str)
@@ -469,6 +525,7 @@ class PilotRunner:
         self._rewrite_grounding_row(result_file, lines, index, row)
         return row
 
+    @_exclusive
     def review_grounding(self, source_grounding_run_id, reviewed_by, checklist):
         """Explicit human Grounding review; never called by a benchmark run.
 
@@ -631,6 +688,7 @@ class PilotRunner:
             return []
         return successful_review_candidates(self._jsonl(result_file), grounding_condition(row))
 
+    @_exclusive
     def run_grounding(self, video_id, method, repetition, provider, authorized_transcript=None):
         return self._run_grounding(video_id, method, repetition, provider, authorized_transcript)[0]
 
@@ -699,7 +757,11 @@ class PilotRunner:
             row["validatorStatus"] = "fail"
             row["errorCategory"] = "quiz_contract_error"
 
+    @_exclusive
     def run_quiz(self, video_id, model, repetition, content_text, provider, source_grounding_run_id=None):
+        return self._run_quiz(video_id, model, repetition, content_text, provider, source_grounding_run_id)
+
+    def _run_quiz(self, video_id, model, repetition, content_text, provider, source_grounding_run_id=None):
         self._check(video_id, repetition)
         models = {item["id"] for item in self.config["quiz_generation"]["models"]}
         if model not in models or not isinstance(content_text, str) or not content_text.strip():
@@ -730,6 +792,7 @@ class PilotRunner:
             self._failure(row, provider, exc, started, response)
             return self._save(row)
 
+    @_exclusive
     def run_end_to_end(self, video_id, method, repetition, provider, authorized_transcript=None):
         self._check(video_id, repetition)
         methods = {item["id"]: item for item in self.config["end_to_end"]["methods"]}
@@ -771,8 +834,8 @@ class PilotRunner:
             row["totalLatencyMs"] = grounding["latencyMs"]
             row["totalEstimatedCostUsd"] = grounding["estimatedCostUsd"]
             return self._save(row)
-        quiz = self.run_quiz(video_id, row["model"], repetition, content, provider,
-                             source_grounding_run_id=grounding["runId"])
+        quiz = self._run_quiz(video_id, row["model"], repetition, content, provider,
+                              source_grounding_run_id=grounding["runId"])
         row["quizRunId"] = quiz["runId"]
         row["apiStatus"] = quiz["apiStatus"]
         row["errorCategory"] = quiz["errorCategory"]

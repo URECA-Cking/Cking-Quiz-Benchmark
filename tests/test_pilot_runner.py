@@ -1,10 +1,15 @@
+import errno
 import json
 import hashlib
 import math
 import os
+import queue
 import shutil
+import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -761,7 +766,9 @@ class PilotRunnerTest(unittest.TestCase):
 
     def test_grounding_from_another_results_directory_is_rejected(self):
         def snapshot(directory):
-            return {path: path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+            # The results lock file is not a result; a refused operation may still create it.
+            return {path: path.read_bytes() for path in directory.rglob("*")
+                    if path.is_file() and path.name != PilotRunner.LOCK_FILE}
 
         custom = PilotRunner(self.repository, self.results / "custom")
         default_source = self.approved_source()
@@ -1091,7 +1098,9 @@ class PilotV2GroundingReviewTest(unittest.TestCase):
         return [json.loads(line) for line in self.grounding_file().read_text(encoding="utf-8").splitlines()]
 
     def snapshot(self):
-        return {path: path.read_bytes() for path in self.repository.rglob("*") if path.is_file()}
+        # The results lock file is not a result; a refused operation may still create it.
+        return {path: path.read_bytes() for path in self.repository.rglob("*")
+                if path.is_file() and path.name != PilotRunner.LOCK_FILE}
 
     def grounding(self, runner=None, video_id=VIDEO, repetition=1):
         provider = SimulatedApiFixture({"grounding": {"normalized": GROUNDING, "responseBody": FIXTURE_RAW}})
@@ -1360,7 +1369,7 @@ class PilotV2GroundingReviewTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "not a known Grounding prompt version"):
                         runner.run_grounding(VIDEO, "gemini_video", 1, provider)
                     self.assertEqual(provider.calls, [])
-                self.assertFalse(self.results.exists())
+                self.assertEqual([path.name for path in self.results.rglob("*")], [PilotRunner.LOCK_FILE])
 
     def test_stored_grounding_prompt_version_must_be_legacy_null_or_known(self):
         stored = self.grounding(self.v1, video_id="nasa-methane-2020")  # rows[0], the row edited below
@@ -1469,6 +1478,233 @@ class PilotV2GroundingReviewTest(unittest.TestCase):
         self.v1._check_storage_integrity()
         quiz, provider = self.quiz("gpt-5.4-mini", legacy["runId"], runner=self.v1, quiz=QUIZ)
         self.assertEqual((quiz["apiStatus"], len(provider.calls)), ("success", 1))
+
+
+class BlockingProvider(SimulatedApiFixture):
+    """Fake API that holds the operation inside its critical section until released."""
+
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def invoke(self, kind, **kwargs):
+        self.entered.set()
+        if not self.release.wait(timeout=10):
+            raise AssertionError("BlockingProvider was never released")
+        return super().invoke(kind, **kwargs)
+
+
+BUSY = "already in progress for this results directory"
+GROUNDED = {"grounding": {"normalized": GROUNDING, "responseBody": FIXTURE_RAW}}
+
+
+class PilotResultsLockTest(unittest.TestCase):
+    """One Pilot mutation per results directory; a concurrent one fails fast (fake Providers only)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.repository = Path(self.temp.name)
+        (self.repository / "configs").mkdir()
+        (self.repository / "data").mkdir()
+        for name in ("pilot.yaml", "pilot-v2.yaml"):
+            shutil.copyfile(ROOT / "configs" / name, self.repository / "configs" / name)
+        shutil.copyfile(ROOT / "data" / "videos.jsonl", self.repository / "data" / "videos.jsonl")
+        self.results = self.repository / "results"
+        self.pool = ThreadPoolExecutor(max_workers=2)
+
+    def tearDown(self):
+        self.pool.shutdown(wait=True)
+        self.temp.cleanup()
+
+    def runner(self, results=None):
+        # A separate instance per caller, like a separate CLI process using the same directory.
+        return PilotRunner(self.repository, results or self.results, self.repository / "configs" / "pilot-v2.yaml")
+
+    def grounding_rows(self, results=None):
+        path = (results or self.results) / "video-grounding.jsonl"
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def artifacts(self, results=None):
+        results = results or self.results
+        return {name: sorted(path.stem for path in (results / name).glob("*.json")) for name in ("raw", "evaluation")}
+
+    def hold(self, call, provider):
+        """Start ``call`` in another thread and wait until it is inside the locked operation."""
+        future = self.pool.submit(call)
+        self.assertTrue(provider.entered.wait(timeout=10))
+        return future
+
+    def test_concurrent_same_condition_grounding_runs_only_once(self):
+        first, second = BlockingProvider(GROUNDED), SimulatedApiFixture(GROUNDED)
+        future = self.hold(lambda: self.runner().run_grounding(VIDEO, "gemini_video", 1, first), first)
+        with self.assertRaisesRegex(ValueError, BUSY):
+            self.runner().run_grounding(VIDEO, "gemini_video", 1, second)
+        first.release.set()
+        row = future.result(timeout=10)
+        self.assertEqual((len(first.calls), second.calls), (1, []))
+        rows = self.grounding_rows()
+        self.assertEqual([(item["runId"], item["apiStatus"], item["attempt"]) for item in rows],
+                         [(row["runId"], "success", 1)])
+        self.assertEqual(self.artifacts(), {"raw": [row["runId"]], "evaluation": [row["runId"]]})
+        self.assertEqual(len(grounding_review.successful_review_candidates(
+            rows, grounding_review.grounding_condition(row))), 1)
+        self.runner()._check_storage_integrity()  # no orphan artifact
+        # After the lock is released, the terminal-success rule still refuses the same condition.
+        with self.assertRaisesRegex(ValueError, "successful Grounding already exists"):
+            self.runner().run_grounding(VIDEO, "gemini_video", 1, second)
+        self.assertEqual(second.calls, [])
+
+    def test_simultaneous_start_allows_exactly_one_generation(self):
+        barrier = threading.Barrier(2)
+        providers = [SimulatedApiFixture(GROUNDED), SimulatedApiFixture(GROUNDED)]
+
+        def start(provider):
+            runner = self.runner()
+            barrier.wait(timeout=10)
+            try:
+                return runner.run_grounding(VIDEO, "gemini_video", 1, provider)["apiStatus"]
+            except ValueError as exc:
+                return str(exc)
+
+        outcomes = [future.result(timeout=10) for future in
+                    [self.pool.submit(start, provider) for provider in providers]]
+        # The loser is refused by the lock, or, if the winner already finished, by terminal success.
+        self.assertEqual(sum(len(provider.calls) for provider in providers), 1)
+        self.assertEqual(outcomes.count("success"), 1)
+        self.assertTrue(any(BUSY in item or "successful Grounding already exists" in item
+                            for item in outcomes if item != "success"))
+        self.assertEqual(len(self.grounding_rows()), 1)
+        self.runner()._check_storage_integrity()
+
+    def test_concurrent_reviews_store_exactly_one_review(self):
+        candidate = self.runner().run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(GROUNDED))
+        entered, release = threading.Event(), threading.Event()
+        original = PilotRunner._rewrite_grounding_row
+
+        def held_rewrite(result_file, lines, index, row):
+            entered.set()
+            self.assertTrue(release.wait(timeout=10))
+            return original(result_file, lines, index, row)
+
+        with mock.patch.object(PilotRunner, "_rewrite_grounding_row", staticmethod(held_rewrite)):
+            future = self.pool.submit(self.runner().review_grounding, candidate["runId"], "reviewer-a", ALL_PASS)
+            self.assertTrue(entered.wait(timeout=10))
+            with self.assertRaisesRegex(ValueError, BUSY):
+                self.runner().review_grounding(candidate["runId"], "reviewer-b",
+                                               dict(ALL_PASS, factualAccuracy="fail"))
+            release.set()
+            reviewed = future.result(timeout=10)
+        stored = self.grounding_rows()
+        self.assertEqual(stored, [reviewed])
+        review = stored[0]["groundingReview"]
+        self.assertEqual((review["reviewedBy"], stored[0]["contentTextApprovalStatus"],
+                          stored[0]["approvedBy"], stored[0]["approvedAt"]),
+                         ("reviewer-a", "approved", "reviewer-a", review["reviewedAt"]))
+        self.runner()._check_storage_integrity()
+        with self.assertRaisesRegex(ValueError, "never overwritten"):
+            self.runner().review_grounding(candidate["runId"], "reviewer-b", dict(ALL_PASS, factualAccuracy="fail"))
+        self.assertEqual(self.grounding_rows(), [reviewed])
+
+    def test_different_operations_never_overlap_and_keep_every_row(self):
+        source = self.runner().run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(GROUNDED))
+        self.runner().review_grounding(source["runId"], APPROVER, ALL_PASS)
+        quiz = {"quiz": {"normalized": dict(QUIZ, promptVersion="pilot-v2"), "responseBody": FIXTURE_RAW}}
+        quiz_a, quiz_b = BlockingProvider(quiz), SimulatedApiFixture(quiz)
+        future = self.hold(lambda: self.runner().run_quiz(VIDEO, "gemini-3.8-flash", 1, CONTENT, quiz_a,
+                                                          source_grounding_run_id=source["runId"]), quiz_a)
+        other = SimulatedApiFixture(GROUNDED)
+        for blocked in (lambda: self.runner().run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, quiz_b,
+                                                       source_grounding_run_id=source["runId"]),
+                        lambda: self.runner().run_grounding("nasa-methane-2020", "gemini_video", 1, other),
+                        lambda: self.runner().approve_content(source["runId"], APPROVER),
+                        lambda: self.runner().run_end_to_end(VIDEO, "gemini_direct_quiz", 1, other)):
+            with self.assertRaisesRegex(ValueError, BUSY):
+                blocked()
+        quiz_a.release.set()
+        first = future.result(timeout=10)
+        self.assertEqual((quiz_b.calls, other.calls), ([], []))
+        second = self.runner().run_quiz(VIDEO, "gpt-5.4-mini", 1, CONTENT, quiz_b,
+                                        source_grounding_run_id=source["runId"])
+        quiz_rows = [json.loads(line) for line in
+                     (self.results / "quiz-generation.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([row["runId"] for row in quiz_rows], [first["runId"], second["runId"]])
+        self.runner()._check_storage_integrity()
+
+    def test_lock_is_released_after_success_and_after_exceptions(self):
+        runner = self.runner()
+        runner.run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(GROUNDED))
+
+        class Interrupted(SimulatedApiFixture):
+            def invoke(self, kind, **kwargs):
+                raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):  # escapes the operation, not a recorded failure
+            runner.run_grounding("nasa-methane-2020", "gemini_video", 1, Interrupted({}))
+        with self.assertRaisesRegex(ValueError, "Unknown Pilot videoId"):
+            runner.run_grounding("unknown-video", "gemini_video", 1, SimulatedApiFixture(GROUNDED))
+        # No stale lock: the next operation acquires it normally.
+        row = self.runner().run_grounding("nasa-methane-2020", "gemini_video", 1, SimulatedApiFixture(GROUNDED))
+        self.assertEqual(row["apiStatus"], "success")
+        self.assertTrue((self.results / PilotRunner.LOCK_FILE).is_file())  # existing file is not a lock
+
+    def test_only_lock_contention_is_reported_as_busy(self):
+        with self.runner()._results_lock():
+            with self.assertRaisesRegex(ValueError, BUSY):  # real contention from another handle
+                with self.runner()._results_lock():
+                    self.fail("the lock must not be granted twice")
+        failure = OSError(errno.EIO, "simulated lock I/O failure")
+        with mock.patch("msvcrt.locking" if os.name == "nt" else "fcntl.flock", side_effect=failure):
+            with self.assertRaises(OSError) as raised:
+                with self.runner()._results_lock():
+                    self.fail("the lock must not be granted after a lock error")
+        self.assertIs(raised.exception, failure)  # not disguised as a concurrent operation
+        with self.runner()._results_lock():  # the failed attempt left no lock behind
+            pass
+
+    def test_results_lock_holds_across_processes(self):
+        child_code = textwrap.dedent("""
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, sys.argv[1])
+            from src.pilot_runner import PilotRunner
+            with PilotRunner(Path(sys.argv[2]), Path(sys.argv[3]))._results_lock():
+                print("locked", flush=True)
+                sys.stdin.readline()
+            print("released", flush=True)
+        """)
+        child = subprocess.Popen([sys.executable, "-c", child_code, str(ROOT), str(self.repository), str(self.results)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        lines = queue.Queue()
+        reader = threading.Thread(target=lambda: [lines.put(line.strip()) for line in child.stdout], daemon=True)
+        reader.start()
+        try:
+            self.assertEqual(lines.get(timeout=30), "locked")  # handshake: the child holds the OS lock
+            provider = FixtureProvider({"grounding": {"raw": GROUNDING}})
+            with self.assertRaisesRegex(ValueError, BUSY):
+                self.runner().run_grounding(VIDEO, "gemini_video", 1, provider)
+            self.assertEqual(provider.calls, [])
+            self.assertEqual([path.name for path in self.results.rglob("*")], [PilotRunner.LOCK_FILE])
+            child.stdin.write("\n")
+            child.stdin.flush()
+            self.assertEqual(lines.get(timeout=30), "released")
+            self.assertEqual(child.wait(timeout=30), 0)
+            with self.runner()._results_lock():  # released by the other process: acquired again
+                pass
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=30)
+            reader.join(timeout=30)
+            child.stdin.close()
+            child.stdout.close()
+
+    def test_different_results_directories_do_not_block_each_other(self):
+        first_dir, second_dir = self.results / "first", self.results / "second"
+        holder = BlockingProvider(GROUNDED)
+        future = self.hold(lambda: self.runner(first_dir).run_grounding(VIDEO, "gemini_video", 1, holder), holder)
+        row = self.runner(second_dir).run_grounding(VIDEO, "gemini_video", 1, SimulatedApiFixture(GROUNDED))
+        holder.release.set()
+        self.assertEqual((row["apiStatus"], future.result(timeout=10)["apiStatus"]), ("success", "success"))
 
 
 if __name__ == "__main__":

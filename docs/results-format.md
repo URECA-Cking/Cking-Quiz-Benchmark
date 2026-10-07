@@ -2,7 +2,7 @@
 
 실제 결과 파일은 저장소의 Git-ignore된 `results/` 안에 저장하며 Git에 올리지 않습니다. 다른 저장소 경로나 저장소 밖 경로는 실행기가 거부합니다. `results/raw/<runId>.json`에는 완료 상태, Provider 이름, 숫자형 token usage만 기록하고 fixture는 식별 표지만 기록합니다. 자유형 모델 출력은 raw metadata에 넣지 않고 `results/evaluation/<runId>.json`에 normalized 평가 데이터로 별도 저장합니다. 평가 데이터에는 입력에서 반사된 민감정보가 있을 수 있으므로 공유 전 검토해야 합니다. 각 JSONL 행은 [`run-result.schema.json`](run-result.schema.json)의 세 결과 유형 중 하나입니다. 현재 실행기는 fixture 기본값이며 명시적인 live 옵션·상한을 제공한 한 조건에서만 Provider 호출을 허용합니다. fixture와 로컬 transcript는 `apiStatus=not_run`, API latency·token·cost는 `null`로 기록합니다. fixture가 모의한 오류는 `errorCategory=fixture_...`로 구분합니다. `--total-cost-limit`은 한 CLI 실행의 추정 비용 guard로, 실제 청구액이나 여러 실행에 걸친 누적 상한이 아닙니다.
 
-Pilot 실행은 한 번에 하나씩 순차적으로 수행하며 실행 중에는 `approve_content`를 호출하지 않습니다. 여러 실행의 동시 저장은 지원하지 않습니다. 저장 전 기존 JSONL과 필수 연결 파일을 검사하고 손상·부분 저장 흔적을 발견하면 자동 복구하거나 삭제하지 않고 다음 실행을 중단합니다. 개별 raw/evaluation JSON과 summary JSONL은 같은 디렉터리의 임시 파일을 완성한 뒤 교체하지만, 여러 파일을 하나의 원자적 transaction으로 저장하는 것은 아닙니다. API 응답 후 저장 완료 전 종료 시 실행 기록이 남지 않을 수도 있습니다.
+Pilot 실행은 한 번에 하나씩 순차적으로 수행합니다. 같은 results 디렉터리에서는 결과를 바꾸는 작업(`run_grounding`, `run_quiz`, `run_end_to_end`, `approve_content`, `review_grounding`)을 한 번에 하나만 허용합니다. 두 번째 작업은 기다리지 않고 results 디렉터리의 `.pilot.lock` OS 잠금(Windows `msvcrt.locking`, POSIX `fcntl.flock`)을 얻는 단계에서 바로 거부되며, Provider 호출과 결과 기록을 하지 않습니다. 잠금은 작업이 끝나거나 프로세스가 종료되면 OS가 해제하므로 `.pilot.lock` 파일이 남아 있다는 것만으로 잠긴 상태는 아닙니다. 서로 다른 results 디렉터리는 서로 막지 않습니다. 이는 동시 실행을 지원한다는 뜻이 아니라 겹친 작업을 거부한다는 뜻이며, 네트워크 파일 시스템에서의 잠금 동작은 보장하지 않습니다. 저장 전 기존 JSONL과 필수 연결 파일을 검사하고 손상·부분 저장 흔적을 발견하면 자동 복구하거나 삭제하지 않고 다음 실행을 중단합니다. 개별 raw/evaluation JSON과 summary JSONL은 같은 디렉터리의 임시 파일을 완성한 뒤 교체하지만, 여러 파일을 하나의 원자적 transaction으로 저장하는 것은 아닙니다. API 응답 후 저장 완료 전 종료 시 실행 기록이 남지 않을 수도 있습니다.
 
 ## 분리된 실행 결과
 
