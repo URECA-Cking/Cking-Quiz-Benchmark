@@ -175,6 +175,18 @@ QUIZ_PROMPTS = {
 }
 
 
+# Production Quiz prompts are kept apart from the Pilot ones so a Pilot config can never select them
+# (validate_quiz_config only knows QUIZ_PROMPTS) and Pilot request history stays unchanged.
+PRODUCTION_QUIZ_PROMPTS = {
+    "production-quiz-v1": ("한국어 4지선다 퀴즈를 정확히 3문항 생성하세요. 각 문항은 4개 보기를 갖습니다. "
+                           "correctOptionIndex는 0-based입니다. promptVersion은 production-quiz-v1입니다. "
+                           "제공된 contentText만 사실 근거로 사용하고 그 밖의 지식으로 내용을 추가하지 마세요. "
+                           "정답 근거인 sourceEvidence는 contentText에 실제로 있는 문장을 따옴표 없이 그대로 인용하세요."),
+}
+# Prompt versions with exactly 3 questions, 4 options and a config-controlled Gemini thinking level.
+CONTROLLED_QUIZ_PROMPT_VERSIONS = frozenset({"pilot-v2", "production-quiz-v1"})
+
+
 def validate_quiz_config(config):
     """Bind v2's recorded prompt version to its fixed generation conditions."""
     version = config.get("prompt_version")
@@ -338,9 +350,32 @@ class ProviderRouter:
                 if supplied is not None and supplied != settings[field]:
                     raise ProviderFailure("live_guard")
                 policy = replace(policy, **{field: settings[field]})
+        elif self.config.get("prompt_version") in PRODUCTION_QUIZ_PROMPTS:
+            # Production Quiz config (src/production_quiz.py): Quiz only, settings come from the config.
+            if kind != "quiz" or prompt_version != self.config["prompt_version"]:
+                raise ProviderFailure("invalid_input")
+            entry = next((item for item in self.config["quiz_generation"]["models"] if item["id"] == model), None)
+            if entry is None or entry["provider"] != "gemini":
+                raise ProviderFailure("unsupported_provider")
+            supplied = policy.thinking_level
+            expected = entry["generation_settings"]["thinking_level"]
+            if supplied is not None and supplied != expected:
+                raise ProviderFailure("live_guard")
+            # The output token cap changes the request, so it must be the configured one.
+            if policy.max_output_tokens != entry["generation_settings"]["max_output_tokens"]:
+                raise ProviderFailure("live_guard")
+            policy = replace(policy, thinking_level=expected)
         elif kind in ("quiz", "direct") and prompt_version != self.config.get("prompt_version"):
             raise ProviderFailure("invalid_input")
         return policy
+
+    def request_settings(self, kind, model, prompt_version):
+        """The production Quiz generation settings this router would put in the request; no HTTP."""
+        entry = self.models.get(model)
+        if entry is None or kind not in entry["kinds"] or self.config.get("prompt_version") not in PRODUCTION_QUIZ_PROMPTS:
+            raise ProviderFailure("unsupported_provider")
+        policy = self.execution_policy(kind, model, prompt_version)
+        return {"thinking_level": policy.thinking_level, "max_output_tokens": policy.max_output_tokens}
 
     def invoke(self, kind, **kwargs):
         model = kwargs.get("model")
@@ -447,19 +482,22 @@ class ProviderRouter:
         else:
             question_count, option_count = kwargs.get("questionCount"), kwargs.get("optionCount")
             prompt_version = kwargs.get("promptVersion")
+            prompts = PRODUCTION_QUIZ_PROMPTS if prompt_version in PRODUCTION_QUIZ_PROMPTS else QUIZ_PROMPTS
             if (type(question_count) is not int or question_count < 1 or type(option_count) is not int
-                    or option_count < 2 or not isinstance(prompt_version, str) or prompt_version not in QUIZ_PROMPTS
-                    or (prompt_version == "pilot-v2" and (question_count != 3 or option_count != 4))):
+                    or option_count < 2 or not isinstance(prompt_version, str) or prompt_version not in prompts
+                    or (prompt_version in CONTROLLED_QUIZ_PROMPT_VERSIONS
+                        and (question_count != 3 or option_count != 4))
+                    or (prompt_version in PRODUCTION_QUIZ_PROMPTS and kind != "quiz")):
                 raise ProviderFailure("invalid_input")
-            prompt = QUIZ_PROMPTS[prompt_version].format(question_count=question_count,
-                                                       option_count=option_count, prompt_version=prompt_version)
+            prompt = prompts[prompt_version].format(question_count=question_count,
+                                                    option_count=option_count, prompt_version=prompt_version)
             schema = quiz_schema()
         if provider == "gemini":
             input_parts = ([{"type": "video", "uri": source, "processing": self.policy.video_processing}]
                            if kind != "quiz" else [])
             input_parts.append({"type": "text", "text": prompt + ("\n" + source if kind == "quiz" else "")})
             generation = {"max_output_tokens": policy.max_output_tokens}
-            if kind in ("quiz", "direct") and kwargs["promptVersion"] == "pilot-v2":
+            if kind in ("quiz", "direct") and kwargs["promptVersion"] in CONTROLLED_QUIZ_PROMPT_VERSIONS:
                 generation["thinking_level"] = policy.thinking_level
             return {"model": model, "input": input_parts, "store": False,
                     "response_format": {"type": "text", "mime_type": "application/json", "schema": schema},

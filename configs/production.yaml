@@ -1,0 +1,21 @@
+production:
+  # Production Quiz generation (Issue #39), separate from the Pilot configs. The Quiz input is the
+  # exact contentText of a Grounding that passed production machine eligibility (src/production_grounding.py);
+  # Pilot Human approval, repetitions and the fixed-content manifest are not used.
+  grounding_validation_version: production-grounding-validation-v1
+  quiz_generation:
+    method: fixed_content_text
+    # Gemini Quiz of the A-based production structure (docs/selection.md 8장); the same model, thinking
+    # level and output token cap (--max-output-tokens 8192, docs/selection.md 6장) as the Pilot v2 Quiz A
+    # condition. These settings are part of the input fingerprint, and the Provider's live policy must
+    # match them before any call.
+    model: gemini-3.8-flash
+    provider: gemini
+    api_key_environment_variable: GEMINI_API_KEY
+    generation_settings:
+      thinking_level: medium
+      max_output_tokens: 8192
+    prompt_version: production-quiz-v1
+    output_contract_version: production-quiz-output-v1
+    questions_per_quiz: 3
+    options_per_question: 4
