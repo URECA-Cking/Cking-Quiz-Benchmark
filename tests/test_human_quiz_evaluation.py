@@ -90,14 +90,14 @@ class HumanQuizEvaluationTest(unittest.TestCase):
 
     # ----- fixtures ------------------------------------------------------------------------
 
-    def grounding(self, video_id, repetition=1):
+    def grounding(self, video_id, repetition=1, content=CONTENT):
         row = self.v2.run_grounding(video_id, "gemini_video", repetition,
-                                    answer("grounding", {"contentText": CONTENT, "facts": []}))
+                                    answer("grounding", {"contentText": content, "facts": []}))
         self.v2.review_grounding(row["runId"], "grounding-reviewer", REVIEW)
         return row["runId"]
 
-    def quiz(self, model, video_id, source, payload=None, provider=None, repetition=1):
-        return self.v2.run_quiz(video_id, model, repetition, CONTENT, provider or answer("quiz", payload or quiz()),
+    def quiz(self, model, video_id, source, payload=None, provider=None, repetition=1, content=CONTENT):
+        return self.v2.run_quiz(video_id, model, repetition, content, provider or answer("quiz", payload or quiz()),
                                 source_grounding_run_id=source)
 
     def direct(self, video_id, provider, repetition=1):
@@ -254,6 +254,27 @@ class HumanQuizEvaluationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "More than one API success"):
             self.tool.create_session("dup")
         self.assertFalse((self.results / "human").exists())
+
+    def test_each_repetition_uses_its_own_approved_grounding(self):
+        contents = {1: CONTENT, 2: CONTENT + " 관측 자료는 몇 시간 안에 과학자에게 전달된다."}
+        expected = {}
+        for repetition, content in contents.items():
+            source = self.grounding(KARI, repetition, content)
+            for condition, model in (("A", GEMINI), ("B", OPENAI)):
+                row = self.quiz(model, KARI, source, repetition=repetition, content=content)
+                expected[(condition, repetition)] = (row["runId"], source,
+                                                     hashlib.sha256(content.encode("utf-8")).hexdigest())
+            row = self.direct(KARI, answer("direct", quiz("global rain and snow")), repetition)
+            expected[("C", repetition)] = (row["runId"], None, None)
+        session_id = self.tool.create_session("repetitions")
+        session = self.load(session_id, "session.json")
+        items = {(item["condition"], item["repetition"]): item for item in session["items"] if item["videoId"] == KARI}
+        self.assertEqual({key: (item["runId"], item.get("sourceGroundingRunId"), item.get("contentTextSha256"))
+                          for key, item in items.items()}, expected)
+        evaluation = self.tool.import_evaluation(session_id, filled(self.load(session_id, "blind-export.json")),
+                                                 "reviewer-a")
+        imported = {item["runId"] for item in evaluation["sets"]}
+        self.assertTrue({run_id for run_id, _, _ in expected.values()} <= imported)
 
     def test_unverifiable_ab_source_fails_closed(self):
         path = self.results / "quiz-generation.jsonl"

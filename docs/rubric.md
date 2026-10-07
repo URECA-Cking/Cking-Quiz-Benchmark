@@ -41,7 +41,7 @@ v2 Grounding은 사람이 아래 다섯 항목을 각각 `pass`, `fail`, `uncert
 
 Pilot v2 Quiz A/B·Direct C는 정확히 3문항을 요청하되 schema 배열 길이로 강제하지 않습니다. 실제 `questionCount != 3`은 API 성공 이후의 reliability/계약 실패(`validatorStatus=fail`)로 기록합니다. parsing·계약·사람 품질 판정이 실패해도 해당 조건에 `apiStatus=success`가 있으면 다시 생성하지 않습니다. technical `apiStatus=error`만 다음 live attempt를 허용합니다. 공식 v2 Quiz·Direct live는 내부 HTTP retry 없이(`retry_attempts=0`) 실행합니다. Grounding technical retry는 Issue #23에서 변경하지 않습니다. Provider별 thinking/reasoning medium은 동일한 추론량을 뜻하지 않습니다. pilot-v1의 평가와 실행 정책은 유지합니다.
 
-영상별로 **한 번 고정한 동일 `contentText`와 해시**, 같은 질문 3개·보기 4개·프롬프트 버전·출력 계약을 `gemini-3.8-flash`와 `gpt-5.4-mini`에 제공합니다. 모델별 입력 텍스트가 달라지면 생성 모델 비교로 집계하지 않습니다. 출력은 같은 JSON/Parser/Validator 계약으로 평가합니다.
+**한 번 고정한 동일 `contentText`와 해시**(Pilot v1은 영상·prompt 버전별, Pilot v2는 영상·prompt 버전·repetition별로 같은 repetition의 승인 Grounding에서 고정하며 repetition마다 다를 수 있음), 같은 질문 3개·보기 4개·프롬프트 버전·출력 계약을 `gemini-3.8-flash`와 `gpt-5.4-mini`에 제공합니다. 모델별 입력 텍스트가 달라지면 생성 모델 비교로 집계하지 않습니다. 출력은 같은 JSON/Parser/Validator 계약으로 평가합니다.
 
 | 항목 | 자동 기록 | 사람 검수 |
 | --- | --- | --- |
