@@ -63,6 +63,22 @@ Pilot v2 Quiz A/B/C의 블라인드 Human Evaluation은 `results/human/<sessionI
 
 Pilot v2의 Human 판정 기준 자료는 `evaluation.json`입니다. Pilot v2 summary의 `questionReviews`는 실행 시 만든 빈 값 그대로 두며 Human 판정을 쓰지 않습니다. Pilot v1은 기존처럼 summary의 `questionReviews`가 기준입니다. Judge와 offline 집계는 아직 이 결과를 읽지 않습니다.
 
+## Production 자동 Grounding machine validation (Issue #37)
+
+Production 자동 Grounding은 사람 검수를 거치지 않으므로 Pilot의 Human 승인을 쓰지 않고, 별도의 versioned machine validation으로 production 사용 가능 여부를 판정합니다(`src/production_grounding.py`). Provider를 호출하지 않으며 저장된 결과를 읽기만 합니다.
+
+| 구분 | 의미 |
+| --- | --- |
+| Human 승인 (`contentTextApprovalStatus=approved`, `approvedBy`, `approvedAt`, `groundingReview`) | 사람이 원본 영상과 대조한 Pilot Grounding 검수를 통과했다는 Pilot 계약. 그대로 유지하며 machine validation이 읽거나 쓰지 않습니다. |
+| machine validation `pass` | 저장된 Grounding 결과가 해당 validation version의 구조·원천 식별·`contentText` hash·저장 무결성 계약을 통과했다는 뜻. production 사용 가능 판정의 전제입니다. |
+
+**Machine validation은 원본 영상 기준의 사실 정확성을 검증하지 않습니다.** 사실 정확성, 핵심 정보 포함, timestamp가 가리키는 실제 위치, `evidenceType`의 실제 일치를 확인하지 않으며, 통과한 `contentText`도 verified ground truth가 아닙니다. 구조적으로 올바르지만 영상과 다른 내용은 통과할 수 있습니다.
+
+- 대상 artifact: Grounding summary 행, `evaluation/<runId>.json`(`contentText`, `facts`), `raw/<runId>.json`(Provider 완료 metadata). validation version `production-grounding-validation-v1`은 `gemini_video` / `gemini-3.8-flash` / `video-grounding-v3` Grounding만 다룹니다(`model`이 없거나 다른 모델이면 거부).
+- 기록: Grounding 행에 필드를 추가하지 않고 별도 객체 `{status: pass|fail|not_run, version, groundingRunId, contentTextSha256, validatedAt, failureReasons}`로 만듭니다. `fail`에만 사유가 있고, `validatedAt`은 실제로 존재하는 canonical UTC 시각이어야 합니다. 이 기록을 어디에 저장할지는 Production Quiz 연결에서 정합니다. 기존 Pilot 결과는 migration하지 않습니다.
+- production 사용 가능 조건(`require_production_grounding_eligible`, 모두 만족해야 하며 아니면 사유와 함께 거부): 지원하는 validation version의 `pass` 기록이 같은 `runId`와 실제 `contentText` SHA-256을 가리킴, 요청한 `videoId`와 일치, `apiStatus=success`·`errorCategory=null`, raw metadata가 Pilot 저장과 같은 계약(`validate_raw_metadata`)을 만족하는 Gemini 완료 기록(fixture `not_run`과 Provider 미완료 거부), 비어 있지 않고 UTF-8로 표현할 수 있는 `contentText`, `facts` 필드가 배열로 존재(누락을 빈 배열로 보지 않음. `video-grounding-v3` 응답에 `facts`가 없으면 evaluation 파일에도 `facts` key를 쓰지 않음), 각 fact가 저장 계약(5개 key, 비어 있지 않은 문자열, `evidenceType` 허용값, timestamp는 `null` 또는 0 이상·순서·알려진 영상 길이 이내)을 만족, 행의 `groundingFacts`와 일치, 행의 `contentTextSha256`과 일치. 저장된 `pass`만 믿지 않고 artifact를 다시 검사합니다. Human 승인은 이 기록을 대신하지 않습니다.
+- 정하지 않은 정책: facts 최소 개수(빈 배열도 구조상 허용), `null` timestamp 금지 여부, `contentText` 최소 길이, 영상 길이 metadata가 없을 때의 정책(현재 계약처럼 상한 검사를 하지 않음), 의미·사실 검증, retry·재생성, Creator reject 이후 동작.
+
 ## LLM-as-a-Judge 결과
 
 A/B Quiz에 대한 사후 보조 평가(LLM-as-a-Judge) 결과는 `results/judge/<judgeRunId>/`에만 저장하며 위 세 JSONL과 `results/raw`, `results/evaluation`에는 쓰지 않습니다. 이 하위 디렉터리는 Pilot 저장 무결성 검사 대상이 아닙니다. Judge는 Pilot 결과와 Human Evaluation을 읽기만 합니다. 계약과 파일 구조는 [Judge 프로토콜](judge-protocol.md)을 따릅니다.

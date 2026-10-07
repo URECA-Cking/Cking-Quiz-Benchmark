@@ -24,7 +24,8 @@ from src.grounding_review import (build_review, derive_approval_status, groundin
                                   successful_review_candidates)
 from src.human_evaluation import require_valid_human_evaluation
 from src.provider_adapters import (GROUNDING_PROMPTS, STRING_TIMESTAMP_GROUNDING_VERSIONS,
-                                   validate_quiz_config, video_timestamp_seconds)
+                                   valid_grounding_fact, validate_quiz_config, validate_raw_metadata,
+                                   video_timestamp_seconds)
 from src.provider_failure import ProviderFailure
 
 
@@ -375,15 +376,7 @@ class PilotRunner:
 
     @staticmethod
     def _validate_raw_metadata(value):
-        if value is None or value == {"source": "fixture"}:
-            return
-        if (not isinstance(value, dict) or set(value) != {"status", "provider", "usage"}
-                or value["status"] != "completed" or value["provider"] not in ("gemini", "openai")
-                or not isinstance(value["usage"], dict)
-                or set(value["usage"]) != {"inputTokens", "outputTokens", "thinkingTokens", "toolUseTokens"}
-                or any(token is not None and (type(token) is not int or token < 0)
-                       for token in value["usage"].values())):
-            raise ValueError("Raw results may contain allowlisted provider metadata only")
+        validate_raw_metadata(value)
 
     @staticmethod
     def _metrics(row, response, elapsed_ms):
@@ -700,15 +693,7 @@ class PilotRunner:
                     else:
                         start = fact.get("timestampStartSeconds") if isinstance(fact, dict) else None
                         end = fact.get("timestampEndSeconds") if isinstance(fact, dict) else None
-                    if (not isinstance(fact, dict)
-                            or any(not isinstance(fact.get(key), str) or not fact[key].strip()
-                                   for key in ("fact", "evidenceType", "evidence"))
-                            or fact["evidenceType"] not in ("speech", "visual", "unknown")
-                            or any(value is not None and (type(value) not in (int, float)
-                                                          or not math.isfinite(value) or value < 0
-                                                          or duration is not None and value > duration)
-                                   for value in (start, end))
-                            or start is not None and end is not None and start > end):
+                    if not valid_grounding_fact(fact, start, end, duration):
                         raise ProviderFailure("invalid_grounding_response")
                     checked.append({
                         "fact": fact["fact"], "evidenceType": fact["evidenceType"],
@@ -719,8 +704,9 @@ class PilotRunner:
                         "timestampAccurate": None, "reviewNote": None,
                     })
                 row["groundingFacts"] = checked
-                if string_timestamps:
+                if string_timestamps and "facts" in normalized:
                     # The evaluation file keeps the stored timestamp contract, not the Provider strings.
+                    # A response without facts keeps no facts key, so a missing field never reads as [].
                     normalized = dict(normalized, facts=[
                         {key: item[key] for key in ("fact", "evidenceType", "evidence",
                                                     "timestampStartSeconds", "timestampEndSeconds")}
