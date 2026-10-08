@@ -262,12 +262,16 @@ def estimate_cost(provider, usage, price):
 class JudgeHttpClient:
     is_actual_api = True
 
-    def __init__(self, policy, api_key_variables, transport=None, sleep=None, api_keys=None):
+    def __init__(self, policy, api_key_variables, transport=None, sleep=None, api_keys=None,
+                 max_retry_after_seconds=None):
         self.policy = policy
         self.api_key_variables = api_key_variables
         self.transport = transport or judge_transport
         self.sleep = sleep or time.sleep
         self.api_keys = api_keys
+        # Opt-in (production Judge): a Retry-After above this is not waited for or retried, and the
+        # attempt fails like a 429/5xx without a usable hint. None keeps the Pilot behavior unchanged.
+        self.max_retry_after_seconds = max_retry_after_seconds
         self.requests_made = 0
         self.reserved_cost = 0.0
 
@@ -339,7 +343,8 @@ class JudgeHttpClient:
             entry.update(status=status, outcome="response", retryAfterSeconds=retry_after)
             if status == 429 or 500 <= status < 600:
                 category = "rate_limit" if status == 429 else "server_error"
-                if http_try == 0 and retry_after is not None:
+                if http_try == 0 and retry_after is not None and (
+                        self.max_retry_after_seconds is None or retry_after <= self.max_retry_after_seconds):
                     self.sleep(retry_after)
                     entry["waitedSeconds"] = retry_after
                     continue

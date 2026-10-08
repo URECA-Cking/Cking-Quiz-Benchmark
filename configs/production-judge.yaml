@@ -1,0 +1,23 @@
+production_judge:
+  # Production GPT Pointwise Judge (Issue #41), separate from the Pilot configs/judge.yaml (A/B, Pairwise,
+  # two Judges). It evaluates a Judge-ready production Quiz (src/production_quiz.py) against its exact
+  # contentText only: it never sees the video, so it does not verify the Grounding against the video.
+  provider: openai
+  model: gpt-6.1-sol
+  reasoning: medium
+  api_key_environment_variable: OPENAI_API_KEY
+  max_output_tokens: 8192
+  prompt_version: production-pointwise-judge-v1
+  # The existing Pointwise rubric and response schema of src/judge_contract.py, unchanged.
+  rubric_version: judge-rubric-v1
+  schema_version: judge-schema-v1
+  # Fixed execution policy. Timeout, cost caps, input token estimate, the Retry-After wait cap
+  # (maxRetryAfterSeconds) and prices have no defaults:
+  # they are given explicitly for each live run, and official OpenAI pricing and token accounting
+  # are re-checked before the first real call.
+  execution_policy:
+    http_retry_max: 1
+    retry_after_required: true
+    max_technical_attempts: 2
+    automatic_logical_retry: false
+    request_limit: 4
