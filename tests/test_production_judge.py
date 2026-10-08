@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import shutil
 import socket
@@ -707,6 +708,63 @@ class ProductionJudgeTest(unittest.TestCase):
                 with self.assertRaises(ProductionJudgeUnavailable):
                     self.runner.require_completed(self.quiz_id, evaluation_id)
         self.assertEqual(self.runner.require_completed(self.quiz_id, evaluation_id)["evaluationId"], evaluation_id)
+
+    # Result byte identity and manifest classification
+
+    def test_the_result_sha_is_the_sha_of_the_verified_file_bytes(self):
+        evaluation_id, _ = self.evaluate(FakeOpenAI(ok()))
+        path = self.judge_dir(evaluation_id) / "attempts" / "1" / "result.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        layouts = {"canonical": path.read_bytes(),
+                   "pretty-printed": json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8"),
+                   "trailing newline": path.read_bytes() + b"\n",
+                   "reordered keys": json.dumps(dict(reversed(list(record.items()))), ensure_ascii=False).encode("utf-8")}
+        seen = set()
+        for name, data in layouts.items():
+            with self.subTest(layout=name):
+                path.unlink()
+                path.write_bytes(data)
+                # The Judge contract parses the record; its serialization is not part of the contract.
+                self.assertEqual(self.state(evaluation_id), "completed")
+                completed = self.runner.require_completed(self.quiz_id, evaluation_id)
+                self.assertEqual(completed["resultSha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+                seen.add(completed["resultSha256"])
+        self.assertEqual(len(seen), 4)
+
+    def test_a_missing_or_damaged_manifest_is_corrupted_not_unstarted(self):
+        self.assertEqual(self.state(new_operation_id()), "not_started")  # never recorded anything
+        cases = {"manifest deleted": lambda path: path.unlink(),
+                 "manifest replaced by a directory": lambda path: (path.unlink(), path.mkdir()),
+                 "manifest JSON damaged": lambda path: (path.unlink(), path.write_text("{", encoding="utf-8"))}
+        for name, damage in cases.items():
+            with self.subTest(case=name):
+                evaluation_id, _ = self.evaluate(FakeOpenAI(ok()))
+                self.assertEqual(self.state(evaluation_id), "completed")
+                damage(self.judge_dir(evaluation_id) / "evaluation.json")
+                self.assertTrue((self.judge_dir(evaluation_id) / "attempts").is_dir())
+                self.assertEqual(self.state(evaluation_id), "corrupted")
+                with self.assertRaises(ProductionJudgeUnavailable):
+                    self.runner.require_completed(self.quiz_id, evaluation_id)
+                transport = FakeOpenAI(ok())
+                with self.assertRaisesRegex(ValueError, "corrupted|never reused"):
+                    self.evaluate(transport, evaluation_id)
+                self.assertEqual(transport.bodies, [])
+                self.assertFalse((self.judge_dir(evaluation_id) / "evaluation.json").is_file()
+                                 and name == "manifest deleted")  # not silently recreated
+
+    def test_a_manifest_create_that_never_completed_is_still_unstarted_and_resumable(self):
+        evaluation_id = new_operation_id()
+        folder = self.judge_dir(evaluation_id)
+        folder.mkdir(parents=True)
+        self.assertEqual(self.state(evaluation_id), "not_started")  # empty directory
+        # Exactly what _create_once leaves when it stops before linking the manifest.
+        with tempfile.NamedTemporaryFile("wb", dir=folder, prefix=".production-", suffix=".tmp", delete=False) as stream:
+            stream.write(b"{")
+        self.assertEqual(self.state(evaluation_id), "not_started")
+        _, result = self.evaluate(FakeOpenAI(ok()), evaluation_id)
+        self.assertEqual((result["outcome"], self.state(evaluation_id)), ("completed", "completed"))
+        retry_id, _ = self.evaluate(FakeOpenAI(openai_response("{")))
+        self.assertEqual(self.evaluate(FakeOpenAI(ok()), retry_id)[1]["attempt"], 2)  # resume is unchanged
 
 if __name__ == "__main__":
     unittest.main()

@@ -79,6 +79,9 @@ FIXED_EXECUTION_KEYS = {"httpRetryMax": "http_retry_max", "retryAfterRequired": 
                         "automaticLogicalRetry": "automatic_logical_retry", "requestLimit": "request_limit"}
 EXECUTION_KEYS = frozenset(FIXED_EXECUTION_KEYS) | RUNTIME_KEYS
 _ID = re.compile(r"[0-9a-f]{32}", re.ASCII)
+# The file ProductionQuizRunner._create_once leaves when it stops before linking: NamedTemporaryFile with
+# prefix ".production-" and suffix ".tmp", whose random part is 8 characters of [a-z0-9_].
+_CREATE_ONCE_TEMP = re.compile(r"\.production-[a-z0-9_]{8}\.tmp", re.ASCII)
 
 
 class ProductionJudgeUnavailable(ValueError):
@@ -260,6 +263,12 @@ class ProductionJudgeRunner:
             if not entry.is_dir() or entry.is_symlink() or not re.fullmatch(r"[1-9][0-9]*", entry.name):
                 raise ValueError("unexpected attempt entry")
             read = lambda path: self.quiz._read_json(path) if path.exists() else None
+            result_path = entry / "result.json"
+            result_bytes = None
+            if result_path.exists():
+                if result_path.is_symlink() or not result_path.is_file():
+                    raise ValueError("result record is not a regular file")
+                result_bytes = result_path.read_bytes()
             requests = {}
             if (entry / "requests").exists():
                 for item in (entry / "requests").iterdir():
@@ -271,8 +280,8 @@ class ProductionJudgeRunner:
                     requests[int(match.group(1))] = self.quiz._read_json(item)
             output = entry / "output.json"
             record = {"started": read(entry / "started.json"), "requests": requests,
-                      "result": read(entry / "result.json"),
-                      "output": output.read_bytes() if output.exists() else None}
+                      "result": _strict_json(result_bytes.decode("utf-8")) if result_bytes is not None else None,
+                      "resultBytes": result_bytes, "output": output.read_bytes() if output.exists() else None}
             if record["started"] is None and not requests and record["result"] is None and record["output"] is None:
                 continue  # created before started.json was linked: nothing was sent
             attempts[int(entry.name)] = record
@@ -408,6 +417,49 @@ class ProductionJudgeRunner:
                 cost += settled if settled is not None else intent["reservedUsd"]
         return requests, cost
 
+    def _manifest_presence(self, root):
+        """``absent`` when the evaluation has never recorded anything (no directory, an empty one, or only
+        unfinished create-once temporary files), ``present`` for a regular manifest file, else ``damaged``:
+        a manifest that is not a regular file, or any other entry left without a manifest."""
+        folder = self.quiz._path(*root)
+        manifest = folder / "evaluation.json"
+        if manifest.exists() or manifest.is_symlink():
+            return "present" if manifest.is_file() and not manifest.is_symlink() else "damaged"
+        if not folder.exists():
+            return "absent"
+        if not folder.is_dir() or any(entry.is_symlink() or not entry.is_file()
+                                      or _CREATE_ONCE_TEMP.fullmatch(entry.name) is None
+                                      for entry in folder.iterdir()):
+            return "damaged"
+        return "absent"
+
+    def _verified(self, quiz_operation_id, evaluation_id):
+        """(state, manifest, attempts) from one read of the stored records; the attempts are the exact
+        records the state was derived from, so a caller can use their bytes without reading again."""
+        try:
+            _, body_bytes, identity, indexes, root = self._load(quiz_operation_id, evaluation_id)
+        except ProductionQuizNotJudgeReady:
+            return "quiz_not_judge_ready", None, None
+        except (KeyError, OSError, TypeError, UnicodeError, ValueError):
+            return "corrupted", None, None
+        try:
+            presence = self._manifest_presence(root)
+            if presence != "present":
+                return ("not_started" if presence == "absent" else "corrupted"), None, None
+            manifest = self.quiz._read_json(self.quiz._path(*root, "evaluation.json"))
+            if (set(manifest) != {"format", "evaluationId", "quizOperationId", "inputFingerprint", "identity",
+                                  "executionPolicy"}
+                    or manifest["format"] != MANIFEST_FORMAT or manifest["evaluationId"] != evaluation_id
+                    or manifest["quizOperationId"] != quiz_operation_id
+                    or manifest["identity"] != identity or manifest["inputFingerprint"] != sha256_hex(identity)
+                    or self.quiz._path(*root, "request.json").read_bytes() != body_bytes):
+                return "corrupted", None, None
+            self._stored_policy(manifest["executionPolicy"])  # every runtime value, by the new-run rules
+            attempts = self._attempts(root)
+            return self._state(manifest, attempts, indexes), manifest, attempts
+        except (AttributeError, KeyError, OSError, TypeError, UnicodeError, ValueError):
+            return "corrupted", None, None
+
     def _load(self, quiz_operation_id, evaluation_id):
         if not isinstance(evaluation_id, str) or _ID.fullmatch(evaluation_id) is None:
             raise ValueError("A production Judge evaluationId is 32 lowercase hex characters")
@@ -429,11 +481,17 @@ class ProductionJudgeRunner:
         if not key:
             raise ValueError("The OpenAI API key environment variable is not set")
         body, body_bytes, identity, indexes, root = self._load(quiz_operation_id, evaluation_id)
+        if self._manifest_presence(root) == "damaged":
+            raise ValueError("This evaluation is corrupted; no further request is sent")
         manifest = {"format": MANIFEST_FORMAT, "evaluationId": evaluation_id, "quizOperationId": quiz_operation_id,
                     "inputFingerprint": sha256_hex(identity), "identity": identity, "executionPolicy": execution}
         manifest_path = self.quiz._path(*root, "evaluation.json")
         if not self.quiz._create_once(manifest_path, canonical_json(manifest).encode("utf-8")):
-            if self.quiz._read_json(manifest_path) != manifest:
+            try:
+                stored_manifest = self.quiz._read_json(manifest_path)
+            except (OSError, UnicodeError, ValueError):
+                raise ValueError("This evaluation is corrupted; no further request is sent") from None
+            if stored_manifest != manifest:
                 raise ValueError("This evaluation was created for a different Quiz artifact, Judge config, request "
                                  "or execution policy; it is never reused")
         request_path = self.quiz._path(*root, "request.json")
@@ -516,30 +574,7 @@ class ProductionJudgeRunner:
     def evaluation_state(self, quiz_operation_id, evaluation_id):
         """The evaluation state re-derived from storage: ``quiz_not_judge_ready`` when the Quiz no longer
         passes require_judge_ready, ``corrupted`` when the evaluation records do not verify."""
-        try:
-            _, body_bytes, identity, indexes, root = self._load(quiz_operation_id, evaluation_id)
-        except ProductionQuizNotJudgeReady:
-            return "quiz_not_judge_ready"
-        except (KeyError, OSError, TypeError, UnicodeError, ValueError):
-            return "corrupted"
-        try:
-            manifest = self.quiz._read_json(self.quiz._path(*root, "evaluation.json"))
-        except FileNotFoundError:
-            return "not_started"
-        except (KeyError, TypeError, UnicodeError, ValueError):
-            return "corrupted"
-        try:
-            if (set(manifest) != {"format", "evaluationId", "quizOperationId", "inputFingerprint", "identity",
-                                  "executionPolicy"}
-                    or manifest["format"] != MANIFEST_FORMAT or manifest["evaluationId"] != evaluation_id
-                    or manifest["quizOperationId"] != quiz_operation_id
-                    or manifest["identity"] != identity or manifest["inputFingerprint"] != sha256_hex(identity)
-                    or self.quiz._path(*root, "request.json").read_bytes() != body_bytes):
-                return "corrupted"
-            self._stored_policy(manifest["executionPolicy"])  # every runtime value, by the new-run rules
-            return self._state(manifest, self._attempts(root), indexes)
-        except (AttributeError, KeyError, OSError, TypeError, UnicodeError, ValueError):
-            return "corrupted"
+        return self._verified(quiz_operation_id, evaluation_id)[0]
 
     def require_completed(self, quiz_operation_id, evaluation_id):
         """Return the completed Pointwise result, or raise ProductionJudgeUnavailable.
@@ -549,19 +584,19 @@ class ProductionJudgeRunner:
         stored model text. Per-question verdicts only; no overall PASS/FAIL.
         """
         try:
-            _, body_bytes, identity, indexes, root = self._load(quiz_operation_id, evaluation_id)
+            _, _, identity, _, _ = self._load(quiz_operation_id, evaluation_id)
         except ProductionQuizNotJudgeReady as exc:
             raise ProductionJudgeUnavailable(["quizNotJudgeReady: %s" % exc]) from None
         except (KeyError, OSError, TypeError, UnicodeError, ValueError):  # unreadable or malformed stored files
             raise ProductionJudgeUnavailable(["evaluationState:corrupted"]) from None
-        state = self.evaluation_state(quiz_operation_id, evaluation_id)
+        state, manifest, attempts = self._verified(quiz_operation_id, evaluation_id)
         if state != "completed":
             raise ProductionJudgeUnavailable(["evaluationState:" + state])
-        manifest = self.quiz._read_json(self.quiz._path(*root, "evaluation.json"))
-        attempts = self._attempts(root)
         number = max(attempts)
-        result = attempts[number]["result"]
+        record = attempts[number]
+        result = record["result"]
+        # The result's identity is the SHA-256 of the exact bytes that were verified, not a re-serialization.
         return {"evaluationId": evaluation_id, "quizOperationId": quiz_operation_id, "attempt": number,
                 "inputFingerprint": manifest["inputFingerprint"], "identity": identity,
-                "outputSha256": result["outputSha256"], "estimatedCostUsd": result["estimatedCostUsd"],
-                "questions": result["pointwise"]}
+                "outputSha256": result["outputSha256"], "resultSha256": hashlib.sha256(record["resultBytes"]).hexdigest(),
+                "estimatedCostUsd": result["estimatedCostUsd"], "questions": result["pointwise"]}

@@ -124,6 +124,26 @@ Judge-ready production Quiz를 GPT Pointwise Judge로 평가하고 문항별 결
 - **재개와 무결성**: 같은 평가는 Quiz artifact, Judge 설정, 요청 본문, 실행 정책이 모두 같을 때만 이어갑니다. 저장된 실행 정책은 읽을 때도 새 실행과 같은 규칙으로 모든 값을 검증하고, 그 SHA-256(`executionPolicySha256`)이 각 attempt의 시작·요청 예약·결과 기록에 남아 있어 다른 유효한 값으로 바뀌어도 탐지합니다. 재개 시 기록된 요청 수와 비용(정산 비용, 알 수 없으면 예약 비용)을 복원하고 0으로 되돌리지 않습니다. 예약 비용은 저장된 단가와 추정치로, 정산 비용은 저장된 usage와 단가로 기존 Judge 비용 규칙(`estimate_cost`)에 따라 다시 계산해 저장값과 같아야 하며, 계산할 수 없는 비용은 `null`이어야 합니다. 결과를 읽을 때(`require_completed`)도 Quiz가 여전히 Judge-ready이고 바뀌지 않았는지, 기록 연결과 hash, 저장된 모델 출력의 재검증 결과가 저장된 판정과 같은지 확인합니다.
 - **정하지 않은 정책**: Quiz 전체 PASS/FAIL 집계와 Creator에게 보여 줄 방식, semantic `fail` 이후 재생성, Creator 승인, 게시. 이번에는 문항별 7개 항목 판정·reason, 실행 상태, provenance까지만 저장합니다.
 
+## Production Judge 집계와 Creator 검토 상태 (Issue #43)
+
+완료된 Production Pointwise 평가를 결정론적으로 집계해 Creator 검토용 요약과 routing을 제공합니다(`src/production_judge_aggregation.py`). Provider를 호출하지 않으며 Judge 원결과를 바꾸지 않습니다.
+
+실행 상태(Judge evaluation state), semantic summary(판정 요약), review routing, Creator 승인은 서로 다른 값입니다.
+
+| semantic summary | 조건 | review routing |
+| --- | --- | --- |
+| `ALL_PASS` | 모든 항목이 `pass` | `READY_FOR_CREATOR_REVIEW` |
+| `HAS_FAIL` | `fail`이 하나 이상(`uncertain`도 함께 표시) | `ATTENTION_REQUIRED` |
+| `UNCERTAIN_ONLY` | `fail` 없이 `uncertain`이 하나 이상 | `ATTENTION_REQUIRED` |
+| `UNAVAILABLE` | 유효한 completed 평가 없음 | `JUDGE_UNAVAILABLE` |
+
+- 어떤 routing도 승인이 아닙니다. `ALL_PASS`도 자동 승인·게시하지 않고, `HAS_FAIL`도 자동 폐기·재생성하지 않으며, 특정 항목을 필수 pass 조건으로 두지 않습니다. Judge는 `contentText` 기준 평가이며 원본 영상의 사실을 검증하지 않습니다.
+- **집계 입력과 출력**: `ProductionJudgeRunner.require_completed()`로 검증된 completed 평가의 문항별 7개 항목 verdict·reason만 입력으로 씁니다. 출력은 문항 수, 항목 평가 수(문항 수 × 7), 전체·항목별·문항별 `pass`/`fail`/`uncertain` 개수, `fail`·`uncertain` 목록(`questionIndex`, rubric 항목, verdict, 원본 reason), 원본 문항별 verdict·reason 전체, semantic summary, review routing, 집계 정책 version(`production-judge-aggregation-v1`)과 digest입니다. 입력 순서와 관계없이 같은 판정은 같은 결과가 되며, 없는 verdict·reason을 만들지 않고 형식이 맞지 않는 입력은 거부합니다.
+- **평가가 없을 때**: Judge 상태가 `not_started`, `retryable`, `exhausted`, `terminal`, `uncertain`이면 `UNAVAILABLE` / `JUDGE_UNAVAILABLE`과 실행 상태·사유를 읽기 전용으로 돌려주며 Creator 수동 검토를 허용합니다(`manualReviewAllowed`). 이 응답은 저장하지 않고, 실행 `uncertain`을 판정 `uncertain`으로 바꾸지 않습니다. `corrupted`와 `quiz_not_judge_ready`는 거부하며 수동 검토 경로로 돌리지 않습니다. `evaluation.json`이 일반 파일이 아니거나, `evaluation.json` 없이 평가 디렉터리에 다른 항목이 남아 있으면 `not_started`가 아니라 `corrupted`입니다. 예외는 생성이 끝나지 않은 create-once 임시 파일(`.production-` + 임의 8자 + `.tmp`, 일반 파일)뿐이며, 이것만 있으면 `not_started`로 이어서 실행할 수 있습니다.
+- **저장**: 집계는 `results/production/operations/<quizOperationId>/judge/<evaluationId>/aggregations/<aggregationId>.json`에 한 번만 저장합니다. `aggregationId`는 Quiz provenance(operation, attempt, fingerprint, output·result SHA-256, Grounding run, `contentTextSha256`, snapshot SHA-256, validation version, prompt·출력 계약 version), Judge 설정(model, reasoning, `max_output_tokens`, prompt·rubric·schema version, 계약 hash)과 요청 본문 SHA-256, Judge evaluation(evaluation ID, attempt, fingerprint, 출력 SHA-256, 검증한 `result.json` 파일 바이트의 SHA-256), 집계 정책 version·digest의 SHA-256이며 `generatedAt`은 포함하지 않습니다. 같은 내용이라도 결과 파일 바이트가 다르면 다른 집계가 됩니다. 정책이 바뀌면 다른 파일이 되고 기존 파일은 그대로 남습니다.
+- **재조회**: 저장된 집계는 Judge 평가를 다시 검증하고 집계를 다시 계산해 provenance와 결과가 모두 같을 때만 돌려줍니다. 저장값 변조, 형식 오류, 일부만 쓰인 파일, 읽기 실패, Quiz·Judge 결과가 바뀐 뒤의 오래된 집계는 거부하며 파일을 덮어쓰거나 고치지 않습니다. 집계 파일 쓰기가 실패하면(권한·디스크 오류 등) 거부하고 파일을 남기지 않으므로 다시 호출하면 됩니다.
+- **후속 Creator 승인 요구사항**(이번 범위 밖): Creator 판단을 Judge 결과와 별도로 기록하고, Judge와 다르게 승인하면 override 여부와 사유를 필수로 남기며, Judge 원결과는 바꾸지 않고, Creator 승인 없이 게시하지 않습니다.
+
 ## LLM-as-a-Judge 결과
 
 A/B Quiz에 대한 사후 보조 평가(LLM-as-a-Judge) 결과는 `results/judge/<judgeRunId>/`에만 저장하며 위 세 JSONL과 `results/raw`, `results/evaluation`에는 쓰지 않습니다. 이 하위 디렉터리는 Pilot 저장 무결성 검사 대상이 아닙니다. Judge는 Pilot 결과와 Human Evaluation을 읽기만 합니다. 계약과 파일 구조는 [Judge 프로토콜](judge-protocol.md)을 따릅니다.
