@@ -48,7 +48,8 @@ EXECUTION_POLICY = {"http_retry_max": 1, "retry_after_required": True, "max_tech
                     "automatic_logical_retry": False, "request_limit": 4}
 CONFIG_KEYS = frozenset(("provider", "model", "reasoning", "api_key_environment_variable", "max_output_tokens",
                          "prompt_version", "rubric_version", "schema_version", "execution_policy"))
-RUNTIME_KEYS = frozenset(("timeoutSeconds", "perCallCostLimitUsd", "totalCostLimitUsd", "estimatedInputTokens", "price"))
+RUNTIME_KEYS = frozenset(("timeoutSeconds", "perCallCostLimitUsd", "totalCostLimitUsd", "estimatedInputTokens",
+                          "maxRetryAfterSeconds", "price"))
 PRICE_KEYS = frozenset(("input", "output", "cachedInput", "reference", "checkedAt"))
 
 MANIFEST_FORMAT = "production-judge-evaluation-v1"
@@ -93,13 +94,14 @@ def valid_retry_after(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
-def classify_attempt(category, http_requests):
+def classify_attempt(category, http_requests, max_retry_after_seconds):
     """``completed``, ``retryable_failure`` (an explicit next attempt may follow), ``terminal_failure``
     or ``uncertain``, from the error category and the attempt's stored HTTP request records.
 
     A 429/5xx is retryable only when the attempt used its one HTTP retry and the last response still
-    carried a valid Retry-After; a 429/5xx whose last response has no valid Retry-After is terminal.
-    Refusals, client errors and guards are terminal; timeouts and network errors are uncertain."""
+    carried a valid Retry-After no longer than ``max_retry_after_seconds``; a 429/5xx whose last response
+    has no valid hint, or one above the cap (never waited for), is terminal. Refusals, client errors and
+    guards are terminal; timeouts and network errors are uncertain."""
     if category is None:
         return "completed"
     if category in UNCERTAIN_CATEGORIES:
@@ -107,7 +109,8 @@ def classify_attempt(category, http_requests):
     if category in RETRYABLE_CATEGORIES:
         return "retryable_failure"
     if (category in HTTP_WAIT_CATEGORIES and isinstance(http_requests, list) and len(http_requests) == 2
-            and isinstance(http_requests[-1], dict) and valid_retry_after(http_requests[-1].get("retryAfterSeconds"))):
+            and isinstance(http_requests[-1], dict) and valid_retry_after(http_requests[-1].get("retryAfterSeconds"))
+            and http_requests[-1]["retryAfterSeconds"] <= max_retry_after_seconds):
         return "retryable_failure"
     return "terminal_failure"
 
@@ -205,7 +208,10 @@ class ProductionJudgeRunner:
         if (not isinstance(runtime, dict) or set(runtime) != RUNTIME_KEYS
                 or not isinstance(price, dict) or set(price) != PRICE_KEYS):
             raise ValueError("Production Judge needs timeoutSeconds, perCallCostLimitUsd, totalCostLimitUsd, "
-                             "estimatedInputTokens and price (input, output, cachedInput, reference, checkedAt)")
+                             "estimatedInputTokens, maxRetryAfterSeconds and price "
+                             "(input, output, cachedInput, reference, checkedAt)")
+        if not valid_retry_after(runtime["maxRetryAfterSeconds"]):
+            raise ValueError("maxRetryAfterSeconds must be a finite non-negative number")
         policy = JudgePolicy(live=True, http_request_limit=EXECUTION_POLICY["request_limit"],
                              per_call_cost_limit=runtime["perCallCostLimitUsd"],
                              total_cost_limit=runtime["totalCostLimitUsd"], timeout_seconds=runtime["timeoutSeconds"],
@@ -222,7 +228,8 @@ class ProductionJudgeRunner:
                      "requestLimit": EXECUTION_POLICY["request_limit"],
                      "timeoutSeconds": runtime["timeoutSeconds"], "perCallCostLimitUsd": runtime["perCallCostLimitUsd"],
                      "totalCostLimitUsd": runtime["totalCostLimitUsd"],
-                     "estimatedInputTokens": runtime["estimatedInputTokens"], "price": dict(price)}
+                     "estimatedInputTokens": runtime["estimatedInputTokens"],
+                     "maxRetryAfterSeconds": runtime["maxRetryAfterSeconds"], "price": dict(price)}
         return policy, execution
 
     def _stored_policy(self, execution):
@@ -305,8 +312,9 @@ class ProductionJudgeRunner:
                 or result["inputFingerprint"] != manifest["inputFingerprint"]
                 or result["startedAt"] != started["startedAt"] or not valid_utc_timestamp(result["completedAt"])
                 or not isinstance(result["httpRequests"], list) or len(result["httpRequests"]) != len(requests)
-                or self._http_log_problem(result, requests, policy)
-                or result["outcome"] != classify_attempt(result["errorCategory"], result["httpRequests"])):
+                or self._http_log_problem(result, requests, policy, manifest["executionPolicy"]["maxRetryAfterSeconds"])
+                or result["outcome"] != classify_attempt(result["errorCategory"], result["httpRequests"],
+                                                         manifest["executionPolicy"]["maxRetryAfterSeconds"])):
             return "resultRecordMismatch"
         output = record["output"]
         if result["outputSha256"] is None:
@@ -329,12 +337,13 @@ class ProductionJudgeRunner:
         return None
 
     @staticmethod
-    def _http_log_problem(result, requests, policy):
+    def _http_log_problem(result, requests, policy, max_retry_after_seconds):
         """True when the result's HTTP request records do not match the journal and the client's rules.
 
         Only the last request can have a response that was read, so only it may be settled, and its
         settled cost must equal estimate_cost() of the stored usage (``null`` when that is unknown).
-        A request followed by an HTTP retry must be a 429/5xx with a valid Retry-After that was waited."""
+        A request followed by an HTTP retry must be a 429/5xx with a valid Retry-After within the cap that
+        was waited."""
         log = result["httpRequests"]
         for k, sent in enumerate(log, 1):
             last = k == len(log)
@@ -351,6 +360,7 @@ class ProductionJudgeRunner:
             if not last and (sent["outcome"] != "response"
                              or (sent["status"] != 429 and sent["status"] not in range(500, 600))
                              or not valid_retry_after(sent["retryAfterSeconds"])
+                             or sent["retryAfterSeconds"] > max_retry_after_seconds
                              or sent["waitedSeconds"] != sent["retryAfterSeconds"]):
                 return True
             if last and sent["waitedSeconds"] is not None:
@@ -441,7 +451,8 @@ class ProductionJudgeRunner:
         except JudgeCallFailure:
             raise ValueError("The evaluation's request limit or cost cap leaves no room for another request") from None
         client = JudgeHttpClient(policy, {PROVIDER: self.config["api_key_environment_variable"]}, transport=transport,
-                                 sleep=sleep, api_keys=api_keys)
+                                 sleep=sleep, api_keys=api_keys,
+                                 max_retry_after_seconds=execution["maxRetryAfterSeconds"])
         client.restore_usage(requests_used, reserved)
 
         attempt_root = root + ("attempts", str(attempt))
@@ -490,7 +501,8 @@ class ProductionJudgeRunner:
         result = {"format": RESULT_FORMAT, "evaluationId": evaluation_id, "attempt": attempt,
                   "inputFingerprint": manifest["inputFingerprint"], "requestBodySha256": identity["requestBodySha256"],
                   "executionPolicySha256": policy_sha, "startedAt": started["startedAt"], "completedAt": _now(),
-                  "outcome": classify_attempt(category, log), "errorCategory": category,
+                  "outcome": classify_attempt(category, log, execution["maxRetryAfterSeconds"]),
+                  "errorCategory": category,
                   "httpStatus": http_status, "providerErrorCode": provider_error_code, "reportedModel": reported,
                   "httpRequests": log, "usage": usage, "estimatedCostUsd": cost, "outputSha256": output_sha,
                   "pointwise": pointwise}
@@ -538,8 +550,10 @@ class ProductionJudgeRunner:
         """
         try:
             _, body_bytes, identity, indexes, root = self._load(quiz_operation_id, evaluation_id)
-        except ValueError as exc:  # includes ProductionQuizNotJudgeReady
+        except ProductionQuizNotJudgeReady as exc:
             raise ProductionJudgeUnavailable(["quizNotJudgeReady: %s" % exc]) from None
+        except (KeyError, OSError, TypeError, UnicodeError, ValueError):  # unreadable or malformed stored files
+            raise ProductionJudgeUnavailable(["evaluationState:corrupted"]) from None
         state = self.evaluation_state(quiz_operation_id, evaluation_id)
         if state != "completed":
             raise ProductionJudgeUnavailable(["evaluationState:" + state])

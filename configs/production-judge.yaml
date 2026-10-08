@@ -11,7 +11,8 @@ production_judge:
   # The existing Pointwise rubric and response schema of src/judge_contract.py, unchanged.
   rubric_version: judge-rubric-v1
   schema_version: judge-schema-v1
-  # Fixed execution policy. Timeout, cost caps, input token estimate and prices have no defaults:
+  # Fixed execution policy. Timeout, cost caps, input token estimate, the Retry-After wait cap
+  # (maxRetryAfterSeconds) and prices have no defaults:
   # they are given explicitly for each live run, and official OpenAI pricing and token accounting
   # are re-checked before the first real call.
   execution_policy:

@@ -5,6 +5,7 @@ import socket
 import tempfile
 import unittest
 import urllib.error
+from unittest import mock
 from pathlib import Path
 
 import yaml
@@ -22,6 +23,7 @@ from tests.test_production_quiz import FakeQuizProvider, quiz_with
 
 
 RUNTIME = {"timeoutSeconds": 30, "perCallCostLimitUsd": 1.0, "totalCostLimitUsd": 5.0, "estimatedInputTokens": 3000,
+           "maxRetryAfterSeconds": 60,
            "price": {"input": 2.0, "output": 10.0, "cachedInput": 0.2, "reference": "operator-test-pricing",
                      "checkedAt": "2026-10-08"}}
 # (3000 * 2 + 8192 * 10) / 1e6 per request reservation; a known response settles to (1000 * 2 + 300 * 10) / 1e6.
@@ -481,16 +483,17 @@ class ProductionJudgeTest(unittest.TestCase):
                     "timeout": "uncertain", "network_error": "uncertain"}
         one = [{"retryAfterSeconds": None}]
         for category, outcome in expected.items():
-            self.assertEqual(classify_attempt(category, one), outcome)
+            self.assertEqual(classify_attempt(category, one, 60), outcome)
         waited = {"retryAfterSeconds": 1.0}
         for category in ("rate_limit", "server_error"):
-            self.assertEqual(classify_attempt(category, [{"retryAfterSeconds": None}]), "terminal_failure")
-            self.assertEqual(classify_attempt(category, [waited]), "terminal_failure")  # no HTTP retry was used
-            self.assertEqual(classify_attempt(category, [waited, {"retryAfterSeconds": 2.0}]), "retryable_failure")
-            for hint in (None, -1, float("nan"), True, "1"):
-                self.assertEqual(classify_attempt(category, [waited, {"retryAfterSeconds": hint}]), "terminal_failure")
+            self.assertEqual(classify_attempt(category, [{"retryAfterSeconds": None}], 60), "terminal_failure")
+            self.assertEqual(classify_attempt(category, [waited], 60), "terminal_failure")  # no HTTP retry was used
+            self.assertEqual(classify_attempt(category, [waited, {"retryAfterSeconds": 2.0}], 60), "retryable_failure")
+            self.assertEqual(classify_attempt(category, [waited, {"retryAfterSeconds": 60}], 60), "retryable_failure")
+            for hint in (None, -1, float("nan"), True, "1", 60.5, 86400):
+                self.assertEqual(classify_attempt(category, [waited, {"retryAfterSeconds": hint}], 60), "terminal_failure")
 
-    # Codex review: cost settlement, execution policy integrity, Retry-After classification
+    # Stored cost settlement, execution policy integrity and Retry-After classification
 
     def result_path(self, evaluation_id, attempt=1):
         return self.judge_dir(evaluation_id) / "attempts" / str(attempt) / "result.json"
@@ -607,6 +610,103 @@ class ProductionJudgeTest(unittest.TestCase):
                 evaluation_id, result = self.evaluate(transport)
                 self.assertEqual((result["outcome"], len(transport.bodies)), ("terminal_failure", 1))
 
+
+    # Retry-After wait cap (maxRetryAfterSeconds)
+
+    def test_a_retry_after_within_the_cap_is_waited_and_retried_once(self):
+        for hint in (1.0, 60, 60.0):  # below and exactly at the cap of 60
+            with self.subTest(hint=hint):
+                self.sleeps.clear()
+                transport = FakeOpenAI((429, {}, hint), ok())
+                evaluation_id, result = self.evaluate(transport)
+                self.assertEqual((result["outcome"], len(transport.bodies), self.sleeps), ("completed", 2, [hint]))
+                self.assertEqual(self.state(evaluation_id), "completed")
+
+    def test_a_retry_after_above_the_cap_is_terminal_without_waiting_or_retrying(self):
+        for status, hint, cap in ((429, 60.5, 60), (503, 61, 60), (503, 86400.0, 60), (429, 1.0, 0)):
+            with self.subTest(status=status, hint=hint, cap=cap):
+                self.sleeps.clear()
+                runtime = dict(RUNTIME, maxRetryAfterSeconds=cap)
+                transport = FakeOpenAI((status, {}, hint), ok())
+                evaluation_id, result = self.evaluate(transport, runtime=runtime)
+                self.assertEqual(self.sleeps, [])  # never waited
+                self.assertEqual(len(transport.bodies), 1)  # no HTTP retry
+                self.assertEqual((result["outcome"], result["errorCategory"], result["httpStatus"]),
+                                 ("terminal_failure", "rate_limit" if status == 429 else "server_error", status))
+                self.assertNotEqual(result["outcome"], "uncertain")
+                sent = result["httpRequests"]
+                self.assertEqual((len(sent), sent[0]["retryAfterSeconds"], sent[0]["waitedSeconds"], sent[0]["settledUsd"]),
+                                 (1, hint, None, None))
+                self.assertEqual(sent[0]["reservedUsd"], RESERVATION)  # the reservation is kept
+                journal = sorted((self.judge_dir(evaluation_id) / "attempts" / "1" / "requests").glob("*.json"))
+                self.assertEqual(len(journal), 1)
+                self.assertEqual(self.state(evaluation_id), "terminal")
+                again = FakeOpenAI(ok())
+                with self.assertRaisesRegex(ValueError, "terminal"):  # no explicit attempt 2
+                    self.evaluate(again, evaluation_id, runtime=runtime)
+                self.assertEqual(again.bodies, [])
+        # Within the cap on the first response, above it on the retry's response: terminal too.
+        transport = FakeOpenAI((503, {}, 1.0), (503, {}, 120.0))
+        evaluation_id, result = self.evaluate(transport)
+        self.assertEqual((result["outcome"], len(transport.bodies)), ("terminal_failure", 2))
+        self.assertEqual(self.state(evaluation_id), "terminal")
+
+    def test_a_missing_or_invalid_retry_after_is_still_terminal_with_a_cap(self):
+        for hint in (None, parse_retry_after("soon")):
+            with self.subTest(hint=hint):
+                self.sleeps.clear()
+                transport = FakeOpenAI((503, {}, hint))
+                _, result = self.evaluate(transport)
+                self.assertEqual((result["outcome"], len(transport.bodies), self.sleeps), ("terminal_failure", 1, []))
+
+    def test_the_retry_after_cap_is_a_required_runtime_value(self):
+        without = {key: value for key, value in RUNTIME.items() if key != "maxRetryAfterSeconds"}
+        cases = {"missing": without, "negative": dict(RUNTIME, maxRetryAfterSeconds=-1),
+                 "bool": dict(RUNTIME, maxRetryAfterSeconds=True), "nan": dict(RUNTIME, maxRetryAfterSeconds=float("nan")),
+                 "infinity": dict(RUNTIME, maxRetryAfterSeconds=float("inf")),
+                 "string": dict(RUNTIME, maxRetryAfterSeconds="60"), "null": dict(RUNTIME, maxRetryAfterSeconds=None)}
+        for name, runtime in cases.items():
+            with self.subTest(case=name):
+                transport = FakeOpenAI(ok())
+                with self.assertRaises(ValueError):
+                    self.evaluate(transport, runtime=runtime)
+                self.assertEqual(transport.bodies, [])
+        self.assertFalse((self.production / "operations" / self.quiz_id / "judge").exists())
+
+    def test_the_stored_retry_after_cap_is_validated_bound_and_fixed_on_resume(self):
+        evaluation_id, _ = self.evaluate(FakeOpenAI(ok()))
+        manifest = json.loads((self.judge_dir(evaluation_id) / "evaluation.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["executionPolicy"]["maxRetryAfterSeconds"], 60)
+        again = FakeOpenAI(ok())
+        with self.assertRaisesRegex(ValueError, "completed"):  # a completed evaluation is never re-called
+            self.evaluate(again, evaluation_id)
+        self.assertEqual(again.bodies, [])
+        for cap in (120, -1, None):
+            with self.subTest(stored=cap):
+                evaluation_id, _ = self.evaluate(FakeOpenAI(ok()))
+                self.rewrite(self.judge_dir(evaluation_id) / "evaluation.json",
+                             lambda m: m["executionPolicy"].update(maxRetryAfterSeconds=cap))
+                self.assert_corrupted_and_never_resumed(evaluation_id)
+        # A retryable evaluation cannot be resumed with another cap.
+        evaluation_id, _ = self.evaluate(FakeOpenAI(openai_response("{")))
+        transport = FakeOpenAI(ok())
+        with self.assertRaisesRegex(ValueError, "never reused"):
+            self.evaluate(transport, evaluation_id, runtime=dict(RUNTIME, maxRetryAfterSeconds=120))
+        self.assertEqual(transport.bodies, [])
+        # A stored over-cap hint on a waited request does not verify.
+        evaluation_id, _ = self.evaluate(FakeOpenAI((503, {}, 1.0), (503, {}, 2.0)))
+        self.rewrite(self.result_path(evaluation_id), lambda r: r["httpRequests"][0].update(
+            retryAfterSeconds=120.0, waitedSeconds=120.0))
+        self.assert_corrupted_and_never_resumed(evaluation_id)
+
+    def test_require_completed_reports_unreadable_storage_as_unavailable(self):
+        evaluation_id, _ = self.evaluate(FakeOpenAI(ok()))
+        # Errors reading stored files while binding the Quiz never escape as raw exceptions.
+        for error in (OSError("unreadable"), KeyError("input"), TypeError("shape"), UnicodeDecodeError("utf-8", b"", 0, 1, "x")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(self.runner, "_bind", side_effect=error):
+                with self.assertRaises(ProductionJudgeUnavailable):
+                    self.runner.require_completed(self.quiz_id, evaluation_id)
+        self.assertEqual(self.runner.require_completed(self.quiz_id, evaluation_id)["evaluationId"], evaluation_id)
 
 if __name__ == "__main__":
     unittest.main()
