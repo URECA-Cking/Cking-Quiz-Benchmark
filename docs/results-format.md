@@ -164,6 +164,17 @@ Creator가 Quiz와 Judge 결과(또는 Judge가 없다는 상태)를 함께 확�
 - **stale**: Quiz 변경·eligibility 실패, Judge `result.json` 변경·`corrupted`, 집계·집계 정책 변경, Judge 실행 상태 변경. `MANUAL_WITHOUT_JUDGE` 승인 뒤 같은 evaluation이 `completed`가 되면 stale이며, 결정은 한 번뿐이므로 같은 Quiz operation은 다시 승인할 수 없고 새 Quiz operation으로 다시 검토해야 합니다.
 - **승인 gate**(`require_creator_approved(operationId)`): 상태가 `CREATOR_APPROVED`일 때만 `contentText`, 문항과 결정 기록을 돌려주고 그 밖에는 거부합니다. 파일을 만들거나 바꾸지 않으며 게시는 하지 않습니다.
 
+## Production Quiz 로컬 발행 기록 (Issue #47)
+
+Creator가 승인한 Production Quiz를 로컬 발행 기록으로 남기고, 그 기록의 무결성과 현재 유효성을 확인합니다(`src/production_publish.py`). 로컬 발행 기록은 승인된 Quiz와 그 승인 근거를 파일로 남긴 것이며, 실제 Cking 서비스에 Quiz가 공개됐다는 뜻이 아닙니다. 외부 서비스·DB·Provider를 호출하지 않습니다. `publishedBy`는 호출자가 넘기는 이름이며 인증을 제공하지 않습니다.
+
+- **발행 가능 조건**(`record_publication(operationId, publishedBy)`): `ProductionCreatorReview.require_creator_approved()`가 승인한 Quiz만 기록합니다. 결정 없음, 거절, stale, 손상된 결정, Quiz eligibility 실패, Judge·집계 provenance 불일치는 그 gate에서 거부되며, Creator·Judge 정책을 이 모듈에서 다시 판단하지 않습니다.
+- **저장**: `results/production/operations/<operationId>/publication.json`에 한 번만 저장합니다(create-once, 원자적 저장). 필드는 `format`, `publishId`, `policyVersion`(`production-local-publication-policy-v1`), `quizOperationId`, `creatorDecision`(gate가 검증한 결정 기록), `creatorDecisionSha256`(`creator-decision.json` 실제 파일 바이트의 SHA-256), `payload`(`contentText`와 문항), `payloadSha256`(payload의 canonical JSON SHA-256), `publishedBy`, `publishedAt`(UTC)입니다.
+- **identity**: `publishId`는 policy version, operation ID, `creatorDecisionSha256`, `payloadSha256`의 canonical JSON SHA-256입니다. `publishedAt`은 포함하지 않습니다.
+- **한 번만 기록**: `publishedAt`을 뺀 모든 값이 같은 요청은 저장된 기록을 그대로 돌려주고, 다른 `publishedBy`·승인·payload·policy는 거부합니다. 기존 기록은 손상된 경우에도 덮어쓰거나 고치지 않으며, 동시 요청에서도 기록은 하나만 남습니다. 쓰기 실패는 거부하고 파일을 남기지 않습니다.
+- **저장 전후 검증**: gate 전후에 `creator-decision.json` 바이트가 같고 그 내용이 gate가 검증한 결정과 같아야 하며, 쓰기 직전에 바이트를 다시 확인합니다. 기록을 쓴 직후 현재 상태가 `LOCAL_PUBLICATION_CURRENT`가 아니면 정상 완료로 돌려주지 않고 거부합니다(`publicationRecordedButNotCurrent`). 이때 이미 쓴 기록은 지우지 않습니다. 여러 upstream 파일을 하나의 transaction으로 잠그지 않으므로 검증이 끝난 뒤의 변경까지 막지는 못합니다.
+- **상태**(`publication_status(operationId)`): `LOCAL_PUBLICATION_NOT_RECORDED`(기록 없음), `LOCAL_PUBLICATION_CURRENT`(기록이 유효하고 지금도 같은 결정 파일·승인·payload가 검증됨), `LOCAL_PUBLICATION_STALE`(기록은 유효하지만 승인이나 Quiz가 지금은 다르거나 검증되지 않음), `LOCAL_PUBLICATION_CORRUPTED`(필드 누락·알 수 없는 필드·잘못된 형식·손상된 JSON·빈 파일·symlink·일반 파일이 아닌 경로·hash나 `publishId` 불일치·다른 operation, 또는 결정 파일 바이트는 같은데 snapshot이 다른 경우). 기록 자체의 검증은 upstream을 읽기 전에 하며, `payload`는 production Quiz 출력 계약(`evaluate_quiz_output`의 문항 수·필드·형식·근거 포함 규칙과 0부터 차례인 정수 `questionIndex`)을, `creatorDecision`은 Creator 결정 기록 계약을 정확한 JSON 형식까지 만족해야 합니다(`true`/`false`는 정수가 아님). 결정 기록의 Judge 실행 상태는 `completed`이거나 수동 검토를 허용하는 상태(`review_status()`의 `not_started`, `retryable`, `exhausted`, `terminal`, `uncertain`)여야 하며, `corrupted`·`quiz_not_judge_ready`·알 수 없는 값은 손상된 기록입니다. 결정 snapshot과 payload의 비교도 canonical JSON으로 해 형식이 다른 값을 같다고 보지 않습니다. 매번 다시 계산하며 파일을 만들거나 바꾸지 않습니다. 발행 이후 upstream이 바뀌어도 기록은 그대로 남고 상태만 stale이 됩니다.
+
 ## LLM-as-a-Judge 결과
 
 A/B Quiz에 대한 사후 보조 평가(LLM-as-a-Judge) 결과는 `results/judge/<judgeRunId>/`에만 저장하며 위 세 JSONL과 `results/raw`, `results/evaluation`에는 쓰지 않습니다. 이 하위 디렉터리는 Pilot 저장 무결성 검사 대상이 아닙니다. Judge는 Pilot 결과와 Human Evaluation을 읽기만 합니다. 계약과 파일 구조는 [Judge 프로토콜](judge-protocol.md)을 따릅니다.

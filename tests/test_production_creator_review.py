@@ -304,6 +304,14 @@ class ProductionCreatorReviewTest(unittest.TestCase):
             "missing field": lambda r: r.pop("review"),
             "decided by whitespace": lambda r: r.update(decidedBy=" creator-kim "),
             "routing and summary disagree": lambda r: r["review"].update(semanticSummary="HAS_FAIL"),
+            "manual approval of a corrupted judge": lambda r: (
+                r.update(decisionKind="MANUAL_WITHOUT_JUDGE", reason="by hand", judge=None),
+                r["review"].update(executionStatus="corrupted", semanticSummary="UNAVAILABLE",
+                                   reviewRouting="JUDGE_UNAVAILABLE", aggregationId=None, aggregationPolicy=None)),
+            "manual approval of an unknown state": lambda r: (
+                r.update(decisionKind="MANUAL_WITHOUT_JUDGE", reason="by hand", judge=None),
+                r["review"].update(executionStatus="mystery", semanticSummary="UNAVAILABLE",
+                                   reviewRouting="JUDGE_UNAVAILABLE", aggregationId=None, aggregationPolicy=None)),
         }
         for name, change in tampering.items():
             with self.subTest(case=name):

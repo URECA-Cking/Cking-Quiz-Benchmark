@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from src.approval_tracking import normalize_approved_by, valid_utc_timestamp
 from src.judge_contract import POINTWISE_ITEMS, canonical_json
 from src.production_judge_aggregation import (FAIL_CLOSED_STATES, SUMMARY_ROUTING, UNAVAILABLE_ROUTING,
-                                              UNAVAILABLE_SUMMARY, ProductionJudgeAggregator,
+                                              UNAVAILABLE_STATES, UNAVAILABLE_SUMMARY, ProductionJudgeAggregator,
                                               ProductionReviewRefused)
 from src.production_quiz import ProductionQuizNotJudgeReady
 
@@ -39,6 +39,7 @@ QUIZ_KEYS = ("attempt", "inputFingerprint", "quizOutputSha256", "sourceGrounding
 JUDGE_KEYS = ("attempt", "inputFingerprint", "outputSha256", "resultSha256")
 QUESTION_KEYS = ("questionIndex", "question", "options", "correctOptionIndex", "explanation", "sourceEvidence")
 _ID = re.compile(r"[0-9a-f]{32}", re.ASCII)
+_SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 
 
 class CreatorReviewRefused(ValueError):
@@ -75,6 +76,27 @@ def _acknowledged(items):
     if len(set(pairs)) != len(pairs):
         raise ValueError("acknowledged item is repeated")
     return sorted(pairs)
+
+
+def _sha256_text(value):
+    return type(value) is str and _SHA256.fullmatch(value) is not None
+
+
+def _quiz_and_judge_types_valid(quiz, judge, review):
+    """Exact JSON types of the recorded provenance (``True`` is not the integer 1, 0 is not ``False``)."""
+    quiz_valid = (type(quiz["attempt"]) is int and quiz["attempt"] >= 1
+                  and all(_sha256_text(quiz[key]) for key in ("inputFingerprint", "quizOutputSha256",
+                                                              "contentTextSha256", "sourceSnapshotSha256"))
+                  and type(quiz["sourceGroundingRunId"]) is str and _ID.fullmatch(quiz["sourceGroundingRunId"]) is not None
+                  and type(quiz["groundingValidationVersion"]) is str and bool(quiz["groundingValidationVersion"].strip()))
+    if judge is None:
+        return quiz_valid
+    policy = review["aggregationPolicy"]
+    return (quiz_valid and type(judge["attempt"]) is int and judge["attempt"] >= 1
+            and all(_sha256_text(judge[key]) for key in ("inputFingerprint", "outputSha256", "resultSha256"))
+            and _sha256_text(review["aggregationId"])
+            and type(policy) is dict and set(policy) == {"version", "sha256"}
+            and type(policy["version"]) is str and _sha256_text(policy["sha256"]))
 
 
 class ProductionCreatorReview:
@@ -206,10 +228,20 @@ class ProductionCreatorReview:
             record = self.quiz._read_json(self._decision_path(operation_id))
         except (OSError, UnicodeError, ValueError):
             return None
+        return record if self._record_valid(operation_id, record) else None
+
+    @staticmethod
+    def _record_valid(operation_id, record):
+        """Whether a decision record (a stored file or a snapshot of one) meets the record contract on its
+        own, with exact JSON types; nothing upstream is read."""
         try:
             review, quiz, judge = record["review"], record["quiz"], record["judge"]
             acknowledged = _acknowledged(record["acknowledgedItems"])
             completed = review["executionStatus"] == "completed"
+            # Only a completed evaluation or one of the states review_status offers for manual review;
+            # corrupted, quiz_not_judge_ready or anything unknown is never a reviewable decision.
+            if not completed and review["executionStatus"] not in UNAVAILABLE_STATES:
+                return False
             routing = review["reviewRouting"]
             valid = (set(record) == DECISION_KEYS and record["format"] == DECISION_FORMAT
                      and record["quizOperationId"] == operation_id and isinstance(record["evaluationId"], str)
@@ -226,7 +258,9 @@ class ProductionCreatorReview:
                      and (SUMMARY_ROUTING.get(review["semanticSummary"]) == routing if completed
                           else review["semanticSummary"] == UNAVAILABLE_SUMMARY
                           and review["aggregationId"] is None and review["aggregationPolicy"] is None and judge is None)
-                     and (not completed or isinstance(judge, dict) and set(judge) == set(JUDGE_KEYS)))
+                     and (not completed or isinstance(judge, dict) and set(judge) == set(JUDGE_KEYS))
+                     and all(type(review[key]) is str for key in ("executionStatus", "semanticSummary", "reviewRouting"))
+                     and _quiz_and_judge_types_valid(quiz, judge, review))
             if valid and record["decision"] == "REJECT":
                 valid = record["decisionKind"] == REJECTION_KIND and record["reason"] is not None and not acknowledged
             elif valid:
@@ -235,7 +269,7 @@ class ProductionCreatorReview:
                          and (bool(acknowledged) == (record["decisionKind"] == "JUDGE_OVERRIDE")))
         except (AttributeError, KeyError, TypeError, ValueError):
             valid = False
-        return record if valid else None
+        return valid
 
     def _stale_reasons(self, record):
         """Why the reviewed Quiz, Judge evaluation or aggregation no longer match the record; [] if they do.
