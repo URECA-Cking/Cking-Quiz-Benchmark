@@ -166,7 +166,10 @@ class ProductionQuizRunner:
         if self.results != root and root not in self.results.parents:
             raise ValueError("Production results must be inside repository/results/production")
         config_file = Path(config) if config else self.repository / "configs" / "production.yaml"
-        self.config = validate_production_config(yaml.safe_load(config_file.read_text(encoding="utf-8"))["production"])
+        loaded = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict) or "production" not in loaded:
+            raise ValueError("The production config must be a mapping with a production section")
+        self.config = validate_production_config(loaded["production"])
         self.quiz = self.config["quiz_generation"]
 
     # Storage primitives
