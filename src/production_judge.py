@@ -161,8 +161,10 @@ class ProductionJudgeRunner:
     def __init__(self, repository, results=None, quiz_config=None, judge_config=None):
         self.quiz = ProductionQuizRunner(repository, results, quiz_config)
         config_file = Path(judge_config) if judge_config else self.quiz.repository / "configs" / "production-judge.yaml"
-        self.config = validate_production_judge_config(
-            yaml.safe_load(config_file.read_text(encoding="utf-8"))["production_judge"])
+        loaded = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict) or "production_judge" not in loaded:
+            raise ValueError("The production Judge config must be a mapping with a production_judge section")
+        self.config = validate_production_judge_config(loaded["production_judge"])
         self.contract_sha256 = production_contract_sha256(self.config["prompt_version"])
 
     # Quiz binding and request

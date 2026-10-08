@@ -69,6 +69,24 @@ class FakeOpenAI:
 
 
 class ProductionJudgeTest(unittest.TestCase):
+    def test_yaml_container_errors_are_value_errors_without_side_effects(self):
+        cases = ("", "null", "[]", "text", "3", "other: {}",
+                 "production_judge: null", "production_judge: []", "production_judge: text",
+                 "production_judge: {}")
+        for number, text in enumerate(cases):
+            with self.subTest(yaml=text):
+                path = self.repository / "configs" / ("invalid-%d.yaml" % number)
+                path.write_text(text, encoding="utf-8")
+                before = {p.relative_to(self.repository): p.read_bytes()
+                          for p in self.repository.rglob("*") if p.is_file()}
+                with mock.patch("src.judge_client.urllib.request.urlopen") as transport:
+                    with self.assertRaises(ValueError):
+                        ProductionJudgeRunner(self.repository, judge_config=path)
+                    transport.assert_not_called()
+                after = {p.relative_to(self.repository): p.read_bytes()
+                         for p in self.repository.rglob("*") if p.is_file()}
+                self.assertEqual(after, before)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.repository = Path(self.temp.name)
