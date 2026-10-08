@@ -175,6 +175,31 @@ Creator가 승인한 Production Quiz를 로컬 발행 기록으로 남기고, �
 - **저장 전후 검증**: gate 전후에 `creator-decision.json` 바이트가 같고 그 내용이 gate가 검증한 결정과 같아야 하며, 쓰기 직전에 바이트를 다시 확인합니다. 기록을 쓴 직후 현재 상태가 `LOCAL_PUBLICATION_CURRENT`가 아니면 정상 완료로 돌려주지 않고 거부합니다(`publicationRecordedButNotCurrent`). 이때 이미 쓴 기록은 지우지 않습니다. 여러 upstream 파일을 하나의 transaction으로 잠그지 않으므로 검증이 끝난 뒤의 변경까지 막지는 못합니다.
 - **상태**(`publication_status(operationId)`): `LOCAL_PUBLICATION_NOT_RECORDED`(기록 없음), `LOCAL_PUBLICATION_CURRENT`(기록이 유효하고 지금도 같은 결정 파일·승인·payload가 검증됨), `LOCAL_PUBLICATION_STALE`(기록은 유효하지만 승인이나 Quiz가 지금은 다르거나 검증되지 않음), `LOCAL_PUBLICATION_CORRUPTED`(필드 누락·알 수 없는 필드·잘못된 형식·손상된 JSON·빈 파일·symlink·일반 파일이 아닌 경로·hash나 `publishId` 불일치·다른 operation, 또는 결정 파일 바이트는 같은데 snapshot이 다른 경우). 기록 자체의 검증은 upstream을 읽기 전에 하며, `payload`는 production Quiz 출력 계약(`evaluate_quiz_output`의 문항 수·필드·형식·근거 포함 규칙과 0부터 차례인 정수 `questionIndex`)을, `creatorDecision`은 Creator 결정 기록 계약을 정확한 JSON 형식까지 만족해야 합니다(`true`/`false`는 정수가 아님). 결정 기록의 Judge 실행 상태는 `completed`이거나 수동 검토를 허용하는 상태(`review_status()`의 `not_started`, `retryable`, `exhausted`, `terminal`, `uncertain`)여야 하며, `corrupted`·`quiz_not_judge_ready`·알 수 없는 값은 손상된 기록입니다. 결정 snapshot과 payload의 비교도 canonical JSON으로 해 형식이 다른 값을 같다고 보지 않습니다. 매번 다시 계산하며 파일을 만들거나 바꾸지 않습니다. 발행 이후 upstream이 바뀌어도 기록은 그대로 남고 상태만 stale이 됩니다.
 
+## Production Quiz 검토용 번호 표시 (Issue #49)
+
+Creator가 Quiz를 검토할 때 선택지와 정답을 1부터 매긴 번호로 볼 수 있는 읽기 전용 출력입니다(`src/production_quiz_display.py`). 저장된 `correctOptionIndex`와 `questionIndex`는 0부터 시작하는 그대로이며, 사람에게 보여 줄 때만 선택지는 1~4번, 정답은 `correctOptionIndex + 1`번으로 표시합니다. 파일을 만들거나 바꾸지 않고, Provider를 호출하지 않으며, 승인 결정이나 로컬 발행을 기록하지 않습니다.
+
+```bash
+python -m src.production_quiz_display --operation-id <quizOperationId>
+```
+
+```
+문제 1. 다음 중 올바른 설명은?
+
+1. 오답 A
+2. 오답 B
+3. 정답 C
+4. 오답 D
+
+정답: 3번 — 정답 C
+
+해설: ...
+근거: ...
+```
+
+- 명령은 `require_judge_ready()`로 Judge-ready Quiz만 읽습니다. `review_packet()`은 Judge 집계 파일을 만들 수 있으므로 이 명령에서 호출하지 않습니다. 코드에서는 `format_review_questions(packet)`에 `review_packet()` 결과를 그대로 넘겨도 같은 문항 표시를 얻습니다.
+- 질문·선택지·해설·근거는 저장된 원문 그대로이며 순서를 바꾸지 않습니다. production Quiz 출력 계약을 만족하지 않는 문항(정답 index가 bool·실수·음수·범위 밖, 선택지 수·형식 오류 등)은 정답을 표시하지 않고 오류로 거부합니다.
+
 ## LLM-as-a-Judge 결과
 
 A/B Quiz에 대한 사후 보조 평가(LLM-as-a-Judge) 결과는 `results/judge/<judgeRunId>/`에만 저장하며 위 세 JSONL과 `results/raw`, `results/evaluation`에는 쓰지 않습니다. 이 하위 디렉터리는 Pilot 저장 무결성 검사 대상이 아닙니다. Judge는 Pilot 결과와 Human Evaluation을 읽기만 합니다. 계약과 파일 구조는 [Judge 프로토콜](judge-protocol.md)을 따릅니다.
