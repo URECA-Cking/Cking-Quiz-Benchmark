@@ -112,9 +112,9 @@ class ProductionJudgeAggregator:
                                     "outputSha256": completed["outputSha256"], "resultSha256": completed["resultSha256"]},
                 "aggregationPolicy": {"version": AGGREGATION_POLICY_VERSION, "sha256": aggregation_policy_sha256()}}
 
-    def aggregate(self, quiz_operation_id, evaluation_id):
-        """The stored aggregation of a verified completed evaluation, created once and then only reused
-        after the upstream evaluation and the recomputed aggregation match it; else ProductionReviewRefused."""
+    def expected_aggregation(self, quiz_operation_id, evaluation_id):
+        """(aggregationId, provenance, aggregation) recomputed from the verified completed evaluation; no file
+        is read or written for the aggregation itself."""
         try:
             completed = self.judge.require_completed(quiz_operation_id, evaluation_id)
         except ProductionJudgeUnavailable as exc:
@@ -124,19 +124,18 @@ class ProductionJudgeAggregator:
             provenance = self._provenance(completed)
         except (KeyError, TypeError, ValueError):
             raise ProductionReviewRefused(["judgeResultMalformed"]) from None
-        aggregation_id = sha256_hex(provenance)
-        artifact = {"format": ARTIFACT_FORMAT, "aggregationId": aggregation_id, "provenance": provenance,
-                    "aggregation": aggregation, "generatedAt": datetime.now(timezone.utc).isoformat()}
-        try:
-            path = self.quiz._path("operations", quiz_operation_id, "judge", evaluation_id, "aggregations",
-                                   aggregation_id + ".json")
-            if not path.exists():
-                # Atomic create-once: a failed write leaves no artifact, so the next call can simply retry.
-                self.quiz._create_once(path, canonical_json(artifact).encode("utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ProductionReviewRefused(["aggregationArtifactWriteFailed"]) from exc
+        return sha256_hex(provenance), provenance, aggregation
+
+    def _artifact_path(self, quiz_operation_id, evaluation_id, aggregation_id):
+        return self.quiz._path("operations", quiz_operation_id, "judge", evaluation_id, "aggregations",
+                               aggregation_id + ".json")
+
+    def _stored_artifact(self, path, aggregation_id, provenance, aggregation):
+        """The stored artifact if it is a regular file equal to the recomputed aggregation; else refused."""
         try:
             stored = self.quiz._read_json(path)
+        except FileNotFoundError:  # also a link or a non-file at the path
+            raise ProductionReviewRefused(["aggregationArtifactMissing"]) from None
         except (OSError, UnicodeError, ValueError):
             raise ProductionReviewRefused(["aggregationArtifactUnreadable"]) from None
         if (not isinstance(stored, dict) or set(stored) != ARTIFACT_KEYS or stored["format"] != ARTIFACT_FORMAT
@@ -145,6 +144,36 @@ class ProductionJudgeAggregator:
                 or not valid_utc_timestamp(stored["generatedAt"])):
             raise ProductionReviewRefused(["aggregationArtifactMismatch"])
         return stored
+
+    def aggregate(self, quiz_operation_id, evaluation_id):
+        """The stored aggregation of a verified completed evaluation, created once and then only reused
+        after the upstream evaluation and the recomputed aggregation match it; else ProductionReviewRefused."""
+        aggregation_id, provenance, aggregation = self.expected_aggregation(quiz_operation_id, evaluation_id)
+        artifact = {"format": ARTIFACT_FORMAT, "aggregationId": aggregation_id, "provenance": provenance,
+                    "aggregation": aggregation, "generatedAt": datetime.now(timezone.utc).isoformat()}
+        try:
+            path = self._artifact_path(quiz_operation_id, evaluation_id, aggregation_id)
+            if not path.exists():
+                # Atomic create-once: a failed write leaves no artifact, so the next call can simply retry.
+                self.quiz._create_once(path, canonical_json(artifact).encode("utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ProductionReviewRefused(["aggregationArtifactWriteFailed"]) from exc
+        return self._stored_artifact(path, aggregation_id, provenance, aggregation)
+
+    def verify_aggregation(self, quiz_operation_id, evaluation_id, expected=None):
+        """Read-only ``aggregate``: the existing stored aggregation after the same checks, never created or
+        repaired. A missing artifact is refused (``aggregationArtifactMissing``).
+
+        ``expected`` is an ``expected_aggregation`` result the caller already computed and compared; the
+        artifact is then checked against exactly that value instead of a fresh recomputation."""
+        if expected is None:
+            expected = self.expected_aggregation(quiz_operation_id, evaluation_id)
+        aggregation_id, provenance, aggregation = expected
+        try:
+            path = self._artifact_path(quiz_operation_id, evaluation_id, aggregation_id)
+        except ValueError:
+            raise ProductionReviewRefused(["aggregationArtifactUnreadable"]) from None
+        return self._stored_artifact(path, aggregation_id, provenance, aggregation)
 
     def review_status(self, quiz_operation_id, evaluation_id):
         """Review information for one evaluation, read-only apart from creating its aggregation once.

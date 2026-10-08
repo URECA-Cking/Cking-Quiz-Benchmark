@@ -141,8 +141,28 @@ Judge-ready production Quiz를 GPT Pointwise Judge로 평가하고 문항별 결
 - **집계 입력과 출력**: `ProductionJudgeRunner.require_completed()`로 검증된 completed 평가의 문항별 7개 항목 verdict·reason만 입력으로 씁니다. 출력은 문항 수, 항목 평가 수(문항 수 × 7), 전체·항목별·문항별 `pass`/`fail`/`uncertain` 개수, `fail`·`uncertain` 목록(`questionIndex`, rubric 항목, verdict, 원본 reason), 원본 문항별 verdict·reason 전체, semantic summary, review routing, 집계 정책 version(`production-judge-aggregation-v1`)과 digest입니다. 입력 순서와 관계없이 같은 판정은 같은 결과가 되며, 없는 verdict·reason을 만들지 않고 형식이 맞지 않는 입력은 거부합니다.
 - **평가가 없을 때**: Judge 상태가 `not_started`, `retryable`, `exhausted`, `terminal`, `uncertain`이면 `UNAVAILABLE` / `JUDGE_UNAVAILABLE`과 실행 상태·사유를 읽기 전용으로 돌려주며 Creator 수동 검토를 허용합니다(`manualReviewAllowed`). 이 응답은 저장하지 않고, 실행 `uncertain`을 판정 `uncertain`으로 바꾸지 않습니다. `corrupted`와 `quiz_not_judge_ready`는 거부하며 수동 검토 경로로 돌리지 않습니다. `evaluation.json`이 일반 파일이 아니거나, `evaluation.json` 없이 평가 디렉터리에 다른 항목이 남아 있으면 `not_started`가 아니라 `corrupted`입니다. 예외는 생성이 끝나지 않은 create-once 임시 파일(`.production-` + 임의 8자 + `.tmp`, 일반 파일)뿐이며, 이것만 있으면 `not_started`로 이어서 실행할 수 있습니다.
 - **저장**: 집계는 `results/production/operations/<quizOperationId>/judge/<evaluationId>/aggregations/<aggregationId>.json`에 한 번만 저장합니다. `aggregationId`는 Quiz provenance(operation, attempt, fingerprint, output·result SHA-256, Grounding run, `contentTextSha256`, snapshot SHA-256, validation version, prompt·출력 계약 version), Judge 설정(model, reasoning, `max_output_tokens`, prompt·rubric·schema version, 계약 hash)과 요청 본문 SHA-256, Judge evaluation(evaluation ID, attempt, fingerprint, 출력 SHA-256, 검증한 `result.json` 파일 바이트의 SHA-256), 집계 정책 version·digest의 SHA-256이며 `generatedAt`은 포함하지 않습니다. 같은 내용이라도 결과 파일 바이트가 다르면 다른 집계가 됩니다. 정책이 바뀌면 다른 파일이 되고 기존 파일은 그대로 남습니다.
-- **재조회**: 저장된 집계는 Judge 평가를 다시 검증하고 집계를 다시 계산해 provenance와 결과가 모두 같을 때만 돌려줍니다. 저장값 변조, 형식 오류, 일부만 쓰인 파일, 읽기 실패, Quiz·Judge 결과가 바뀐 뒤의 오래된 집계는 거부하며 파일을 덮어쓰거나 고치지 않습니다. 집계 파일 쓰기가 실패하면(권한·디스크 오류 등) 거부하고 파일을 남기지 않으므로 다시 호출하면 됩니다.
+- **재조회**: 저장된 집계는 Judge 평가를 다시 검증하고 집계를 다시 계산해 provenance와 결과가 모두 같을 때만 돌려줍니다. 저장값 변조, 형식 오류, 일부만 쓰인 파일, 읽기 실패, Quiz·Judge 결과가 바뀐 뒤의 오래된 집계는 거부하며 파일을 덮어쓰거나 고치지 않습니다. 집계 파일 쓰기가 실패하면(권한·디스크 오류 등) 거부하고 파일을 남기지 않으므로 다시 호출하면 됩니다. `verify_aggregation`은 같은 검사를 읽기 전용으로 수행하며, 집계 파일이 없으면 만들지 않고 거부합니다(Creator 상태 조회와 승인 gate가 사용). 호출자가 이미 계산해 비교한 기대값(`expected`)을 넘기면 다시 계산하지 않고 그 값과 정확히 같은 집계만 인정합니다.
 - **후속 Creator 승인 요구사항**(이번 범위 밖): Creator 판단을 Judge 결과와 별도로 기록하고, Judge와 다르게 승인하면 override 여부와 사유를 필수로 남기며, Judge 원결과는 바꾸지 않고, Creator 승인 없이 게시하지 않습니다.
+
+## Production Creator 검토·승인 결정 (Issue #45)
+
+Creator가 Quiz와 Judge 결과(또는 Judge가 없다는 상태)를 함께 확인하고, Quiz operation 하나에 최종 승인 또는 거절을 한 번 기록합니다(`src/production_creator_review.py`). Judge 결과와 집계는 바꾸지 않으며, 게시는 후속 단계에서 승인 gate를 사용합니다. `decidedBy`는 호출자가 넘기는 이름이며 인증을 제공하지 않습니다.
+
+- **검토 자료**(`review_packet(operationId, evaluationId)`): `require_judge_ready()`의 `contentText`와 문항(`questionIndex`, 질문, 보기, 정답 index, 설명, 근거), `review_status()`의 Judge 실행 상태·semantic summary·review routing·rubric별 판정과 reason·fail/uncertain 항목(`problemItems`)·집계 ID를 돌려줍니다. Judge 평가가 없으면 경고(`unavailableWarning`)를 붙입니다. Quiz eligibility 실패와 Judge `corrupted`·`quiz_not_judge_ready`는 거부합니다. 집계가 아직 없으면 `review_status()`가 집계 파일을 한 번 만듭니다.
+- **결정 유형**: 승인 유형은 결정 시점의 routing에서 도출하며 호출자가 지정하지 않습니다.
+
+| 결정 | routing | `decisionKind` | 필수 |
+| --- | --- | --- | --- |
+| `APPROVE` | `READY_FOR_CREATOR_REVIEW` | `JUDGE_AGREED` | 없음(사유는 선택) |
+| `APPROVE` | `ATTENTION_REQUIRED` | `JUDGE_OVERRIDE` | 사유 + 모든 fail/uncertain 항목의 확인(`questionIndex`, rubric 집합이 집계와 정확히 일치) |
+| `APPROVE` | `JUDGE_UNAVAILABLE` | `MANUAL_WITHOUT_JUDGE` | 사유. 당시 Judge 실행 상태를 기록 |
+| `REJECT` | 모든 routing(`ALL_PASS` 포함) | `CREATOR_REJECTION` | 사유 |
+
+- **저장**: `results/production/operations/<operationId>/creator-decision.json`에 한 번만 저장합니다(create-once, 원자적 저장). 결정, 결정 유형, `decidedBy`, `decidedAt`(UTC), 사유, 확인한 항목, 검토한 routing·summary·Judge 실행 상태·집계 ID·집계 정책, Quiz provenance(attempt, fingerprint, 출력 SHA-256, Grounding run, `contentTextSha256`, snapshot SHA-256, validation version), Judge evaluation ID와 attempt·fingerprint·출력·`result.json` SHA-256(Judge가 없으면 `null`)을 기록합니다.
+- **최종 결정 1회**: 같은 요청(결정 시각 제외 모든 값이 같음)의 재전송은 저장된 기록을 돌려주고, 다른 결정·결정자·사유·확인 항목·검토 provenance는 거부합니다. 기록을 덮어쓰거나 철회·변경하지 않으며 손상된 기록도 새 결정으로 바꾸지 않습니다. 저장 실패는 거부하고 파일을 남기지 않습니다.
+- **상태**(`decision_status`): `PENDING_CREATOR_REVIEW`(결정 없음), `CREATOR_APPROVED`·`CREATOR_REJECTED`(유효한 결정이고 검토한 Quiz·Judge·집계가 지금도 같음), `CREATOR_DECISION_STALE`(결정은 유효하지만 검토한 provenance가 바뀌었거나 더 이상 검증되지 않음), `CREATOR_DECISION_CORRUPTED`(결정 기록 자체가 잘못됨). 매번 upstream을 다시 검증하며 파일을 만들거나 바꾸지 않습니다. 결정 기록과 비교한 기대값 하나로 저장된 집계를 검증하고, 검증하는 동안 Judge 결과가 바뀌었으면(검증 끝에 다시 계산한 값이 처음과 다르면) 승인으로 인정하지 않습니다.
+- **stale**: Quiz 변경·eligibility 실패, Judge `result.json` 변경·`corrupted`, 집계·집계 정책 변경, Judge 실행 상태 변경. `MANUAL_WITHOUT_JUDGE` 승인 뒤 같은 evaluation이 `completed`가 되면 stale이며, 결정은 한 번뿐이므로 같은 Quiz operation은 다시 승인할 수 없고 새 Quiz operation으로 다시 검토해야 합니다.
+- **승인 gate**(`require_creator_approved(operationId)`): 상태가 `CREATOR_APPROVED`일 때만 `contentText`, 문항과 결정 기록을 돌려주고 그 밖에는 거부합니다. 파일을 만들거나 바꾸지 않으며 게시는 하지 않습니다.
 
 ## LLM-as-a-Judge 결과
 
