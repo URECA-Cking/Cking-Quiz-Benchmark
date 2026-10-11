@@ -133,7 +133,7 @@ def validate_production_judge_config(config):
             or any(not isinstance(config[key], str) or not config[key].strip()
                    for key in ("model", "reasoning", "api_key_environment_variable"))
             or type(config["max_output_tokens"]) is not int or config["max_output_tokens"] < 1
-            or config["prompt_version"] not in PROMPT_VERSIONS
+            or not isinstance(config["prompt_version"], str) or config["prompt_version"] not in PROMPT_VERSIONS
             or config["rubric_version"] != RUBRIC_VERSION or config["schema_version"] != SCHEMA_VERSION
             or not isinstance(policy, dict) or set(policy) != set(EXECUTION_POLICY)
             # type() too, so a YAML true never stands in for 1 or the reverse.
