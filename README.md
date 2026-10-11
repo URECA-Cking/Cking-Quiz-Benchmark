@@ -10,9 +10,13 @@ AI 퀴즈의 영상 근거 확보 방식과 생성 모델을 **별도로** 비�
 - **Quiz Generation Benchmark:** 동일하게 고정한 `contentText`(Pilot v1은 영상·prompt 버전별, Pilot v2는 영상·prompt 버전·repetition별로 그 repetition에서 승인된 텍스트)를 `gemini-3.8-flash`와 `gpt-5.4-mini`에 제공합니다. 같은 프롬프트 버전과 Quiz 계약으로 파싱·검증, 정답 정확성·유일성, 근거의 정답 지지 여부, 한국어 품질, 지연·토큰·비용을 비교합니다. Grounding을 반복 호출하지 않아 생성 모델만 비교할 수 있어야 합니다.
 - **End-to-End Benchmark:** Gemini Grounding → Gemini/OpenAI Quiz, YouTube → Gemini 직접 Quiz, 권한 있는 transcript → Gemini/OpenAI Quiz를 비교합니다. transcript를 확보할 수 없는 영상은 해당 조건을 `not_run`으로 기록합니다.
 
-기존 A/B/C와의 관계: **A**는 Gemini Grounding 후 Quiz 생성의 두 조합, **B**는 Gemini 직접 Quiz, **C**는 권한 있는 transcript 기반 두 조합입니다. 새로운 Quiz Generation Benchmark는 A/C의 한 실행을 그대로 비교하지 않고 **동일한 고정 입력**으로 생성 모델의 차이만 측정합니다.
+초기 설계 당시 A/B/C 명칭: **A**는 Gemini Grounding 후 Quiz 생성의 두 조합, **B**는 Gemini 직접 Quiz, **C**는 권한 있는 transcript 기반 두 조합입니다. 당시 Quiz Generation Benchmark 설계는 A/C의 한 실행을 그대로 비교하지 않고 **동일한 고정 입력**으로 생성 모델의 차이만 측정합니다.
 
-현재는 평가 계약과 영상 후보, 사람 검수를 마친 ground truth, **fixture 및 명시적 live 단일 조건 실행기**가 있습니다. fixture 결과는 API 미실행(`apiStatus=not_run`)으로 기록하며 실제 latency·token·cost 성능 결과로 사용하지 않습니다. 첫 Pilot 영상 `nasa-water-cycle-2019`에서는 Grounding attempt 1~4 실패 후 attempt 5가 성공했고, 해당 `contentText`의 사람 승인과 동일 승인 입력을 공유한 Gemini Quiz A·OpenAI Quiz B의 실행 및 사람 평가를 마쳤습니다. A/B의 offline 집계가 가능하지만 Pilot 전체가 완료된 것은 아닙니다. Gemini Direct Quiz는 이 영상의 현재 조건에서 technical attempt 1~3이 완료되지 않았으며, 세 번째는 HTTP 503 / `service_unavailable`로 기록됐습니다. 원본 영상 파일과 transcript 전문은 저장하지 않습니다. Pilot을 검증한 뒤에만 영상 12~18개와 추가 모델로 확대합니다.
+초기 Pilot 단계에는 평가 계약과 영상 후보, 사람 검수를 마친 ground truth, **fixture 및 명시적 live 단일 조건 실행기**가 준비되어 있었습니다. fixture 결과는 API 미실행(`apiStatus=not_run`)으로 기록하며 실제 latency·token·cost 성능 결과로 사용하지 않습니다. 첫 Pilot 영상 `nasa-water-cycle-2019`에서는 Grounding attempt 1~4 실패 후 attempt 5가 성공했고, 해당 `contentText`의 사람 승인과 동일 승인 입력을 공유한 Gemini Quiz A·OpenAI Quiz B의 실행 및 사람 평가를 마쳤습니다. 당시 A/B의 offline 집계가 가능했지만 Pilot 전체가 완료된 상태는 아니었습니다. Gemini Direct Quiz는 이 초기 실행의 영상·조건에서 technical attempt 1~3이 완료되지 않았으며, 세 번째는 HTTP 503 / `service_unavailable`로 기록됐습니다. 원본 영상 파일과 transcript 전문은 저장하지 않습니다. 영상 12~18개와 추가 모델로의 확대는 초기 계획이며, 완료된 실행 범위와 구분합니다.
+
+Pilot v2-r2에서는 영상 4개 × repetition 2 × A/B/C의 24개 Quiz set·72문항 생성과 Human blind evaluation을 완료했습니다. 이때 A는 Gemini fixed-content, B는 같은 승인 contentText를 사용하는 OpenAI fixed-content, C는 Gemini Direct입니다. 상세 결과와 초기 실행 기록은 [선택 기록 §8](docs/selection.md#8-pilot-v2-r2-결과와-quiz-생성-방식-결정)을 참고합니다.
+
+Production 구성요소는 automatic Grounding machine eligibility → Gemini Quiz 생성·output gate → GPT Pointwise Judge → 집계 → Creator 검토·승인 → 로컬 발행 기록까지 구현되어 있습니다. 로컬 발행은 실제 Cking 서비스 게시가 아니며, 상세 계약은 [결과 형식](docs/results-format.md)에 정의합니다.
 
 ## 평가 원칙
 
@@ -31,11 +35,11 @@ Grounding 결과와 Quiz 결과는 별도로 저장하고 실행 ID로 연결합
 - [`data/ground_truth_candidates.jsonl`](data/ground_truth_candidates.jsonl): 공식 자료에서 추린 사실 후보 12개. YouTube 자막·내용에 대한 사람 검수 후 모두 `approved`.
 - [`docs/pilot-data-review.md`](docs/pilot-data-review.md): 권리·언어·영상 확인의 남은 조건.
 - [`docs/results-format.md`](docs/results-format.md), [`docs/run-result.schema.json`](docs/run-result.schema.json): 계층별 실행 JSONL과 집계 CSV 계약.
-- [`docs/selection.md`](docs/selection.md): 실험 뒤 선택 근거를 기록할 자리.
-- [`src/README.md`](src/README.md): fixture 실행 방법과 후속 Provider 경계.
+- [`docs/selection.md`](docs/selection.md): Pilot 실행 프로토콜, 결과와 방식·모델 선택 및 Production 구조 결정 기록.
+- [`src/README.md`](src/README.md): Pilot 실행 방법과 Provider·평가 경계.
 
 실제 API 키는 각각 `GEMINI_API_KEY`, `OPENAI_API_KEY` 환경변수로만 전달합니다. 키를 코드, 설정 파일, `.env`, 로그, Git에 저장하지 않습니다. 공개 저장소에는 출처를 확인한 메타데이터와 재서술한 사실 후보만 올립니다. 영상·자막 전문, 제한된 transcript, 원시 API 응답 및 로컬 결과는 Git에 포함하지 않습니다.
 
 ## 다음 단계
 
-승인된 후보를 바탕으로 transcript 사용 권한, 실제 모델 ID와 비용 상한을 확정해야 합니다. 현재 실행기는 기본적으로 fixture만 읽으며, live 실행은 명시적 옵션·상한이 모두 지정될 때만 허용합니다. 실제 Pilot 실행 전 별도 검토가 필요합니다.
+Pilot v2-r2의 결과와 Production 구조 결정은 기록되어 있습니다. 실제 서비스 연결은 Cking-BE의 인증·저장·게시 계약과 별도로 확인해야 합니다. transcript 조건은 Pilot v2 범위 밖이며, 추가 live 실험을 진행할 때는 모델·요금·사용 권한·비용 상한을 다시 확인하고 별도 실행 승인을 받아야 합니다. Pilot CLI는 기본적으로 fixture를 사용하며 live 실행에는 명시적 옵션과 상한이 필요합니다.
