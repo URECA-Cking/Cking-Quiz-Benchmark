@@ -528,6 +528,8 @@ YouTube 링크 → Gemini Direct Quiz 생성 → GPT 계열 LLM Judge → Creato
 
 ### Production architecture 재검토: A 기반 구조로 변경 (USER DECISION)
 
+이 소절은 architecture 변경 당시의 결정과 미정 사항을 보존한 기록입니다. 이후 구현된 Production 계약은 아래의 현재 구현 안내를 따릅니다.
+
 Production Quiz 생성기 구조를 C(Gemini Direct)에서 A 기반 구조로 변경합니다. Pilot 결과를 새로 해석하거나 추가 실험을 한 결과가 아니라, production Judge를 붙이는 방법을 검토하면서 내린 architecture 결정입니다.
 
 결정 순서:
@@ -563,7 +565,7 @@ A 기반 구조를 택한 이유:
 
 - Pilot의 사람 Grounding 검수·승인은 production workflow에 포함되지 않습니다. Pilot 비교를 위한 프로토콜이었습니다(위 "Pilot 프로토콜과 production의 구분").
 - production의 자동 Grounding 결과는 검증된 ground truth가 아닙니다. Judge가 `contentText` 기준으로 `pass`를 내도 영상 기준의 사실 정확성을 보장하지 않습니다.
-- 정확한 GPT Judge 모델은 정하지 않았습니다(TBD). `configs/judge.yaml`의 `gpt-6.1-sol`은 Pilot 사후 Judge 설정이며 production 모델 결정이 아닙니다.
+- 당시 정확한 GPT Judge 모델은 정하지 않았습니다(TBD). 당시 `configs/judge.yaml`의 `gpt-6.1-sol`은 Pilot 사후 Judge 설정이며 production 모델 결정이 아니었습니다.
 - production에는 Pairwise가 필요하지 않습니다. production Judge는 Pointwise입니다.
 - Creator의 최종 확인·승인은 유지합니다.
 - 두 번째 72문항 실행은 하지 않습니다(위 "실행 범위").
@@ -578,12 +580,14 @@ A 기반 구조를 택한 이유:
 
 이 변경은 다음을 주장하지 않습니다: A의 품질이 C보다 좋다는 것, C가 실패했다는 것, A/C 비교에서 A가 이겼다는 것, GPT Judge 실험 결과가 이 결정을 뒷받침한다는 것. 이 결정은 Judge 실행 결과에 근거하지 않습니다.
 
-다음 단계 (제안, 아직 진행하지 않음):
+당시 제안한 다음 단계 (결정 시점에는 미진행):
 
 1. Production A 자동 Grounding evidence 계약 정의(evidence 신뢰 정책 포함).
 2. Production A와 GPT Pointwise Judge 지원 구현.
 3. GPT Judge 검증: Human 평가로 `pass`가 확인된 기존 Quiz를 positive 데이터로 재사용하고, 알려진 결함 사례(known-bad)를 추가해 확인.
 4. 최종 E2E 검증.
+
+현재는 [Production Grounding machine validation](results-format.md#production-자동-grounding-machine-validation-issue-37), [Quiz 생성과 output gate](results-format.md#production-quiz-생성과-output-gate-issue-39), [GPT Pointwise Judge](results-format.md#production-gpt-pointwise-judge-issue-41)를 구현했습니다. Production Judge 모델은 `configs/production-judge.yaml`의 `gpt-6.1-sol`로 설정되어 있습니다. 후속 [Judge 집계](results-format.md#production-judge-집계와-creator-검토-상태-issue-43), [Creator 검토·승인](results-format.md#production-creator-검토승인-결정-issue-45), [로컬 발행 기록](results-format.md#production-quiz-로컬-발행-기록-issue-47)도 구현되어 있습니다. 이 구현 상태는 위 3·4번의 실제 Provider 기반 검증 완료를 뜻하지 않으며, 로컬 발행은 실제 Cking 서비스 게시가 아닙니다.
 
 ## 공식 문서 출처 (2026-10-02 확인)
 
