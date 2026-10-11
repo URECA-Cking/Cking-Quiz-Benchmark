@@ -355,7 +355,7 @@ class ProductionQuizTest(unittest.TestCase):
         self.assertEqual(self.runner.operation_state(operation_id), "uncertain")
         self.assert_not_judge_ready(operation_id, "operationUncertain")
 
-    # Codex review: request settings, provenance chain and technical retry
+    # Request settings, provenance chain and technical retry
 
     def test_output_token_cap_and_thinking_level_are_fingerprinted_and_bound_to_the_provider(self):
         fingerprints = {}
