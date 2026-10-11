@@ -284,6 +284,26 @@ class ProductionJudgeTest(unittest.TestCase):
             with self.subTest(case=name), self.assertRaises(ValueError):
                 validate_production_judge_config(changed)
 
+    def test_wrong_config_field_types_are_value_errors_without_side_effects(self):
+        original = yaml.safe_load((self.repository / "configs" / "production-judge.yaml").read_text(encoding="utf-8"))
+        cases = [(key, value) for key in original["production_judge"]
+                 for value in (None, [], {}, True, 3)
+                 if not (key == "max_output_tokens" and type(value) is int)]
+        for number, (key, value) in enumerate(cases):
+            with self.subTest(field=key, value=value):
+                config = copy.deepcopy(original)
+                config["production_judge"][key] = value
+                path = self.repository / "configs" / ("wrong-type-%d.yaml" % number)
+                path.write_text(yaml.safe_dump(config), encoding="utf-8")
+                before = {p.relative_to(self.repository): p.read_bytes()
+                          for p in self.repository.rglob("*") if p.is_file()}
+                with mock.patch("src.judge_client.urllib.request.urlopen") as transport:
+                    with self.assertRaises(ValueError):
+                        ProductionJudgeRunner(self.repository, judge_config=path)
+                    transport.assert_not_called()
+                self.assertEqual(before, {p.relative_to(self.repository): p.read_bytes()
+                                          for p in self.repository.rglob("*") if p.is_file()})
+
     # Contract failures and terminal / uncertain states
 
     def test_unusable_responses_are_kept_and_only_an_explicit_attempt_follows(self):
